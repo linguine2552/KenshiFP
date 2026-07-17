@@ -63,13 +63,17 @@
 /* Character::handle (a `hand`) at Character+0x58; ids at +0x60.. (=hand+0x8). */
 #define CHAR_HANDLE       0x58
 
-/* ---- M3 WASD movement (in progress) ----
+/* ---- M3 WASD movement ----
  * Character->movement (CharMovement*) is at +0x640. CharMovement::setDestination
- * (Vec3, UpdatePriority, bool) is VIRTUAL, but the header's vtable slot is stale
- * for 1.0.68 (the getPosition lesson: header said slot 0, real was slot 8). So
- * we DUMP the live CharMovement vtable to the log to identify the real slot,
- * rather than guess and crash. The move call is disabled until that's confirmed. */
+ * (const Vec3&, UpdatePriority, bool) VERIFIED at RVA 0x661270 (vt[18]/+0x90 of
+ * the live CharMovement vtable; Ghidra typed arg2 as Vector3*). UpdatePriority:
+ * LOW=0, MED=1, HIGH=2. We breadcrumb a point ahead in the camera heading while
+ * WASD is held (~10 Hz), and order the current position on release (halt).
+ * NOTE: KenshiCoop found player chars can ignore a bare CharMovement dest; if so
+ * this won't move them and we'll switch to the Character-level order path. */
 #define CHAR_MOVEMENT      0x640   /* Character::movement (CharMovement*) */
+#define RVA_CHARMOVE_SETDEST 0x661270u
+#define UPDATE_PRIORITY_HIGH 2
 #define MOVE_STEP          10.0f
 #define MOVE_HZ_MS         100
 
@@ -80,7 +84,7 @@
  * person, and restore on exit. */
 #define OGRE_SETFOVY_SYM  "?setFOVy@Frustum@Ogre@@UEAAXAEBVRadian@2@@Z"
 #define OGRE_GETFOVY_SYM  "?getFOVy@Frustum@Ogre@@UEBAAEBVRadian@2@XZ"
-#define FP_FOV_DEG        90.0f    /* vertical FOV while first-person; tune */
+#define FP_FOV_DEG        70.0f    /* vertical FOV while first-person; tune */
 #define DEG2RAD           0.01745329f
 
 /* ---- M2 first-person (Ogre node override) ----
@@ -103,7 +107,7 @@
  * NOTE: Ogre's get* accessors return BY VALUE and crashed across our ABI, so we
  * never read node state; FP exit just levels local orientation to identity. */
 #define OGRE_SETDORI_SYM  "?_setDerivedOrientation@Node@Ogre@@QEAAXAEBVQuaternion@2@@Z"
-#define EYE_HEIGHT        2.6f    /* local units above `center`; tune in-game */
+#define EYE_HEIGHT        3.6f    /* local units above `center`; tune in-game */
 #define LOOK_SENS         0.0025f /* radians per mouse pixel */
 
 /* ---- player character / position (proven in KenshiMP) ---- */
@@ -130,6 +134,7 @@ typedef void (*node_set_ori_t)(void *node, const Quat *q);   /* local setOrienta
 typedef void (*node_set_dori_t)(void *node, const Quat *q);  /* world _setDerivedOrientation */
 typedef void (*cam_set_fovy_t)(void *camera, const float *rad);
 typedef const float *(*cam_get_fovy_t)(void *camera);
+typedef void (*charmove_setdest_t)(void *mv, const Vec3 *dest, int pri, char shift);
 
 static FILE *g_log;
 static uintptr_t g_base;
@@ -150,7 +155,9 @@ static cam_set_fovy_t g_cam_set_fovy;
 static cam_get_fovy_t g_cam_get_fovy;
 static int g_fov_saved;
 static float g_fov_default;
-static int g_vt_dumped;           /* CharMovement vtable logged once */
+static charmove_setdest_t g_charmove_setdest;  /* CharMovement::setDestination */
+static DWORD g_last_move_ms;
+static int g_was_moving;
 
 static void logline(const char *fmt, ...)
 {
@@ -350,34 +357,56 @@ static void fp_camera_override(void *gw)
     g_ovr_prev = active;
 }
 
-/* Log the followed character's CharMovement (+0x640) vtable so we can identify
- * the real setDestination slot offline (header vtable offsets are stale for
- * 1.0.68). Runs once. Read-only. */
-static void dump_movement_vtable(void *pc)
-{
-    void *mv = readable((void *)((uintptr_t)pc + CHAR_MOVEMENT), 8)
-        ? *(void **)((uintptr_t)pc + CHAR_MOVEMENT) : NULL;
-    if (!readable(mv, 8)) { logline("[mv] movement ptr not readable"); return; }
-    void **vt = *(void ***)mv;
-    if (!readable(vt, 8)) { logline("[mv] movement vtable not readable"); return; }
-    logline("[mv] movement=%p vtable RVA 0x%zx (base %p)",
-            mv, (uintptr_t)vt - g_base, (void *)g_base);
-    for (int i = 0; i < 40; i++) {
-        if (!readable(&vt[i], 8)) break;
-        void *f = vt[i];
-        if (!readable(f, 1)) continue;
-        logline("[mv] vt[%2d] off=0x%02x -> RVA 0x%zx", i, i * 8, (uintptr_t)f - g_base);
-    }
-}
-
-/* M3 WASD movement — DISABLED pending the correct setDestination slot. For now
- * just dumps the CharMovement vtable once so we can pin it without crashing. */
+/* M3: drive the followed character with WASD relative to where we're looking.
+ * Breadcrumb CharMovement::setDestination a few metres ahead at ~10 Hz; halt at
+ * the current position when all keys release. */
 static void fp_movement(void *gw)
 {
-    if (!g_fp_mode) return;
+    if (!g_fp_mode || !g_charmove_setdest) return;
     void *pc = first_player_char(gw);
     if (!pc) return;
-    if (!g_vt_dumped) { g_vt_dumped = 1; dump_movement_vtable(pc); }
+    void *mv = readable((void *)((uintptr_t)pc + CHAR_MOVEMENT), 8)
+        ? *(void **)((uintptr_t)pc + CHAR_MOVEMENT) : NULL;
+    if (!readable(mv, 8)) return;
+
+    int w = (GetAsyncKeyState(VK_W) & 0x8000) != 0;
+    int s = (GetAsyncKeyState(VK_S) & 0x8000) != 0;
+    int a = (GetAsyncKeyState(VK_A) & 0x8000) != 0;
+    int d = (GetAsyncKeyState(VK_D) & 0x8000) != 0;
+    float mf = (float)(w - s);     /* forward axis */
+    float mr = (float)(d - a);     /* strafe axis  */
+
+    if (mf == 0.0f && mr == 0.0f) {
+        if (g_was_moving) {         /* release: halt at current position */
+            Vec3 here;
+            if (char_position(pc, &here))
+                g_charmove_setdest(mv, &here, UPDATE_PRIORITY_HIGH, 0);
+            g_was_moving = 0;
+        }
+        return;
+    }
+
+    DWORD now = GetTickCount();
+    if (now - g_last_move_ms < MOVE_HZ_MS) return;
+    g_last_move_ms = now;
+
+    Vec3 here;
+    if (!char_position(pc, &here)) return;
+
+    /* Heading from mouse-look yaw. Ogre Y-up, camera looks -Z:
+     * forward = (-sin,0,-cos), right = (cos,0,-sin). */
+    float th = g_yaw;
+    float fx = -sinf(th), fz = -cosf(th);
+    float rx =  cosf(th), rz = -sinf(th);
+    float dx = fx * mf + rx * mr;
+    float dz = fz * mf + rz * mr;
+    float len = sqrtf(dx * dx + dz * dz);
+    if (len < 0.001f) return;
+    dx /= len; dz /= len;
+
+    Vec3 tgt = { here.x + dx * MOVE_STEP, here.y, here.z + dz * MOVE_STEP };
+    g_charmove_setdest(mv, &tgt, UPDATE_PRIORITY_HIGH, 0);
+    g_was_moving = 1;
 }
 
 static void hooked_mainloop(void *gw, float time)
@@ -402,7 +431,8 @@ __declspec(dllexport) void dllStartPlugin(void)
     g_base = (uintptr_t)GetModuleHandleA(NULL);
     g_follow_object  = (follow_object_t)(g_base + RVA_FOLLOW_OBJECT);
     g_stop_following = (stop_follow_t)(g_base + RVA_STOP_FOLLOW);
-    logline("KenshiFP loaded (FP + FOV; WASD pending vtable id); module base %p", (void *)g_base);
+    g_charmove_setdest = (charmove_setdest_t)(g_base + RVA_CHARMOVE_SETDEST);
+    logline("KenshiFP loaded (FP + FOV + WASD); module base %p", (void *)g_base);
 
     /* Resolve Ogre node world-transform setters from OgreMain_x64.dll. */
     HMODULE ogre = GetModuleHandleA("OgreMain_x64.dll");
@@ -431,7 +461,7 @@ __declspec(dllexport) void dllStartPlugin(void)
         logline("MH_Initialize failed (MH_STATUS %d)", (int)mh);
     }
 
-    logline(ok ? "KenshiFP active: F = first-person; mouse = look (WASD move pending)"
+    logline(ok ? "KenshiFP active: F = first-person; mouse = look; WASD = move"
                : "KenshiFP FAILED to install per-frame hook");
 }
 

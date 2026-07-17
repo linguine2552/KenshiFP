@@ -105,6 +105,20 @@
  *   Node::setOrientation(Quaternion)      [local; 16B struct -> passed by ptr] */
 #define OGRE_SETPOS_SYM   "?setPosition@Node@Ogre@@QEAAXAEBVVector3@2@@Z"
 #define OGRE_SETORI_SYM   "?setOrientation@Node@Ogre@@QEAAXVQuaternion@2@@Z"
+#define OGRE_SETINHORI_SYM "?setInheritOrientation@Node@Ogre@@QEAAX_N@Z"
+
+/* ---- head-bone tracking (real first-person feel: eye = head bone) ----
+ * Character::getBoneWorldPosition(this, retVec3, std::string* name) — RVA
+ * 0x440360 (confirmed: falls back to getPosition/vtable+0x40 when the bone is
+ * absent). Returns the bone position in the SAME game-world frame as
+ * getPosition. So we take (head - feet) as a world-axis offset and apply it as
+ * the camera node's LOCAL position above `center` (which the engine keeps at
+ * the character in Ogre space). This tracks animation AND ragdoll (the head
+ * bone follows the physics), and removes the eye-height guesswork/into-ground
+ * dip. MEMBER-STRUCT-RETURN ABI: this=RCX, retbuf=RDX, args=R8 (per KenshiCoop;
+ * same pattern as the working getPosition — NOT retbuf-first). */
+#define RVA_GET_BONE_WORLD 0x440360u
+#define HEAD_BONE_NAME    "Bip01 Head"
 /* World-space orientation setter. Used for the look direction so it's immune to
  * the parent `center` node's orientation — setting a *local* orientation made
  * the camera ROLL when yawing (local combined with center's tilt). Position
@@ -140,6 +154,9 @@ typedef void (*node_set_dori_t)(void *node, const Quat *q);  /* world _setDerive
 typedef void (*cam_set_fovy_t)(void *camera, const float *rad);
 typedef const float *(*cam_get_fovy_t)(void *camera);
 typedef void (*charmove_setdest_t)(void *mv, const Vec3 *dest, int pri, char shift);
+typedef void (*node_set_inhori_t)(void *node, char inherit);
+/* member-struct-return: this=RCX, retbuf=RDX, name=R8 */
+typedef Vec3 *(*get_bone_world_t)(void *character, Vec3 *ret, const void *name);
 
 static FILE *g_log;
 static uintptr_t g_base;
@@ -149,6 +166,9 @@ static stop_follow_t g_stop_following;
 static node_set_pos_t g_node_set_pos;   /* Ogre::Node::setPosition (local) */
 static node_set_ori_t g_node_set_ori;   /* Ogre::Node::setOrientation (local) */
 static node_set_dori_t g_node_set_dori; /* Ogre::Node::_setDerivedOrientation (world) */
+static node_set_inhori_t g_node_set_inhori; /* Ogre::Node::setInheritOrientation */
+static get_bone_world_t g_get_bone_world;   /* Character::getBoneWorldPosition */
+static unsigned char g_head_bone[32];   /* MSVC std::string "Bip01 Head" (SSO) */
 static int g_ogre_ready;
 static DWORD g_last_tick_ms;
 static int g_fp_mode;              /* toggled by VK_TOGGLE_FP edge */
@@ -295,7 +315,6 @@ static void camera_lock(void *gw)
  * (read-only, no cursor recenter -> no fight with the engine's own cursor). */
 static void fp_camera_override(void *gw)
 {
-    (void)gw;
     if (!g_ogre_ready) return;
     void *cam = *(void **)(g_base + RVA_CAM_INSTANCE);
     if (!readable(cam, CC_FREECAM + 1)) return;
@@ -325,8 +344,21 @@ static void fp_camera_override(void *gw)
         }
         SetCursorPos(cx, cy);  /* recenter so the cursor never drifts to edges */
 
-        /* Eye offset LOCAL to `center` (game keeps center at the character). */
+        /* Eye = the head bone. Offset LOCAL to `center` (kept at the character);
+         * (head - feet) is a world-axis displacement, and inheritOrientation is
+         * off (below) so it applies world-vertical. Falls back to a fixed eye
+         * height if the bone position looks invalid. */
         Vec3 eye = { 0.0f, EYE_HEIGHT, 0.0f };
+        if (g_get_bone_world) {
+            void *pc = first_player_char(gw);
+            Vec3 feet, head;
+            if (pc && char_position(pc, &feet)) {
+                g_get_bone_world(pc, &head, g_head_bone);
+                Vec3 off = { head.x - feet.x, head.y - feet.y, head.z - feet.z };
+                if (off.x*off.x + off.y*off.y + off.z*off.z > 0.25f) eye = off;
+            }
+        }
+        g_node_set_inhori(node, 0);   /* apply eye offset in world axes (no dip) */
 
         /* World look orientation q = q_yaw(Y) * q_pitch(X); no roll. Ogre camera
          * looks down -Z at identity. Set DERIVED (world) so the parent center
@@ -358,6 +390,7 @@ static void fp_camera_override(void *gw)
             g_cam_set_fovy(ogre_cam, &g_fov_default);
             g_fov_saved = 0;
         }
+        g_node_set_inhori(node, 1);   /* restore normal node inheritance */
         Quat ident = { 1.0f, 0.0f, 0.0f, 0.0f };
         g_node_set_ori(node, &ident);
     }
@@ -450,7 +483,13 @@ __declspec(dllexport) void dllStartPlugin(void)
     g_follow_object  = (follow_object_t)(g_base + RVA_FOLLOW_OBJECT);
     g_stop_following = (stop_follow_t)(g_base + RVA_STOP_FOLLOW);
     g_charmove_setdest = (charmove_setdest_t)(g_base + RVA_CHARMOVE_SETDEST);
-    logline("KenshiFP loaded (FP + FOV + WASD); module base %p", (void *)g_base);
+    g_get_bone_world   = (get_bone_world_t)(g_base + RVA_GET_BONE_WORLD);
+    /* MSVC std::string SSO for the head bone name (size<=15 -> inline buffer). */
+    memset(g_head_bone, 0, sizeof g_head_bone);
+    memcpy(g_head_bone, HEAD_BONE_NAME, sizeof(HEAD_BONE_NAME) - 1);
+    *(size_t *)(g_head_bone + 0x10) = sizeof(HEAD_BONE_NAME) - 1;  /* size */
+    *(size_t *)(g_head_bone + 0x18) = 15;                          /* capacity */
+    logline("KenshiFP loaded (FP + head-bone + FOV + WASD); module base %p", (void *)g_base);
 
     /* Resolve Ogre node world-transform setters from OgreMain_x64.dll. */
     HMODULE ogre = GetModuleHandleA("OgreMain_x64.dll");
@@ -458,9 +497,10 @@ __declspec(dllexport) void dllStartPlugin(void)
         g_node_set_pos  = (node_set_pos_t)GetProcAddress(ogre, OGRE_SETPOS_SYM);
         g_node_set_ori  = (node_set_ori_t)GetProcAddress(ogre, OGRE_SETORI_SYM);
         g_node_set_dori = (node_set_dori_t)GetProcAddress(ogre, OGRE_SETDORI_SYM);
+        g_node_set_inhori = (node_set_inhori_t)GetProcAddress(ogre, OGRE_SETINHORI_SYM);
         g_cam_set_fovy  = (cam_set_fovy_t)GetProcAddress(ogre, OGRE_SETFOVY_SYM);
         g_cam_get_fovy  = (cam_get_fovy_t)GetProcAddress(ogre, OGRE_GETFOVY_SYM);
-        g_ogre_ready = (g_node_set_pos && g_node_set_ori && g_node_set_dori);
+        g_ogre_ready = (g_node_set_pos && g_node_set_ori && g_node_set_dori && g_node_set_inhori);
         logline("Ogre FOV setters: set=%p get=%p", (void *)g_cam_set_fovy, (void *)g_cam_get_fovy);
     }
     logline(g_ogre_ready ? "Ogre node setters resolved (FP override armed)"

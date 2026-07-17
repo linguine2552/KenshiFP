@@ -127,6 +127,27 @@ Chased the CameraClass ctor to its storage site:
 - Stage-0 client UPDATED to read the true instance (0x2133310) and cross-check
   that CameraClass.camera(+0x68) == sceneCtx.camera(+0x58). Rebuilt.
 
+### 2026-07-17 — STAGE-0 VERIFIED IN-GAME (clean sweep, no crash, 70s+ stable)
+Ran isolated (KenshiMP plugins temporarily disabled). Log:
+scratchpad/KenshiFP_stage0_pass.log. All anchors confirmed:
+- CameraClass instance @ RVA 0x2133310 = LIVE (cam=0x2108b80, stable). Decisive
+  cross-check PASSED: CameraClass.camera(+0x68)==sceneCtx.camera(+0x58)
+  (ogreCam 0x331c3c0 "MATCH" every tick) -> instance + field layout CONFIRMED.
+  center(+0x58)=0x331a710, node(+0x70)=0x3324c90 both valid SceneNodes.
+- Player char path: pc=0 in menu/loading, then pc=0x6d66c450 pos
+  (-50978.8,1533.5,2932.5) after save load, via getPosition slot 8. CONFIRMED.
+- **WASD via Win32 GetAsyncKeyState WORKS under Proton** (digits flip exactly
+  with keys: A=0100, W+A=1100, W+D=1001, ...). So the engine `key` global is
+  NOT needed for input reading — big simplification.
+- F toggle works (FP ON/OFF per press). speedMult pinned 1.0. Hook stable.
+- INCIDENTAL: gw fixed at 0x142134110 -> GameWorld object is statically located
+  (RVA 0x2134110; this is what the `ou` global points to).
+- OPEN (non-blocking): yaw(+0x18)/pitch(+0x1C)/altitude(+0x60) all read 0.000.
+  Camera identity is proven via MATCH, so either the camera wasn't rotated or
+  these rotation fields live/update elsewhere. Resolve during M2 (mouse-look):
+  probe by rotating the camera in-game and watching which offsets change, or
+  decompile CameraClass::rotate/rotationUpdate for the real field indices.
+
 ### Still TODO for M1/M3 (find after boot-test confirms the instance)
 - CameraClass::update RVA: instance global 0x2133310 has many readers; update
   takes `this` in RCX so update itself doesn't read the global — its per-frame

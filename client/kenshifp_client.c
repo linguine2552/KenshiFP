@@ -1,21 +1,22 @@
 /*
  * KenshiFP client DLL — first-person mode for Kenshi 1.0.68 "Newland" x64.
  *
- * STAGE 0 (this file): read-only anchor validation. Installs the proven
- * per-frame MinHook trampoline on GameWorld::mainLoop_GPUSensitiveStuff, and
- * each frame (throttled) logs the pieces the camera-lock + WASD work depends
- * on, WITHOUT writing any game state yet:
- *   - GameWorld* (the hook's `this`) and its frameSpeedMult/player fields,
- *   - the camera-holder global DAT_142133308 and the Ogre::Camera* at +0x58,
- *   - the first player character and its world position (getPosition slot 8),
- *   - live WASD + toggle-key state via Win32 GetAsyncKeyState.
- * This proves the read path on the main thread before we start driving the
- * camera (M1) and issuing movement orders (M3). Same method as KenshiMP:
- * headless-Ghidra offsets -> mingw DLL -> Ogre plugin-path load -> in-game log.
+ * M1 (this file): CAMERA LOCK. Builds on the verified stage-0 read path. While
+ * FP mode is ON (toggle: F), each frame re-asserts CameraClass::followObject on
+ * the selected player character so the camera tracks it (a chase-cam lock);
+ * on toggle OFF, calls stopFollowing once to release. Everything else is still
+ * read-only observation, logged at 1 Hz.
+ *
+ * Verified stage-0 anchors it stands on (re/NOTES.md):
+ *   - per-frame MinHook trampoline on GameWorld::mainLoop_GPUSensitiveStuff,
+ *   - CameraClass instance at *(base + 0x2133310) (camera+0x68 == scene cam),
+ *   - player char via GameWorld->player->playerCharacters[0] + getPosition,
+ *   - WASD/toggle via Win32 GetAsyncKeyState (works under Proton).
+ * New M1 writes: followObject (0x6ae520) / stopFollowing (0x6ae560), both tiny
+ * leaf setters (no allocation) — safe to call from the main-thread hook.
  *
  * Loaded via Plugins_x64.cfg (Plugin=KenshiFP_x64), no RE_Kenshi.
- * All offsets: see ../re/NOTES.md. Field offsets from KenshiLib headers are
- * treated as provisional until this DLL's log confirms them in-game.
+ * All offsets: see ../re/NOTES.md.
  */
 #include <windows.h>
 #include <stdint.h>
@@ -45,11 +46,21 @@
 #define CC_YAW            0x18
 #define CC_PITCH          0x1C
 #define CC_FOLLOW_HAND    0x28       /* hand objectCurrentlyFollowing */
+#define CC_FOLLOW_IDS     0x30       /* the hand's 5 id dwords (what followObject writes) */
 #define CC_CENTER         0x58       /* Ogre::SceneNode* center */
 #define CC_CAMERA         0x68       /* Ogre::Camera* */
 #define CC_NODE           0x70       /* Ogre::SceneNode* */
 #define CC_ALTITUDE       0x60
 #define CC_FREECAM        0xBF
+
+/* CameraClass methods (M1 writes; RVAs derived in ../re/NOTES.md).
+ *   followObject(this /RCX/, const hand* object /RDX/): copies object's 5 id
+ *     dwords (object+0x8..+0x18) into this->objectCurrentlyFollowing (+0x30..).
+ *   stopFollowing(this /RCX/): resets those ids to the null-hand constants. */
+#define RVA_FOLLOW_OBJECT 0x6ae520u
+#define RVA_STOP_FOLLOW   0x6ae560u
+/* Character::handle (a `hand`) at Character+0x58; ids at +0x60.. (=hand+0x8). */
+#define CHAR_HANDLE       0x58
 
 /* ---- player character / position (proven in KenshiMP) ---- */
 #define PI_PLAYERCHARS    0x2B0      /* PlayerInterface::playerCharacters (lektor<Character*>) */
@@ -67,13 +78,18 @@
 typedef struct { float x, y, z; } Vec3;
 typedef Vec3 *(*get_position_t)(void *self, Vec3 *out);
 typedef void (*mainloop_t)(void *gw, float time);
+typedef void *(*follow_object_t)(void *cam, void *hand);
+typedef void (*stop_follow_t)(void *cam);
 
 static FILE *g_log;
 static uintptr_t g_base;
 static mainloop_t g_mainloop_orig;
+static follow_object_t g_follow_object;
+static stop_follow_t g_stop_following;
 static DWORD g_last_tick_ms;
 static int g_fp_mode;              /* toggled by VK_TOGGLE_FP edge */
 static int g_toggle_was_down;
+static int g_prev_fp;             /* g_fp_mode from last frame (edge detect) */
 
 static void logline(const char *fmt, ...)
 {
@@ -169,11 +185,33 @@ static void fp_tick(void *gw)
     int s = (GetAsyncKeyState(VK_S) & 0x8000) != 0;
     int d = (GetAsyncKeyState(VK_D) & 0x8000) != 0;
 
-    logline("[tick] fp=%d gw=%p speedMult=%.3f | cam=%p ogreCam=%p(scene=%p%s) center=%p node=%p yaw=%.3f pitch=%.3f alt=%.1f freecam=%u | pc=%p pos=%s(%.1f,%.1f,%.1f) | WASD=%d%d%d%d",
+    /* objectCurrentlyFollowing id[0] (cam+0x30) — confirms followObject wrote. */
+    uint32_t follow_id = readable(cam, CC_FOLLOW_IDS + 4)
+        ? *(uint32_t *)((uintptr_t)cam + CC_FOLLOW_IDS) : 0;
+
+    logline("[tick] fp=%d gw=%p speedMult=%.3f | cam=%p ogreCam=%p(scene=%p%s) center=%p node=%p yaw=%.3f pitch=%.3f alt=%.1f freecam=%u followId=%08x | pc=%p pos=%s(%.1f,%.1f,%.1f) | WASD=%d%d%d%d",
             g_fp_mode, gw, speedmult,
             cam, ogre_cam, scene_cam, (ogre_cam == scene_cam ? " MATCH" : " DIFF"),
-            center, node, yaw, pitch, alt, (unsigned)freecam,
+            center, node, yaw, pitch, alt, (unsigned)freecam, follow_id,
             pc, havepos ? "" : "?", pos.x, pos.y, pos.z, w, a, s, d);
+}
+
+/* M1 camera lock. Runs every frame. While FP is on, re-assert followObject on
+ * the selected character so the camera tracks it and any vanilla pan that
+ * cleared the follow is immediately overridden. On the FP->off edge, release. */
+static void camera_lock(void *gw)
+{
+    void *cam = *(void **)(g_base + RVA_CAM_INSTANCE);
+    if (!readable(cam, CC_FREECAM + 1)) return;
+
+    if (g_fp_mode) {
+        void *pc = first_player_char(gw);   /* v1: squad leader (index 0) */
+        if (pc && readable((void *)((uintptr_t)pc + CHAR_HANDLE), 0x20))
+            g_follow_object(cam, (void *)((uintptr_t)pc + CHAR_HANDLE));
+    } else if (g_prev_fp) {
+        g_stop_following(cam);              /* released this frame */
+    }
+    g_prev_fp = g_fp_mode;
 }
 
 static void hooked_mainloop(void *gw, float time)
@@ -181,6 +219,7 @@ static void hooked_mainloop(void *gw, float time)
     g_mainloop_orig(gw, time);     /* run the game's frame first */
 
     poll_input();                  /* every frame: catch toggle edges */
+    if (gw) camera_lock(gw);       /* every frame: assert/release the lock */
 
     DWORD now = GetTickCount();
     if (gw && (now - g_last_tick_ms) >= 1000) {   /* 1 Hz observation log */
@@ -193,7 +232,9 @@ __declspec(dllexport) void dllStartPlugin(void)
 {
     g_log = fopen("KenshiFP.log", "w");
     g_base = (uintptr_t)GetModuleHandleA(NULL);
-    logline("KenshiFP stage-0 loaded; module base %p", (void *)g_base);
+    g_follow_object  = (follow_object_t)(g_base + RVA_FOLLOW_OBJECT);
+    g_stop_following = (stop_follow_t)(g_base + RVA_STOP_FOLLOW);
+    logline("KenshiFP M1 (camera lock) loaded; module base %p", (void *)g_base);
 
     MH_STATUS mh = MH_Initialize();
     int ok = 0;
@@ -208,7 +249,7 @@ __declspec(dllexport) void dllStartPlugin(void)
         logline("MH_Initialize failed (MH_STATUS %d)", (int)mh);
     }
 
-    logline(ok ? "KenshiFP active: press F in-game to toggle FP intent; watch [tick] lines"
+    logline(ok ? "KenshiFP active: press F to lock/unlock camera to selected char; watch [tick] followId"
                : "KenshiFP FAILED to install per-frame hook");
 }
 

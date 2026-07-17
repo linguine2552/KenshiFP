@@ -148,6 +148,23 @@ scratchpad/KenshiFP_stage0_pass.log. All anchors confirmed:
   probe by rotating the camera in-game and watching which offsets change, or
   decompile CameraClass::rotate/rotationUpdate for the real field indices.
 
+### 2026-07-17 — M1 camera-lock functions found (cluster enum before ctor)
+Enumerated CameraClass methods in [0x6ad800,0x6af000) via ListAndDumpRange.java;
+identified two by field-access signature:
+- **followObject(const hand&) = RVA 0x6ae520.** ABI followObject(this /RCX/,
+  const hand* /RDX/). Body copies the hand's 5 id dwords (arg+0x8..+0x18) into
+  this->objectCurrentlyFollowing ids (this+0x30..+0x40) and zeroes the follow
+  offset (this+0x48). Leaf setter, no alloc.
+- **stopFollowing() = RVA 0x6ae560.** Resets this+0x30..+0x40 to the null-hand
+  constants DAT_141e3a600.. (same ones the ctor used) and clears +0x48.
+Character hand = Character+0x58 (ids at +0x60.. == hand+0x8), so
+followObject(cam, char+0x58) locks the camera to that character. No separate
+"isFollowing" bool exists — a valid followed hand == following; vanilla pan
+likely calls stopFollowing, so M1 RE-ASSERTS followObject every frame while FP
+on. (Nearby: FUN_1406ae960 @0x6ae960 calls Ogre::Camera vtable+0x108 with a
+scaled global — a zoom/FOV setter, unused for now.)
+M1 client writes followId to the log ([tick] followId=) to confirm the write.
+
 ### Still TODO for M1/M3 (find after boot-test confirms the instance)
 - CameraClass::update RVA: instance global 0x2133310 has many readers; update
   takes `this` in RCX so update itself doesn't read the global — its per-frame

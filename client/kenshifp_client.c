@@ -78,9 +78,15 @@
  * the target and walk (no strafing). We aim FAR ahead so it commits to a full-
  * speed walk, and only RE-ISSUE when the heading or key set changes (or a slow
  * refresh) — re-issuing a near target every frame made it re-path and creep. */
-#define MOVE_FAR           40.0f   /* world units ahead to aim */
-#define MOVE_REFRESH_MS    500     /* keep-alive re-issue while walking straight */
+/* Distance-controls-speed: the move target's distance is set by look pitch, the
+ * way right-clicking near your feet walks slowly and clicking far runs. Kenshi
+ * accelerates toward farther orders. Look DOWN (pitch +) -> near/slow; look UP
+ * (pitch -) -> far/run. */
+#define MOVE_NEAR          10.0f   /* target distance looking straight down (slow) */
+#define MOVE_FAR           350.0f  /* target distance looking up (full run) */
+#define MOVE_REFRESH_MS    300     /* keep-alive re-issue while walking */
 #define MOVE_TURN_EPS      0.12f   /* radians of heading change that forces a re-issue */
+#define EYE_DROP           3.0f    /* lower the eye below the head bone to eye level (tune) */
 
 /* ---- FOV ----
  * Ogre::Frustum::setFOVy(const Radian&) [Camera inherits it]; Radian == {float}.
@@ -192,6 +198,7 @@ static DWORD g_last_move_ms;
 static int g_was_moving;
 static float g_last_move_dir;      /* heading of last issued destination (radians) */
 static int g_last_move_keys;       /* WASD bitmask of last issued destination */
+static float g_dbg_center_y, g_dbg_eye_y;  /* diagnostics for eye-height tuning */
 
 static void logline(const char *fmt, ...)
 {
@@ -297,9 +304,9 @@ static void fp_tick(void *gw)
     (void)ogre_cam; (void)scene_cam; (void)center; (void)node;
     (void)yaw; (void)pitch; (void)alt; (void)freecam; (void)speedmult;
 
-    logline("[tick] fp=%d pc=%p pos=%s(%.1f,%.1f,%.1f) headOff=(%.2f,%.2f,%.2f) look(yaw=%.2f pitch=%.2f) | WASD=%d%d%d%d",
-            g_fp_mode, pc, havepos ? "" : "?", pos.x, pos.y, pos.z,
-            hoff.x, hoff.y, hoff.z, g_yaw, g_pitch, w, a, s, d);
+    logline("[tick] fp=%d pos=(%.1f,%.1f,%.1f) headOff.y=%.2f centerY=%.1f eyeY=%.1f look(yaw=%.2f pitch=%.2f) | WASD=%d%d%d%d",
+            g_fp_mode, pos.x, pos.y, pos.z,
+            hoff.y, g_dbg_center_y, g_dbg_eye_y, g_yaw, g_pitch, w, a, s, d);
 }
 
 /* M1 camera lock. Runs every frame. While FP is on, re-assert followObject on
@@ -373,7 +380,8 @@ static void fp_camera_override(void *gw)
                     if (h.x*h.x + h.y*h.y + h.z*h.z > 0.25f) off = h;
                 }
             }
-            Vec3 eyeW = { centerW.x + off.x, centerW.y + off.y, centerW.z + off.z };
+            Vec3 eyeW = { centerW.x + off.x, centerW.y + off.y - EYE_DROP, centerW.z + off.z };
+            g_dbg_center_y = centerW.y; g_dbg_eye_y = eyeW.y;   /* for tuning */
             g_node_set_dpos(node, &eyeW);
         }
 
@@ -452,8 +460,15 @@ static void fp_movement(void *gw)
     dx /= len; dz /= len;
     float dir = atan2f(dx, dz);    /* heading of the movement direction */
 
-    /* Re-issue only when the direction/keys change, or on a slow keep-alive —
-     * not every tick — so the character commits to a smooth walk. */
+    /* Target distance from look pitch (pitch + = looking down = near/slow;
+     * pitch - = looking up = far/run). The engine accelerates toward farther
+     * orders, so this gives smooth analog speed control by where you look. */
+    float t = (1.4f - g_pitch) / 2.8f;      /* 0 at full-down, 1 at full-up */
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    float dist = MOVE_NEAR + t * (MOVE_FAR - MOVE_NEAR);
+
+    /* Re-issue on heading/key change, a distance-bucket change, or keep-alive. */
     DWORD now = GetTickCount();
     float dturn = dir - g_last_move_dir;
     while (dturn >  3.14159265f) dturn -= 6.2831853f;
@@ -465,7 +480,7 @@ static void fp_movement(void *gw)
 
     Vec3 here;
     if (!char_position(pc, &here)) return;
-    Vec3 tgt = { here.x + dx * MOVE_FAR, here.y, here.z + dz * MOVE_FAR };
+    Vec3 tgt = { here.x + dx * dist, here.y, here.z + dz * dist };
     g_charmove_setdest(mv, &tgt, UPDATE_PRIORITY_HIGH, 0);
     g_was_moving = 1;
     g_last_move_ms = now;

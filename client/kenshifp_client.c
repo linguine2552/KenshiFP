@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "MinHook.h"
 
 /* ---- per-frame hook (proven in KenshiMP, same binary) ---- */
@@ -62,6 +63,18 @@
 /* Character::handle (a `hand`) at Character+0x58; ids at +0x60.. (=hand+0x8). */
 #define CHAR_HANDLE       0x58
 
+/* ---- M2 first-person (Ogre node override) ----
+ * CameraClass::update (RVA 0x6b0f90) each frame places the camera NODE (+0x70)
+ * at a 3rd-person offset from the center (which follows the character). For FP
+ * we override that node's WORLD transform every frame, after update() ran, via
+ * OgreMain_x64.dll exports:
+ *   Node::_setDerivedPosition(const Vector3&)   -> world eye position
+ *   Node::_setDerivedOrientation(const Quaternion&) -> mouse-look orientation
+ * The Ogre::Camera (+0x68) is attached to that node, so this drives the view. */
+#define OGRE_SETDPOS_SYM  "?_setDerivedPosition@Node@Ogre@@QEAAXAEBVVector3@2@@Z"
+#define OGRE_SETDORI_SYM  "?_setDerivedOrientation@Node@Ogre@@QEAAXAEBVQuaternion@2@@Z"
+#define EYE_HEIGHT        1.7f    /* world units above getPosition(); tune in-game */
+
 /* ---- player character / position (proven in KenshiMP) ---- */
 #define PI_PLAYERCHARS    0x2B0      /* PlayerInterface::playerCharacters (lektor<Character*>) */
 #define LEK_COUNT         0x8        /* lektor::count (u32) */
@@ -76,16 +89,22 @@
 #define VK_D 0x44
 
 typedef struct { float x, y, z; } Vec3;
+typedef struct { float w, x, y, z; } Quat;   /* Ogre::Quaternion order */
 typedef Vec3 *(*get_position_t)(void *self, Vec3 *out);
 typedef void (*mainloop_t)(void *gw, float time);
 typedef void *(*follow_object_t)(void *cam, void *hand);
 typedef void (*stop_follow_t)(void *cam);
+typedef void (*node_set_dpos_t)(void *node, const Vec3 *v);
+typedef void (*node_set_dori_t)(void *node, const Quat *q);
 
 static FILE *g_log;
 static uintptr_t g_base;
 static mainloop_t g_mainloop_orig;
 static follow_object_t g_follow_object;
 static stop_follow_t g_stop_following;
+static node_set_dpos_t g_node_set_dpos;   /* Ogre::Node::_setDerivedPosition */
+static node_set_dori_t g_node_set_dori;   /* Ogre::Node::_setDerivedOrientation */
+static int g_ogre_ready;
 static DWORD g_last_tick_ms;
 static int g_fp_mode;              /* toggled by VK_TOGGLE_FP edge */
 static int g_toggle_was_down;
@@ -214,12 +233,49 @@ static void camera_lock(void *gw)
     g_prev_fp = g_fp_mode;
 }
 
+/* M2 first-person override. After the game's camera update ran this frame,
+ * force the camera node to the character's eye position and a mouse-look
+ * orientation. Mouse-look v1: absolute cursor position maps to yaw/pitch
+ * (read-only, no cursor recenter -> no fight with the engine's own cursor). */
+static void fp_camera_override(void *gw)
+{
+    if (!g_ogre_ready || !g_fp_mode) return;
+    void *cam = *(void **)(g_base + RVA_CAM_INSTANCE);
+    if (!readable(cam, CC_NODE + 8)) return;
+    if (*(unsigned char *)((uintptr_t)cam + CC_FREECAM)) return;  /* leave free-cam alone */
+    void *node = *(void **)((uintptr_t)cam + CC_NODE);
+    if (!readable(node, 8)) return;
+
+    void *pc = first_player_char(gw);
+    Vec3 pos;
+    if (!pc || !char_position(pc, &pos)) return;
+    Vec3 eye = { pos.x, pos.y + EYE_HEIGHT, pos.z };
+
+    POINT cur; GetCursorPos(&cur);
+    int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    if (sw <= 0) sw = 1920;
+    if (sh <= 0) sh = 1080;
+    float yaw   = ((float)cur.x / (float)sw - 0.5f) * 6.2831853f;   /* ~±pi across screen */
+    float pitch = -((float)cur.y / (float)sh - 0.5f) * 2.4f;        /* look up/down */
+    if (pitch >  1.4f) pitch =  1.4f;
+    if (pitch < -1.4f) pitch = -1.4f;
+
+    /* q = q_yaw(Y) * q_pitch(X); Ogre camera looks down -Z at identity. */
+    float cy = cosf(yaw * 0.5f), sy = sinf(yaw * 0.5f);
+    float cp = cosf(pitch * 0.5f), sp = sinf(pitch * 0.5f);
+    Quat q = { cy * cp, cy * sp, sy * cp, -sy * sp };
+
+    g_node_set_dpos(node, &eye);
+    g_node_set_dori(node, &q);
+}
+
 static void hooked_mainloop(void *gw, float time)
 {
     g_mainloop_orig(gw, time);     /* run the game's frame first */
 
     poll_input();                  /* every frame: catch toggle edges */
     if (gw) camera_lock(gw);       /* every frame: assert/release the lock */
+    if (gw) fp_camera_override(gw);/* every frame: force FP eye + mouse-look */
 
     DWORD now = GetTickCount();
     if (gw && (now - g_last_tick_ms) >= 1000) {   /* 1 Hz observation log */
@@ -234,7 +290,17 @@ __declspec(dllexport) void dllStartPlugin(void)
     g_base = (uintptr_t)GetModuleHandleA(NULL);
     g_follow_object  = (follow_object_t)(g_base + RVA_FOLLOW_OBJECT);
     g_stop_following = (stop_follow_t)(g_base + RVA_STOP_FOLLOW);
-    logline("KenshiFP M1 (camera lock) loaded; module base %p", (void *)g_base);
+    logline("KenshiFP M2 (first person) loaded; module base %p", (void *)g_base);
+
+    /* Resolve Ogre node world-transform setters from OgreMain_x64.dll. */
+    HMODULE ogre = GetModuleHandleA("OgreMain_x64.dll");
+    if (ogre) {
+        g_node_set_dpos = (node_set_dpos_t)GetProcAddress(ogre, OGRE_SETDPOS_SYM);
+        g_node_set_dori = (node_set_dori_t)GetProcAddress(ogre, OGRE_SETDORI_SYM);
+        g_ogre_ready = (g_node_set_dpos && g_node_set_dori);
+    }
+    logline(g_ogre_ready ? "Ogre node setters resolved (FP override armed)"
+                         : "WARN: Ogre node setters NOT resolved (FP override disabled)");
 
     MH_STATUS mh = MH_Initialize();
     int ok = 0;
@@ -249,7 +315,7 @@ __declspec(dllexport) void dllStartPlugin(void)
         logline("MH_Initialize failed (MH_STATUS %d)", (int)mh);
     }
 
-    logline(ok ? "KenshiFP active: press F to lock/unlock camera to selected char; watch [tick] followId"
+    logline(ok ? "KenshiFP active: press F to toggle first-person; move mouse to look"
                : "KenshiFP FAILED to install per-frame hook");
 }
 

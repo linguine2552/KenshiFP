@@ -165,6 +165,36 @@ on. (Nearby: FUN_1406ae960 @0x6ae960 calls Ogre::Camera vtable+0x108 with a
 scaled global — a zoom/FOV setter, unused for now.)
 M1 client writes followId to the log ([tick] followId=) to confirm the write.
 
+### 2026-07-17 — M1 VERIFIED + M2 first-person built
+M1 verified in-game: followId flips 0000000b (null-hand type=0xb) <-> 00000001
+(followed) on F; camera locks onto/tracks the character; no crash. Confirms
+followObject/stopFollowing and the whole write path.
+
+CameraClass::update = **RVA 0x6b0f90** (found by branch on follow-hand type at
++0x30: ==0xb null, ==1 following, ==0x5b). Model learned:
+- if freeCameraMode(+0xbf): delegates to FUN_1406b0960 (free/orbit) and returns.
+- accumulates WASD-pan + rotate/tilt from DAT_142133xxx input flags.
+- when following: resolves the object, getPosition, setPosition(center node
+  +0x58) = character pos (+ offset). center = the look-at point.
+- writes yaw(+0x18)=rot-delta, pitch(+0x1C)=rot-delta  <-- these are PER-FRAME
+  DELTAS, ~0 at rest (explains the earlier 0.000 reading; NOT absolute angles).
+- FUN_1406afee0 (0x6afee0) applies yaw/pitch to the camera NODE (+0x70) via
+  Ogre::Node::yaw/pitch + DegreesToRadians (the tilt/orbit placement).
+- cursor: GetCursorPos/SetCursorPos while rotating (drag-rotate).
+
+M2 approach (built, awaiting test): Ogre is a SEPARATE DLL (OgreMain_x64.dll)
+whose transform methods are EXPORTS — resolve by mangled name, no RVA needed:
+  Node::_setDerivedPosition  ?_setDerivedPosition@Node@Ogre@@QEAAXAEBVVector3@2@@Z
+  Node::_setDerivedOrientation ?_setDerivedOrientation@Node@Ogre@@QEAAXAEBVQuaternion@2@@Z
+Each frame, AFTER the game's mainLoop (so after update() positioned the camera),
+override the camera node (+0x70) WORLD transform: derived pos = charPos +
+(0,EYE_HEIGHT,0); derived orientation = quat from mouse-look (v1: absolute
+cursor pos -> yaw/pitch, read-only, no recenter). Ogre::Camera(+0x68) is
+attached to that node so this drives the view. EYE_HEIGHT=1.7 provisional (tune).
+OPEN for the test: does render pick up the override (timing vs update())? is the
+look direction/handedness right? is EYE_HEIGHT sane? If the mainLoop-hook
+timing loses to update(), escalate to a MinHook trampoline on update() 0x6b0f90.
+
 ### Still TODO for M1/M3 (find after boot-test confirms the instance)
 - CameraClass::update RVA: instance global 0x2133310 has many readers; update
   takes `this` in RCX so update itself doesn't read the global — its per-frame

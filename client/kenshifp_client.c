@@ -63,17 +63,25 @@
 /* Character::handle (a `hand`) at Character+0x58; ids at +0x60.. (=hand+0x8). */
 #define CHAR_HANDLE       0x58
 
-/* ---- M3 WASD movement ----
- * Character::setDestination(Character* self, const Vec3* pos, bool shift) — the
- * PLAYER move-order path (RVA 0x5c84e0; found via the right-click order handler,
- * signature confirmed against KenshiCoop's g_charSetDestFn). A player character
- * obeys this (a bare CharMovement::setDestination is ignored). We breadcrumb it:
- * while a WASD key is held, order a point a few metres ahead in the camera's
- * facing direction, re-issued at ~10 Hz; on release, order the current position
- * (halt). The engine keeps pathfinding/collision/animation. */
-#define RVA_SET_DESTINATION 0x5c84e0u
-#define MOVE_STEP          10.0f   /* world units ahead to breadcrumb */
-#define MOVE_HZ_MS         100     /* re-issue interval while moving */
+/* ---- M3 WASD movement (in progress) ----
+ * Character->movement (CharMovement*) is at +0x640. CharMovement::setDestination
+ * (Vec3, UpdatePriority, bool) is VIRTUAL, but the header's vtable slot is stale
+ * for 1.0.68 (the getPosition lesson: header said slot 0, real was slot 8). So
+ * we DUMP the live CharMovement vtable to the log to identify the real slot,
+ * rather than guess and crash. The move call is disabled until that's confirmed. */
+#define CHAR_MOVEMENT      0x640   /* Character::movement (CharMovement*) */
+#define MOVE_STEP          10.0f
+#define MOVE_HZ_MS         100
+
+/* ---- FOV ----
+ * Ogre::Frustum::setFOVy(const Radian&) [Camera inherits it]; Radian == {float}.
+ * getFOVy returns a const ref (pointer in RAX -> safe ABI, unlike the by-value
+ * get* accessors). We capture the default FOV once, force FP_FOV while in first
+ * person, and restore on exit. */
+#define OGRE_SETFOVY_SYM  "?setFOVy@Frustum@Ogre@@UEAAXAEBVRadian@2@@Z"
+#define OGRE_GETFOVY_SYM  "?getFOVy@Frustum@Ogre@@UEBAAEBVRadian@2@XZ"
+#define FP_FOV_DEG        90.0f    /* vertical FOV while first-person; tune */
+#define DEG2RAD           0.01745329f
 
 /* ---- M2 first-person (Ogre node override) ----
  * Scene graph (from the ctor): root -> center(+0x58) -> node(+0x70) -> camera
@@ -120,7 +128,8 @@ typedef void (*stop_follow_t)(void *cam);
 typedef void (*node_set_pos_t)(void *node, const Vec3 *v);   /* local setPosition */
 typedef void (*node_set_ori_t)(void *node, const Quat *q);   /* local setOrientation */
 typedef void (*node_set_dori_t)(void *node, const Quat *q);  /* world _setDerivedOrientation */
-typedef void (*set_dest_t)(void *character, const Vec3 *pos, char shift);
+typedef void (*cam_set_fovy_t)(void *camera, const float *rad);
+typedef const float *(*cam_get_fovy_t)(void *camera);
 
 static FILE *g_log;
 static uintptr_t g_base;
@@ -137,9 +146,11 @@ static int g_toggle_was_down;
 static int g_prev_fp;             /* g_fp_mode from last frame (camera_lock edge) */
 static int g_ovr_prev;            /* was the FP node override active last frame */
 static float g_yaw, g_pitch;      /* accumulated mouse-look angles (radians) */
-static set_dest_t g_set_destination;  /* Character::setDestination */
-static DWORD g_last_move_ms;
-static int g_was_moving;
+static cam_set_fovy_t g_cam_set_fovy;
+static cam_get_fovy_t g_cam_get_fovy;
+static int g_fov_saved;
+static float g_fov_default;
+static int g_vt_dumped;           /* CharMovement vtable logged once */
 
 static void logline(const char *fmt, ...)
 {
@@ -312,63 +323,61 @@ static void fp_camera_override(void *gw)
 
         g_node_set_pos(node, &eye);
         g_node_set_dori(node, &q);
+
+        /* FOV: capture default once, then force the FP FOV each frame. */
+        void *ogre_cam = *(void **)((uintptr_t)cam + CC_CAMERA);
+        if (g_cam_set_fovy && readable(ogre_cam, 8)) {
+            if (!g_fov_saved && g_cam_get_fovy) {
+                const float *d = g_cam_get_fovy(ogre_cam);
+                if (readable((void *)d, 4)) { g_fov_default = *d; g_fov_saved = 1; }
+            }
+            float rad = FP_FOV_DEG * DEG2RAD;
+            g_cam_set_fovy(ogre_cam, &rad);
+        }
     } else if (g_ovr_prev) {
-        /* FP exit: release the cursor and level the node orientation to identity
-         * so update()'s incremental rotations no longer drift off our FP angle.
-         * Position is left for update() to reset via its normal path. */
+        /* FP exit: release the cursor, restore FOV, and level the node
+         * orientation to identity so update()'s incremental rotations no longer
+         * drift off our FP angle (position is left for update() to reset). */
         while (ShowCursor(TRUE) < 0) { }
+        void *ogre_cam = *(void **)((uintptr_t)cam + CC_CAMERA);
+        if (g_fov_saved && g_cam_set_fovy && readable(ogre_cam, 8)) {
+            g_cam_set_fovy(ogre_cam, &g_fov_default);
+            g_fov_saved = 0;
+        }
         Quat ident = { 1.0f, 0.0f, 0.0f, 0.0f };
         g_node_set_ori(node, &ident);
     }
     g_ovr_prev = active;
 }
 
-/* M3: drive the followed character with WASD, relative to where we're looking.
- * Breadcrumb Character::setDestination a few metres ahead at ~10 Hz; halt at the
- * current position when all keys release. */
+/* Log the followed character's CharMovement (+0x640) vtable so we can identify
+ * the real setDestination slot offline (header vtable offsets are stale for
+ * 1.0.68). Runs once. Read-only. */
+static void dump_movement_vtable(void *pc)
+{
+    void *mv = readable((void *)((uintptr_t)pc + CHAR_MOVEMENT), 8)
+        ? *(void **)((uintptr_t)pc + CHAR_MOVEMENT) : NULL;
+    if (!readable(mv, 8)) { logline("[mv] movement ptr not readable"); return; }
+    void **vt = *(void ***)mv;
+    if (!readable(vt, 8)) { logline("[mv] movement vtable not readable"); return; }
+    logline("[mv] movement=%p vtable RVA 0x%zx (base %p)",
+            mv, (uintptr_t)vt - g_base, (void *)g_base);
+    for (int i = 0; i < 40; i++) {
+        if (!readable(&vt[i], 8)) break;
+        void *f = vt[i];
+        if (!readable(f, 1)) continue;
+        logline("[mv] vt[%2d] off=0x%02x -> RVA 0x%zx", i, i * 8, (uintptr_t)f - g_base);
+    }
+}
+
+/* M3 WASD movement — DISABLED pending the correct setDestination slot. For now
+ * just dumps the CharMovement vtable once so we can pin it without crashing. */
 static void fp_movement(void *gw)
 {
-    if (!g_fp_mode || !g_set_destination) return;
+    if (!g_fp_mode) return;
     void *pc = first_player_char(gw);
     if (!pc) return;
-
-    int w = (GetAsyncKeyState(VK_W) & 0x8000) != 0;
-    int s = (GetAsyncKeyState(VK_S) & 0x8000) != 0;
-    int a = (GetAsyncKeyState(VK_A) & 0x8000) != 0;
-    int d = (GetAsyncKeyState(VK_D) & 0x8000) != 0;
-    float mf = (float)(w - s);     /* forward axis */
-    float mr = (float)(d - a);     /* strafe axis  */
-
-    if (mf == 0.0f && mr == 0.0f) {
-        if (g_was_moving) {         /* release: halt at current position */
-            Vec3 here;
-            if (char_position(pc, &here)) g_set_destination(pc, &here, 0);
-            g_was_moving = 0;
-        }
-        return;
-    }
-
-    DWORD now = GetTickCount();
-    if (now - g_last_move_ms < MOVE_HZ_MS) return;
-    g_last_move_ms = now;
-
-    Vec3 here;
-    if (!char_position(pc, &here)) return;
-
-    /* Move relative to the camera heading (g_yaw). Ogre Y-up, camera looks -Z:
-     * forward = (-sin,0,-cos), right = (cos,0,-sin). */
-    float th = g_yaw;
-    float fx = -sinf(th), fz = -cosf(th);
-    float rx =  cosf(th), rz = -sinf(th);
-    float dx = fx * mf + rx * mr;
-    float dz = fz * mf + rz * mr;
-    float len = sqrtf(dx * dx + dz * dz);
-    if (len < 0.001f) return;
-    dx /= len; dz /= len;
-
-    Vec3 tgt = { here.x + dx * MOVE_STEP, here.y, here.z + dz * MOVE_STEP };
-    g_set_destination(pc, &tgt, 0);
-    g_was_moving = 1;
+    if (!g_vt_dumped) { g_vt_dumped = 1; dump_movement_vtable(pc); }
 }
 
 static void hooked_mainloop(void *gw, float time)
@@ -393,8 +402,7 @@ __declspec(dllexport) void dllStartPlugin(void)
     g_base = (uintptr_t)GetModuleHandleA(NULL);
     g_follow_object  = (follow_object_t)(g_base + RVA_FOLLOW_OBJECT);
     g_stop_following = (stop_follow_t)(g_base + RVA_STOP_FOLLOW);
-    g_set_destination = (set_dest_t)(g_base + RVA_SET_DESTINATION);
-    logline("KenshiFP M3 (first person + WASD move) loaded; module base %p", (void *)g_base);
+    logline("KenshiFP loaded (FP + FOV; WASD pending vtable id); module base %p", (void *)g_base);
 
     /* Resolve Ogre node world-transform setters from OgreMain_x64.dll. */
     HMODULE ogre = GetModuleHandleA("OgreMain_x64.dll");
@@ -402,7 +410,10 @@ __declspec(dllexport) void dllStartPlugin(void)
         g_node_set_pos  = (node_set_pos_t)GetProcAddress(ogre, OGRE_SETPOS_SYM);
         g_node_set_ori  = (node_set_ori_t)GetProcAddress(ogre, OGRE_SETORI_SYM);
         g_node_set_dori = (node_set_dori_t)GetProcAddress(ogre, OGRE_SETDORI_SYM);
+        g_cam_set_fovy  = (cam_set_fovy_t)GetProcAddress(ogre, OGRE_SETFOVY_SYM);
+        g_cam_get_fovy  = (cam_get_fovy_t)GetProcAddress(ogre, OGRE_GETFOVY_SYM);
         g_ogre_ready = (g_node_set_pos && g_node_set_ori && g_node_set_dori);
+        logline("Ogre FOV setters: set=%p get=%p", (void *)g_cam_set_fovy, (void *)g_cam_get_fovy);
     }
     logline(g_ogre_ready ? "Ogre node setters resolved (FP override armed)"
                          : "WARN: Ogre node setters NOT resolved (FP override disabled)");
@@ -420,7 +431,7 @@ __declspec(dllexport) void dllStartPlugin(void)
         logline("MH_Initialize failed (MH_STATUS %d)", (int)mh);
     }
 
-    logline(ok ? "KenshiFP active: F = first-person; mouse = look; WASD = move"
+    logline(ok ? "KenshiFP active: F = first-person; mouse = look (WASD move pending)"
                : "KenshiFP FAILED to install per-frame hook");
 }
 

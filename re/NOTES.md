@@ -209,7 +209,28 @@ Also user reported inverted left/right → negated the yaw mapping. Rebuilt.
 Note _getDerivedPosition@Node returns Vector3 BY VALUE (?AV...) → ABI is
 (retbuf RCX, this RDX); skipped it as a diagnostic to avoid ABI slips.
 
-### Still TODO for M1/M3 (find after boot-test confirms the instance)
+### 2026-07-17 — M2 polish + M3 WASD movement
+M2 fixes shipped: yaw-roll (use Ogre Node::_setDerivedOrientation WORLD for the
+look so parent center's orientation can't induce roll; position stays local),
+relative mouse-look w/ SetCursorPos recenter + ShowCursor hide, EYE_HEIGHT 2.6.
+Ogre get* accessors return BY VALUE and CRASH across our ABI — never call them;
+only setters (void return) are safe.
+
+M3: **Character::setDestination = RVA 0x5c84e0** (the PLAYER move-order path).
+Found via KenshiCoop (g_charSetDestFn = KenshiLib::GetRealAddress(&Character::
+setDestination), sig `void(Character* self, const Ogre::Vector3* pos, bool
+shift)`); in 1.0.68 it's the only (this,Vec3*,bool) fn in the Character cluster
+that is called from the right-click-move GUI handlers (FUN_140347950,
+FUN_140358040) + AI (0x5f03c0/0x5f16a0/0x5f5d10). It writes dest Vec3 to
+Character+0x48 and notifies the goal obj at Character+0x640 (vtable+0xc0) then
+the movement path (Character+0x448). Sibling FUN_1405c8540 (0x5c8540) is the
+bare movement-only variant (a player char ignores it — matches KenshiCoop).
+WASD breadcrumbs setDestination(char, charPos + heading*MOVE_STEP, 0) at ~10Hz;
+halt = setDestination(char, charPos) on release. Heading from mouse-look yaw.
+Character::movement offset (per KenshiCoop c->movement) not needed — we use the
+player path only. AWAITING test (movement works? forward/strafe sign correct?).
+
+### Still TODO (find after boot-test confirms the instance)
 - CameraClass::update RVA: instance global 0x2133310 has many readers; update
   takes `this` in RCX so update itself doesn't read the global — its per-frame
   CALLER does. Identify the caller among the 0x2133310 readers, or find

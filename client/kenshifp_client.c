@@ -76,12 +76,15 @@
  *   Node::setOrientation(Quaternion)      [local; 16B struct -> passed by ptr] */
 #define OGRE_SETPOS_SYM   "?setPosition@Node@Ogre@@QEAAXAEBVVector3@2@@Z"
 #define OGRE_SETORI_SYM   "?setOrientation@Node@Ogre@@QEAAXVQuaternion@2@@Z"
-/* NOTE: Ogre's getPosition/getOrientation return Vector3/Quaternion BY VALUE;
- * calling them across our ABI boundary crashed, so we do NOT read node state.
- * Clean FP exit instead just levels the node orientation to identity (below),
- * which stops update()'s incremental rotations from drifting off our last FP
- * angle. Only the setters (which work reliably) are used. */
-#define EYE_HEIGHT        1.85f   /* local units above `center`; tune in-game */
+/* World-space orientation setter. Used for the look direction so it's immune to
+ * the parent `center` node's orientation — setting a *local* orientation made
+ * the camera ROLL when yawing (local combined with center's tilt). Position
+ * stays LOCAL (small eye offset above center) to avoid world-coordinate issues.
+ * NOTE: Ogre's get* accessors return BY VALUE and crashed across our ABI, so we
+ * never read node state; FP exit just levels local orientation to identity. */
+#define OGRE_SETDORI_SYM  "?_setDerivedOrientation@Node@Ogre@@QEAAXAEBVQuaternion@2@@Z"
+#define EYE_HEIGHT        2.6f    /* local units above `center`; tune in-game */
+#define LOOK_SENS         0.0025f /* radians per mouse pixel */
 
 /* ---- player character / position (proven in KenshiMP) ---- */
 #define PI_PLAYERCHARS    0x2B0      /* PlayerInterface::playerCharacters (lektor<Character*>) */
@@ -104,6 +107,7 @@ typedef void *(*follow_object_t)(void *cam, void *hand);
 typedef void (*stop_follow_t)(void *cam);
 typedef void (*node_set_pos_t)(void *node, const Vec3 *v);   /* local setPosition */
 typedef void (*node_set_ori_t)(void *node, const Quat *q);   /* local setOrientation */
+typedef void (*node_set_dori_t)(void *node, const Quat *q);  /* world _setDerivedOrientation */
 
 static FILE *g_log;
 static uintptr_t g_base;
@@ -112,12 +116,14 @@ static follow_object_t g_follow_object;
 static stop_follow_t g_stop_following;
 static node_set_pos_t g_node_set_pos;   /* Ogre::Node::setPosition (local) */
 static node_set_ori_t g_node_set_ori;   /* Ogre::Node::setOrientation (local) */
+static node_set_dori_t g_node_set_dori; /* Ogre::Node::_setDerivedOrientation (world) */
 static int g_ogre_ready;
 static DWORD g_last_tick_ms;
 static int g_fp_mode;              /* toggled by VK_TOGGLE_FP edge */
 static int g_toggle_was_down;
 static int g_prev_fp;             /* g_fp_mode from last frame (camera_lock edge) */
 static int g_ovr_prev;            /* was the FP node override active last frame */
+static float g_yaw, g_pitch;      /* accumulated mouse-look angles (radians) */
 
 static void logline(const char *fmt, ...)
 {
@@ -259,29 +265,42 @@ static void fp_camera_override(void *gw)
     int active = g_fp_mode && !*(unsigned char *)((uintptr_t)cam + CC_FREECAM);
 
     if (active) {
+        int cx = GetSystemMetrics(SM_CXSCREEN) / 2;
+        int cy = GetSystemMetrics(SM_CYSCREEN) / 2;
+        if (cx <= 0) cx = 960;
+        if (cy <= 0) cy = 540;
+
+        POINT cur; GetCursorPos(&cur);
+        if (!g_ovr_prev) {
+            /* FP enter: zero the look and capture the cursor (hide + center). */
+            g_yaw = 0.0f; g_pitch = 0.0f;
+            while (ShowCursor(FALSE) >= 0) { }
+        } else {
+            /* relative mouse-look: accumulate delta from screen center */
+            g_yaw   -= (float)(cur.x - cx) * LOOK_SENS;   /* mouse right -> look right */
+            g_pitch += (float)(cur.y - cy) * LOOK_SENS;   /* mouse down  -> look down  */
+            if (g_pitch >  1.4f) g_pitch =  1.4f;
+            if (g_pitch < -1.4f) g_pitch = -1.4f;
+        }
+        SetCursorPos(cx, cy);  /* recenter so the cursor never drifts to edges */
+
         /* Eye offset LOCAL to `center` (game keeps center at the character). */
         Vec3 eye = { 0.0f, EYE_HEIGHT, 0.0f };
 
-        POINT cur; GetCursorPos(&cur);
-        int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
-        if (sw <= 0) sw = 1920;
-        if (sh <= 0) sh = 1080;
-        float yaw   = -((float)cur.x / (float)sw - 0.5f) * 6.2831853f;  /* left cursor -> look left */
-        float pitch =  ((float)cur.y / (float)sh - 0.5f) * 2.4f;        /* mouse up -> look up */
-        if (pitch >  1.4f) pitch =  1.4f;
-        if (pitch < -1.4f) pitch = -1.4f;
-
-        /* q = q_yaw(Y) * q_pitch(X); Ogre camera looks down -Z at identity. */
-        float cy = cosf(yaw * 0.5f), sy = sinf(yaw * 0.5f);
-        float cp = cosf(pitch * 0.5f), sp = sinf(pitch * 0.5f);
-        Quat q = { cy * cp, cy * sp, sy * cp, -sy * sp };
+        /* World look orientation q = q_yaw(Y) * q_pitch(X); no roll. Ogre camera
+         * looks down -Z at identity. Set DERIVED (world) so the parent center
+         * node's orientation can't induce roll. */
+        float qy = cosf(g_yaw * 0.5f),   sqy = sinf(g_yaw * 0.5f);
+        float qp = cosf(g_pitch * 0.5f), sqp = sinf(g_pitch * 0.5f);
+        Quat q = { qy * qp, qy * sqp, sqy * qp, -sqy * sqp };
 
         g_node_set_pos(node, &eye);
-        g_node_set_ori(node, &q);
+        g_node_set_dori(node, &q);
     } else if (g_ovr_prev) {
-        /* FP exit: level the node orientation to identity so update()'s
-         * incremental rotations no longer drift off our last FP angle. Position
-         * is left for update() to reset via its normal (non-follow) path. */
+        /* FP exit: release the cursor and level the node orientation to identity
+         * so update()'s incremental rotations no longer drift off our FP angle.
+         * Position is left for update() to reset via its normal path. */
+        while (ShowCursor(TRUE) < 0) { }
         Quat ident = { 1.0f, 0.0f, 0.0f, 0.0f };
         g_node_set_ori(node, &ident);
     }
@@ -314,9 +333,10 @@ __declspec(dllexport) void dllStartPlugin(void)
     /* Resolve Ogre node world-transform setters from OgreMain_x64.dll. */
     HMODULE ogre = GetModuleHandleA("OgreMain_x64.dll");
     if (ogre) {
-        g_node_set_pos = (node_set_pos_t)GetProcAddress(ogre, OGRE_SETPOS_SYM);
-        g_node_set_ori = (node_set_ori_t)GetProcAddress(ogre, OGRE_SETORI_SYM);
-        g_ogre_ready = (g_node_set_pos && g_node_set_ori);
+        g_node_set_pos  = (node_set_pos_t)GetProcAddress(ogre, OGRE_SETPOS_SYM);
+        g_node_set_ori  = (node_set_ori_t)GetProcAddress(ogre, OGRE_SETORI_SYM);
+        g_node_set_dori = (node_set_dori_t)GetProcAddress(ogre, OGRE_SETDORI_SYM);
+        g_ogre_ready = (g_node_set_pos && g_node_set_ori && g_node_set_dori);
     }
     logline(g_ogre_ready ? "Ogre node setters resolved (FP override armed)"
                          : "WARN: Ogre node setters NOT resolved (FP override disabled)");

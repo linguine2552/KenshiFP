@@ -84,9 +84,10 @@
  * (pitch -) -> far/run. */
 #define MOVE_NEAR          10.0f   /* target distance looking straight down (slow) */
 #define MOVE_FAR           350.0f  /* target distance looking up (full run) */
-#define MOVE_REFRESH_MS    300     /* keep-alive re-issue while walking */
+#define MOVE_RETARGET_FRAC 0.4f    /* re-issue once the char has closed to this fraction of the target */
+#define MOVE_KEEPALIVE_MS  2000    /* safety re-issue if nothing else triggers */
 #define MOVE_TURN_EPS      0.12f   /* radians of heading change that forces a re-issue */
-#define EYE_DROP           3.0f    /* lower the eye below the head bone to eye level (tune) */
+#define EYE_DROP           2.0f    /* lower the eye below the head bone to eye level (tune) */
 
 /* ---- FOV ----
  * Ogre::Frustum::setFOVy(const Radian&) [Camera inherits it]; Radian == {float}.
@@ -198,6 +199,7 @@ static DWORD g_last_move_ms;
 static int g_was_moving;
 static float g_last_move_dir;      /* heading of last issued destination (radians) */
 static int g_last_move_keys;       /* WASD bitmask of last issued destination */
+static float g_move_tx, g_move_tz, g_move_dist;  /* last issued target + its distance */
 static float g_dbg_center_y, g_dbg_eye_y;  /* diagnostics for eye-height tuning */
 
 static void logline(const char *fmt, ...)
@@ -370,17 +372,25 @@ static void fp_camera_override(void *gw)
         void *center = *(void **)((uintptr_t)cam + CC_CENTER);
         Vec3 centerW;
         if (readable(center, 8) && g_node_get_dpos(center, &centerW)) {
-            Vec3 off = { 0.0f, EYE_HEIGHT, 0.0f };  /* fallback */
+            /* The `center` node bobs/smooths with the vanilla camera, so it is a
+             * bad vertical anchor. Take X/Z from it (Ogre space; X/Z are rebased
+             * by the floating origin so we must stay in Ogre space + add the head
+             * lean), but take Y straight from the head bone (Y is NOT rebased and
+             * is stable) -> the eye is welded to head height, no bob. */
+            Vec3 eyeW = { centerW.x, centerW.y + EYE_HEIGHT - EYE_DROP, centerW.z };  /* fallback */
             if (g_get_bone_world) {
                 void *pc = first_player_char(gw);
                 Vec3 feet, head;
                 if (pc && char_position(pc, &feet)) {
                     g_get_bone_world(pc, &head, g_head_bone);
                     Vec3 h = { head.x - feet.x, head.y - feet.y, head.z - feet.z };
-                    if (h.x*h.x + h.y*h.y + h.z*h.z > 0.25f) off = h;
+                    if (h.x*h.x + h.y*h.y + h.z*h.z > 0.25f) {
+                        eyeW.x = centerW.x + h.x;
+                        eyeW.y = head.y - EYE_DROP;   /* head-bone Y directly (stable) */
+                        eyeW.z = centerW.z + h.z;
+                    }
                 }
             }
-            Vec3 eyeW = { centerW.x + off.x, centerW.y + off.y - EYE_DROP, centerW.z + off.z };
             g_dbg_center_y = centerW.y; g_dbg_eye_y = eyeW.y;   /* for tuning */
             g_node_set_dpos(node, &eyeW);
         }
@@ -468,20 +478,27 @@ static void fp_movement(void *gw)
     if (t > 1.0f) t = 1.0f;
     float dist = MOVE_NEAR + t * (MOVE_FAR - MOVE_NEAR);
 
-    /* Re-issue on heading/key change, a distance-bucket change, or keep-alive. */
+    Vec3 here;
+    if (!char_position(pc, &here)) return;
+
+    /* Re-issue only when needed — key change, a real turn, or once the char has
+     * closed most of the way to the current target — NOT every tick. Re-issuing
+     * a fresh nearby destination each frame is what made it stutter-step. */
     DWORD now = GetTickCount();
     float dturn = dir - g_last_move_dir;
     while (dturn >  3.14159265f) dturn -= 6.2831853f;
     while (dturn < -3.14159265f) dturn += 6.2831853f;
+    float rtx = g_move_tx - here.x, rtz = g_move_tz - here.z;
+    float remain = sqrtf(rtx * rtx + rtz * rtz);
     int changed = !g_was_moving || keys != g_last_move_keys
                 || (dturn > MOVE_TURN_EPS || dturn < -MOVE_TURN_EPS)
-                || (now - g_last_move_ms) > MOVE_REFRESH_MS;
+                || (remain < g_move_dist * MOVE_RETARGET_FRAC)
+                || (now - g_last_move_ms) > MOVE_KEEPALIVE_MS;
     if (!changed) return;
 
-    Vec3 here;
-    if (!char_position(pc, &here)) return;
     Vec3 tgt = { here.x + dx * dist, here.y, here.z + dz * dist };
     g_charmove_setdest(mv, &tgt, UPDATE_PRIORITY_HIGH, 0);
+    g_move_tx = tgt.x; g_move_tz = tgt.z; g_move_dist = dist;
     g_was_moving = 1;
     g_last_move_ms = now;
     g_last_move_dir = dir;

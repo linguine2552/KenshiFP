@@ -130,7 +130,8 @@
  * NOTE: Ogre's get* accessors return BY VALUE and crashed across our ABI, so we
  * never read node state; FP exit just levels local orientation to identity. */
 #define OGRE_SETDORI_SYM  "?_setDerivedOrientation@Node@Ogre@@QEAAXAEBVQuaternion@2@@Z"
-#define EYE_HEIGHT        5.6f    /* local units above `center`; tune in-game */
+#define EYE_HEIGHT        1.7f    /* fallback eye height ONLY when the head bone
+                                   * read fails; head-bone offset is used when valid */
 #define LOOK_SENS         0.0025f /* radians per mouse pixel */
 
 /* ---- player character / position (proven in KenshiMP) ---- */

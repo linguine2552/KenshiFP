@@ -87,7 +87,7 @@
 #define MOVE_RETARGET_FRAC 0.4f    /* re-issue once the char has closed to this fraction of the target */
 #define MOVE_KEEPALIVE_MS  2000    /* safety re-issue if nothing else triggers */
 #define MOVE_TURN_EPS      0.12f   /* radians of heading change that forces a re-issue */
-#define EYE_DROP           2.0f    /* lower the eye below the head bone to eye level (tune) */
+#define EYE_DROP           (-1.5f) /* offset from the head bone Y (negative = raise); tune */
 
 /* ---- FOV ----
  * Ogre::Frustum::setFOVy(const Radian&) [Camera inherits it]; Radian == {float}.
@@ -467,7 +467,7 @@ static void fp_movement(void *gw)
     float dz = fz * mf + rz * mr;
     float len = sqrtf(dx * dx + dz * dz);
     if (len < 0.001f) return;
-    dx /= len; dz /= len;
+    dx = -dx / len; dz = -dz / len;   /* negate: W=forward, S=back, A=left, D=right */
 
     /* Target distance from look pitch (pitch + = looking down = near/slow;
      * pitch - = looking up = far/run). The engine accelerates toward farther

@@ -74,8 +74,13 @@
 #define CHAR_MOVEMENT      0x640   /* Character::movement (CharMovement*) */
 #define RVA_CHARMOVE_SETDEST 0x661270u
 #define UPDATE_PRIORITY_HIGH 2
-#define MOVE_STEP          10.0f
-#define MOVE_HZ_MS         100
+/* Orient-to-direction movement: setDestination makes the character turn to face
+ * the target and walk (no strafing). We aim FAR ahead so it commits to a full-
+ * speed walk, and only RE-ISSUE when the heading or key set changes (or a slow
+ * refresh) — re-issuing a near target every frame made it re-path and creep. */
+#define MOVE_FAR           40.0f   /* world units ahead to aim */
+#define MOVE_REFRESH_MS    500     /* keep-alive re-issue while walking straight */
+#define MOVE_TURN_EPS      0.12f   /* radians of heading change that forces a re-issue */
 
 /* ---- FOV ----
  * Ogre::Frustum::setFOVy(const Radian&) [Camera inherits it]; Radian == {float}.
@@ -107,7 +112,7 @@
  * NOTE: Ogre's get* accessors return BY VALUE and crashed across our ABI, so we
  * never read node state; FP exit just levels local orientation to identity. */
 #define OGRE_SETDORI_SYM  "?_setDerivedOrientation@Node@Ogre@@QEAAXAEBVQuaternion@2@@Z"
-#define EYE_HEIGHT        3.6f    /* local units above `center`; tune in-game */
+#define EYE_HEIGHT        5.6f    /* local units above `center`; tune in-game */
 #define LOOK_SENS         0.0025f /* radians per mouse pixel */
 
 /* ---- player character / position (proven in KenshiMP) ---- */
@@ -158,6 +163,8 @@ static float g_fov_default;
 static charmove_setdest_t g_charmove_setdest;  /* CharMovement::setDestination */
 static DWORD g_last_move_ms;
 static int g_was_moving;
+static float g_last_move_dir;      /* heading of last issued destination (radians) */
+static int g_last_move_keys;       /* WASD bitmask of last issued destination */
 
 static void logline(const char *fmt, ...)
 {
@@ -373,10 +380,11 @@ static void fp_movement(void *gw)
     int s = (GetAsyncKeyState(VK_S) & 0x8000) != 0;
     int a = (GetAsyncKeyState(VK_A) & 0x8000) != 0;
     int d = (GetAsyncKeyState(VK_D) & 0x8000) != 0;
-    float mf = (float)(w - s);     /* forward axis */
-    float mr = (float)(d - a);     /* strafe axis  */
+    int keys = w | (s << 1) | (a << 2) | (d << 3);
+    float mf = (float)(w - s);     /* forward/back */
+    float mr = (float)(d - a);     /* left/right (turns the char, not strafe) */
 
-    if (mf == 0.0f && mr == 0.0f) {
+    if (keys == 0 || (mf == 0.0f && mr == 0.0f)) {
         if (g_was_moving) {         /* release: halt at current position */
             Vec3 here;
             if (char_position(pc, &here))
@@ -386,14 +394,7 @@ static void fp_movement(void *gw)
         return;
     }
 
-    DWORD now = GetTickCount();
-    if (now - g_last_move_ms < MOVE_HZ_MS) return;
-    g_last_move_ms = now;
-
-    Vec3 here;
-    if (!char_position(pc, &here)) return;
-
-    /* Heading from mouse-look yaw. Ogre Y-up, camera looks -Z:
+    /* Desired heading, relative to the camera yaw. Ogre Y-up, camera looks -Z:
      * forward = (-sin,0,-cos), right = (cos,0,-sin). */
     float th = g_yaw;
     float fx = -sinf(th), fz = -cosf(th);
@@ -403,10 +404,27 @@ static void fp_movement(void *gw)
     float len = sqrtf(dx * dx + dz * dz);
     if (len < 0.001f) return;
     dx /= len; dz /= len;
+    float dir = atan2f(dx, dz);    /* heading of the movement direction */
 
-    Vec3 tgt = { here.x + dx * MOVE_STEP, here.y, here.z + dz * MOVE_STEP };
+    /* Re-issue only when the direction/keys change, or on a slow keep-alive —
+     * not every tick — so the character commits to a smooth walk. */
+    DWORD now = GetTickCount();
+    float dturn = dir - g_last_move_dir;
+    while (dturn >  3.14159265f) dturn -= 6.2831853f;
+    while (dturn < -3.14159265f) dturn += 6.2831853f;
+    int changed = !g_was_moving || keys != g_last_move_keys
+                || (dturn > MOVE_TURN_EPS || dturn < -MOVE_TURN_EPS)
+                || (now - g_last_move_ms) > MOVE_REFRESH_MS;
+    if (!changed) return;
+
+    Vec3 here;
+    if (!char_position(pc, &here)) return;
+    Vec3 tgt = { here.x + dx * MOVE_FAR, here.y, here.z + dz * MOVE_FAR };
     g_charmove_setdest(mv, &tgt, UPDATE_PRIORITY_HIGH, 0);
     g_was_moving = 1;
+    g_last_move_ms = now;
+    g_last_move_dir = dir;
+    g_last_move_keys = keys;
 }
 
 static void hooked_mainloop(void *gw, float time)

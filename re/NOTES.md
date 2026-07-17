@@ -195,6 +195,20 @@ OPEN for the test: does render pick up the override (timing vs update())? is the
 look direction/handedness right? is EYE_HEIGHT sane? If the mainLoop-hook
 timing loses to update(), escalate to a MinHook trampoline on update() 0x6b0f90.
 
+### 2026-07-17 — M2 test #1: "camera teleports far away" + inverted yaw → FIXED
+Cause of teleport: used Node::_setDerivedPosition(WORLD) with the char's GLOBAL
+coords (-50978,...). But the camera node is a CHILD of `center` (which update()
+already puts at the character), and/or Kenshi rebases the scene origin for its
+huge world — so a global derived position flung the camera ~scene-away. FIX:
+use LOCAL setters and a small offset relative to center:
+  Node::setPosition   ?setPosition@Node@Ogre@@QEAAXAEBVVector3@2@@Z   (local)
+  Node::setOrientation ?setOrientation@Node@Ogre@@QEAAXVQuaternion@2@@Z (local,
+    16B Quaternion by value -> passed by pointer in MS x64, so (node,Quat*) ABI)
+Camera node local pos = (0, EYE_HEIGHT, 0) above center = eye; no world coords.
+Also user reported inverted left/right → negated the yaw mapping. Rebuilt.
+Note _getDerivedPosition@Node returns Vector3 BY VALUE (?AV...) → ABI is
+(retbuf RCX, this RDX); skipped it as a diagnostic to avoid ABI slips.
+
 ### Still TODO for M1/M3 (find after boot-test confirms the instance)
 - CameraClass::update RVA: instance global 0x2133310 has many readers; update
   takes `this` in RCX so update itself doesn't read the global — its per-frame

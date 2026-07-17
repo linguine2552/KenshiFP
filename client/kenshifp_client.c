@@ -64,16 +64,19 @@
 #define CHAR_HANDLE       0x58
 
 /* ---- M2 first-person (Ogre node override) ----
- * CameraClass::update (RVA 0x6b0f90) each frame places the camera NODE (+0x70)
- * at a 3rd-person offset from the center (which follows the character). For FP
- * we override that node's WORLD transform every frame, after update() ran, via
- * OgreMain_x64.dll exports:
- *   Node::_setDerivedPosition(const Vector3&)   -> world eye position
- *   Node::_setDerivedOrientation(const Quaternion&) -> mouse-look orientation
- * The Ogre::Camera (+0x68) is attached to that node, so this drives the view. */
-#define OGRE_SETDPOS_SYM  "?_setDerivedPosition@Node@Ogre@@QEAAXAEBVVector3@2@@Z"
-#define OGRE_SETDORI_SYM  "?_setDerivedOrientation@Node@Ogre@@QEAAXAEBVQuaternion@2@@Z"
-#define EYE_HEIGHT        1.7f    /* world units above getPosition(); tune in-game */
+ * Scene graph (from the ctor): root -> center(+0x58) -> node(+0x70) -> camera
+ * (+0x68 attached). CameraClass::update keeps `center` at the character and
+ * offsets `node` (local, relative to center) up-and-back for 3rd person. For FP
+ * we override `node`'s LOCAL transform every frame after update() ran: a small
+ * eye-height offset above center + a mouse-look orientation. LOCAL (not world)
+ * so it's independent of Kenshi's world coordinate space — setting a *derived*
+ * (world) position to the global char coords fought the hierarchy and flung the
+ * camera away. OgreMain_x64.dll exports, resolved by mangled name:
+ *   Node::setPosition(const Vector3&)     [local]
+ *   Node::setOrientation(Quaternion)      [local; 16B struct -> passed by ptr] */
+#define OGRE_SETPOS_SYM   "?setPosition@Node@Ogre@@QEAAXAEBVVector3@2@@Z"
+#define OGRE_SETORI_SYM   "?setOrientation@Node@Ogre@@QEAAXVQuaternion@2@@Z"
+#define EYE_HEIGHT        1.7f    /* local units above `center`; tune in-game */
 
 /* ---- player character / position (proven in KenshiMP) ---- */
 #define PI_PLAYERCHARS    0x2B0      /* PlayerInterface::playerCharacters (lektor<Character*>) */
@@ -94,16 +97,16 @@ typedef Vec3 *(*get_position_t)(void *self, Vec3 *out);
 typedef void (*mainloop_t)(void *gw, float time);
 typedef void *(*follow_object_t)(void *cam, void *hand);
 typedef void (*stop_follow_t)(void *cam);
-typedef void (*node_set_dpos_t)(void *node, const Vec3 *v);
-typedef void (*node_set_dori_t)(void *node, const Quat *q);
+typedef void (*node_set_pos_t)(void *node, const Vec3 *v);   /* local setPosition */
+typedef void (*node_set_ori_t)(void *node, const Quat *q);   /* local setOrientation */
 
 static FILE *g_log;
 static uintptr_t g_base;
 static mainloop_t g_mainloop_orig;
 static follow_object_t g_follow_object;
 static stop_follow_t g_stop_following;
-static node_set_dpos_t g_node_set_dpos;   /* Ogre::Node::_setDerivedPosition */
-static node_set_dori_t g_node_set_dori;   /* Ogre::Node::_setDerivedOrientation */
+static node_set_pos_t g_node_set_pos;   /* Ogre::Node::setPosition (local) */
+static node_set_ori_t g_node_set_ori;   /* Ogre::Node::setOrientation (local) */
 static int g_ogre_ready;
 static DWORD g_last_tick_ms;
 static int g_fp_mode;              /* toggled by VK_TOGGLE_FP edge */
@@ -246,16 +249,16 @@ static void fp_camera_override(void *gw)
     void *node = *(void **)((uintptr_t)cam + CC_NODE);
     if (!readable(node, 8)) return;
 
-    void *pc = first_player_char(gw);
-    Vec3 pos;
-    if (!pc || !char_position(pc, &pos)) return;
-    Vec3 eye = { pos.x, pos.y + EYE_HEIGHT, pos.z };
+    /* Eye offset is LOCAL to `center` (which the game keeps at the character),
+     * so no world coordinates involved. */
+    Vec3 eye = { 0.0f, EYE_HEIGHT, 0.0f };
 
     POINT cur; GetCursorPos(&cur);
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
     if (sw <= 0) sw = 1920;
     if (sh <= 0) sh = 1080;
-    float yaw   = ((float)cur.x / (float)sw - 0.5f) * 6.2831853f;   /* ~±pi across screen */
+    /* Negated yaw: left cursor -> look left (fixes inverted left/right). */
+    float yaw   = -((float)cur.x / (float)sw - 0.5f) * 6.2831853f;  /* ~±pi across screen */
     float pitch = -((float)cur.y / (float)sh - 0.5f) * 2.4f;        /* look up/down */
     if (pitch >  1.4f) pitch =  1.4f;
     if (pitch < -1.4f) pitch = -1.4f;
@@ -265,8 +268,8 @@ static void fp_camera_override(void *gw)
     float cp = cosf(pitch * 0.5f), sp = sinf(pitch * 0.5f);
     Quat q = { cy * cp, cy * sp, sy * cp, -sy * sp };
 
-    g_node_set_dpos(node, &eye);
-    g_node_set_dori(node, &q);
+    g_node_set_pos(node, &eye);
+    g_node_set_ori(node, &q);
 }
 
 static void hooked_mainloop(void *gw, float time)
@@ -295,9 +298,9 @@ __declspec(dllexport) void dllStartPlugin(void)
     /* Resolve Ogre node world-transform setters from OgreMain_x64.dll. */
     HMODULE ogre = GetModuleHandleA("OgreMain_x64.dll");
     if (ogre) {
-        g_node_set_dpos = (node_set_dpos_t)GetProcAddress(ogre, OGRE_SETDPOS_SYM);
-        g_node_set_dori = (node_set_dori_t)GetProcAddress(ogre, OGRE_SETDORI_SYM);
-        g_ogre_ready = (g_node_set_dpos && g_node_set_dori);
+        g_node_set_pos = (node_set_pos_t)GetProcAddress(ogre, OGRE_SETPOS_SYM);
+        g_node_set_ori = (node_set_ori_t)GetProcAddress(ogre, OGRE_SETORI_SYM);
+        g_ogre_ready = (g_node_set_pos && g_node_set_ori);
     }
     logline(g_ogre_ready ? "Ogre node setters resolved (FP override armed)"
                          : "WARN: Ogre node setters NOT resolved (FP override disabled)");

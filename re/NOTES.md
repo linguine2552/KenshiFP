@@ -107,9 +107,39 @@ getViewMatrix, and +0x58 is header `center`(SceneNode*). Either 1.0.68 layout
 shifted or DAT_142133308 is a different (camera-holder) type. **Stage-0 client
 logs all these to resolve it empirically before we write anything.**
 
-### Still TODO for M1/M3
-- InputHandler `key` global address (for engine-side WASD instead of Win32).
-- CameraClass::update RVA + which slot/global holds the CameraClass instance
-  (confirm DAT_142133308 identity via the stage-0 log; else find via FUN_1406afbf0).
-- Character::setDestination RVA (WASD breadcrumb order path).
-- WASD camera-pan consumption site to suppress in FP mode.
+### 2026-07-17 (cont.) — CameraClass instance + layout NAILED
+Chased the CameraClass ctor to its storage site:
+- **CameraClass ctor = FUN_1406afbf0, RVA 0x6afbf0** (KenshiLib header 0x6AF410,
+  stale). Decompile proves the header field layout is VALID for 1.0.68: it
+  stores the Ogre::Camera* arg at this+0x68, builds SceneNode "camera_center"
+  at this+0x58 and "camera_node" at this+0x70, and sets hand::vftable at
+  this+0x28 (objectCurrentlyFollowing) and +0x80 (inBuilding). So yaw+0x18,
+  pitch+0x1C, altitude+0x60, camera+0x68, center+0x58, node+0x70,
+  freeCameraMode+0xBF are all trustworthy.
+- Caller chain: FUN_140745490 calls setup FUN_14086cf90(&DAT_142133300); the
+  setup fn stores scene ctx at holder+0x8 and the **CameraClass* at
+  holder+0x10**. holder = 0x142133300, so:
+  **CameraClass INSTANCE pointer = *(CameraClass**)(base + 0x2133310).**
+- Resolves the earlier +0x58 conflict: DAT_142133308 (RVA 0x2133308) is NOT the
+  CameraClass — it's the scene/render context (holder+0x8); its +0x58 is the
+  Ogre::Camera used for getViewMatrix, its +0x60 a SceneManager. The real
+  CameraClass is a distinct object at holder+0x10.
+- Stage-0 client UPDATED to read the true instance (0x2133310) and cross-check
+  that CameraClass.camera(+0x68) == sceneCtx.camera(+0x58). Rebuilt.
+
+### Still TODO for M1/M3 (find after boot-test confirms the instance)
+- CameraClass::update RVA: instance global 0x2133310 has many readers; update
+  takes `this` in RCX so update itself doesn't read the global — its per-frame
+  CALLER does. Identify the caller among the 0x2133310 readers, or find
+  followObject/rotate/teleport in the 0x6ADxxx–0x6B0xxx cluster (ctor moved
+  header 0x6AF410 -> 0x6afbf0, ~+0x7e0, so the cluster shifted; not uniform).
+  M1 camera lock can use CameraClass::followObject(hand) or write center-node
+  pos each frame — both need the instance (have it) + one RVA.
+- InputHandler `key` global: config method FUN_140362430 (0x362430) is
+  vtable-dispatched (no call-xrefs). Best next anchor: whichever 0x2133310
+  reader is CameraClass::update's caller also derefs `key` for the pan bools
+  (+0xDB..0xDE). Only needed if Win32 GetAsyncKeyState proves unreliable under
+  Proton — the stage-0 log's WASD field answers that.
+- Character::setDestination RVA: no clean string (movement is Havok task-based:
+  MoveTo_Addon, Task_MoveToDoor RTTI). Find via the right-click order path or
+  by runtime-probing the Character vtable/methods once we have a live Character.

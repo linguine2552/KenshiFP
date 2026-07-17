@@ -28,16 +28,26 @@
 #define GW_FRAMESPEED_OFF 0x700      /* GameWorld::frameSpeedMult (float) */
 #define GW_PLAYER         0x580      /* GameWorld::player (PlayerInterface*) */
 
-/* ---- camera (M0 finding, re/NOTES.md) ----
- * DAT_142133308 is the engine's global camera-holder pointer: every frame
- * mainLoop calls Ogre::Camera::getViewMatrix(*(Camera**)(DAT_142133308+0x58)).
- * So +0x58 is the live Ogre::Camera*. Provisionally the global CameraClass*. */
-#define RVA_CAM_GLOBAL    0x2133308u
-#define CAM_OGRE_CAMERA   0x58       /* Ogre::Camera* used for the view matrix */
-/* CameraClass field offsets (KenshiLib header, provisional until logged): */
+/* ---- camera (M0, re/NOTES.md — confirmed via the CameraClass ctor) ----
+ * The global at RVA 0x2133300 is the camera/scene holder struct; the engine
+ * fills it in FUN_14086cf90(&holder):
+ *   holder+0x08 -> scene/render context (DAT_142133308; its +0x58 is the
+ *                  Ogre::Camera used for getViewMatrix each frame),
+ *   holder+0x10 -> the CameraClass* (Kenshi's camera brain).
+ * So the CameraClass INSTANCE pointer lives at RVA 0x2133310. The ctor
+ * (FUN_1406afbf0, RVA 0x6afbf0) proved the header field layout is valid for
+ * 1.0.68: camera(Ogre::Camera*)+0x68, center(SceneNode*)+0x58, node+0x70,
+ * objectCurrentlyFollowing(hand)+0x28. */
+#define RVA_CAM_INSTANCE  0x2133310u /* *(CameraClass**)(base + this) */
+#define RVA_SCENE_CTX     0x2133308u /* scene/render context; +0x58 Ogre::Camera* */
+#define SCENE_OGRE_CAMERA 0x58
+/* CameraClass field offsets (KenshiLib header, ctor-confirmed layout): */
 #define CC_YAW            0x18
 #define CC_PITCH          0x1C
 #define CC_FOLLOW_HAND    0x28       /* hand objectCurrentlyFollowing */
+#define CC_CENTER         0x58       /* Ogre::SceneNode* center */
+#define CC_CAMERA         0x68       /* Ogre::Camera* */
+#define CC_NODE           0x70       /* Ogre::SceneNode* */
 #define CC_ALTITUDE       0x60
 #define CC_FREECAM        0xBF
 
@@ -128,18 +138,24 @@ static void poll_input(void)
 /* Throttled read-only observation of everything the FP work will drive. */
 static void fp_tick(void *gw)
 {
-    /* camera-holder global */
-    void *cam_holder = *(void **)(g_base + RVA_CAM_GLOBAL);
-    void *ogre_cam = NULL;
+    /* CameraClass instance (holder+0x10). Read its ctor-confirmed fields. */
+    void *cam = *(void **)(g_base + RVA_CAM_INSTANCE);
+    void *ogre_cam = NULL, *center = NULL, *node = NULL;
     float yaw = 0, pitch = 0, alt = 0;
     unsigned char freecam = 0;
-    if (readable(cam_holder, CC_FREECAM + 1)) {
-        ogre_cam = *(void **)((uintptr_t)cam_holder + CAM_OGRE_CAMERA);
-        yaw      = *(float *)((uintptr_t)cam_holder + CC_YAW);
-        pitch    = *(float *)((uintptr_t)cam_holder + CC_PITCH);
-        alt      = *(float *)((uintptr_t)cam_holder + CC_ALTITUDE);
-        freecam  = *(unsigned char *)((uintptr_t)cam_holder + CC_FREECAM);
+    if (readable(cam, CC_FREECAM + 1)) {
+        ogre_cam = *(void **)((uintptr_t)cam + CC_CAMERA);
+        center   = *(void **)((uintptr_t)cam + CC_CENTER);
+        node     = *(void **)((uintptr_t)cam + CC_NODE);
+        yaw      = *(float *)((uintptr_t)cam + CC_YAW);
+        pitch    = *(float *)((uintptr_t)cam + CC_PITCH);
+        alt      = *(float *)((uintptr_t)cam + CC_ALTITUDE);
+        freecam  = *(unsigned char *)((uintptr_t)cam + CC_FREECAM);
     }
+    /* cross-check: the scene context's Ogre::Camera should equal cam+0x68 */
+    void *scene = *(void **)(g_base + RVA_SCENE_CTX);
+    void *scene_cam = readable(scene, SCENE_OGRE_CAMERA + 8)
+        ? *(void **)((uintptr_t)scene + SCENE_OGRE_CAMERA) : NULL;
 
     float speedmult = readable(gw, GW_FRAMESPEED_OFF + 4)
         ? *(float *)((uintptr_t)gw + GW_FRAMESPEED_OFF) : -1.0f;
@@ -153,9 +169,10 @@ static void fp_tick(void *gw)
     int s = (GetAsyncKeyState(VK_S) & 0x8000) != 0;
     int d = (GetAsyncKeyState(VK_D) & 0x8000) != 0;
 
-    logline("[tick] fp=%d gw=%p speedMult=%.3f | camHolder=%p ogreCam=%p yaw=%.3f pitch=%.3f alt=%.1f freecam=%u | pc=%p pos=%s(%.1f,%.1f,%.1f) | WASD=%d%d%d%d",
+    logline("[tick] fp=%d gw=%p speedMult=%.3f | cam=%p ogreCam=%p(scene=%p%s) center=%p node=%p yaw=%.3f pitch=%.3f alt=%.1f freecam=%u | pc=%p pos=%s(%.1f,%.1f,%.1f) | WASD=%d%d%d%d",
             g_fp_mode, gw, speedmult,
-            cam_holder, ogre_cam, yaw, pitch, alt, (unsigned)freecam,
+            cam, ogre_cam, scene_cam, (ogre_cam == scene_cam ? " MATCH" : " DIFF"),
+            center, node, yaw, pitch, alt, (unsigned)freecam,
             pc, havepos ? "" : "?", pos.x, pos.y, pos.z, w, a, s, d);
 }
 

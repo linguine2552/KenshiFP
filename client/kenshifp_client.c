@@ -105,7 +105,11 @@
  *   Node::setOrientation(Quaternion)      [local; 16B struct -> passed by ptr] */
 #define OGRE_SETPOS_SYM   "?setPosition@Node@Ogre@@QEAAXAEBVVector3@2@@Z"
 #define OGRE_SETORI_SYM   "?setOrientation@Node@Ogre@@QEAAXVQuaternion@2@@Z"
-#define OGRE_SETINHORI_SYM "?setInheritOrientation@Node@Ogre@@QEAAX_N@Z"
+/* World-space transform: set camera node's DERIVED pos/orientation directly, so
+ * the parent `center` node's transform can't induce dip or roll. Need center's
+ * world position to place the eye = centerWorld + (head-feet) offset. */
+#define OGRE_SETDPOS_SYM  "?_setDerivedPosition@Node@Ogre@@QEAAXAEBVVector3@2@@Z"
+#define OGRE_GETDPOS_SYM  "?_getDerivedPosition@Node@Ogre@@QEBA?AVVector3@2@XZ"
 
 /* ---- head-bone tracking (real first-person feel: eye = head bone) ----
  * Character::getBoneWorldPosition(this, retVec3, std::string* name) — RVA
@@ -154,7 +158,8 @@ typedef void (*node_set_dori_t)(void *node, const Quat *q);  /* world _setDerive
 typedef void (*cam_set_fovy_t)(void *camera, const float *rad);
 typedef const float *(*cam_get_fovy_t)(void *camera);
 typedef void (*charmove_setdest_t)(void *mv, const Vec3 *dest, int pri, char shift);
-typedef void (*node_set_inhori_t)(void *node, char inherit);
+typedef void (*node_set_dpos_t)(void *node, const Vec3 *v);   /* world _setDerivedPosition */
+typedef Vec3 *(*node_get_dpos_t)(void *node, Vec3 *ret);      /* world _getDerivedPosition (this=RCX,ret=RDX) */
 /* member-struct-return: this=RCX, retbuf=RDX, name=R8 */
 typedef Vec3 *(*get_bone_world_t)(void *character, Vec3 *ret, const void *name);
 
@@ -166,7 +171,8 @@ static stop_follow_t g_stop_following;
 static node_set_pos_t g_node_set_pos;   /* Ogre::Node::setPosition (local) */
 static node_set_ori_t g_node_set_ori;   /* Ogre::Node::setOrientation (local) */
 static node_set_dori_t g_node_set_dori; /* Ogre::Node::_setDerivedOrientation (world) */
-static node_set_inhori_t g_node_set_inhori; /* Ogre::Node::setInheritOrientation */
+static node_set_dpos_t g_node_set_dpos; /* Ogre::Node::_setDerivedPosition (world) */
+static node_get_dpos_t g_node_get_dpos; /* Ogre::Node::_getDerivedPosition (world) */
 static get_bone_world_t g_get_bone_world;   /* Character::getBoneWorldPosition */
 static unsigned char g_head_bone[32];   /* MSVC std::string "Bip01 Head" (SSO) */
 static int g_ogre_ready;
@@ -280,15 +286,19 @@ static void fp_tick(void *gw)
     int s = (GetAsyncKeyState(VK_S) & 0x8000) != 0;
     int d = (GetAsyncKeyState(VK_D) & 0x8000) != 0;
 
-    /* objectCurrentlyFollowing id[0] (cam+0x30) — confirms followObject wrote. */
-    uint32_t follow_id = readable(cam, CC_FOLLOW_IDS + 4)
-        ? *(uint32_t *)((uintptr_t)cam + CC_FOLLOW_IDS) : 0;
+    /* head-bone offset (head - feet) for tuning the eye position. */
+    Vec3 hoff = {0,0,0};
+    if (havepos && g_get_bone_world) {
+        Vec3 head;
+        g_get_bone_world(pc, &head, g_head_bone);
+        hoff.x = head.x - pos.x; hoff.y = head.y - pos.y; hoff.z = head.z - pos.z;
+    }
+    (void)ogre_cam; (void)scene_cam; (void)center; (void)node;
+    (void)yaw; (void)pitch; (void)alt; (void)freecam; (void)speedmult;
 
-    logline("[tick] fp=%d gw=%p speedMult=%.3f | cam=%p ogreCam=%p(scene=%p%s) center=%p node=%p yaw=%.3f pitch=%.3f alt=%.1f freecam=%u followId=%08x | pc=%p pos=%s(%.1f,%.1f,%.1f) | WASD=%d%d%d%d",
-            g_fp_mode, gw, speedmult,
-            cam, ogre_cam, scene_cam, (ogre_cam == scene_cam ? " MATCH" : " DIFF"),
-            center, node, yaw, pitch, alt, (unsigned)freecam, follow_id,
-            pc, havepos ? "" : "?", pos.x, pos.y, pos.z, w, a, s, d);
+    logline("[tick] fp=%d pc=%p pos=%s(%.1f,%.1f,%.1f) headOff=(%.2f,%.2f,%.2f) look(yaw=%.2f pitch=%.2f) | WASD=%d%d%d%d",
+            g_fp_mode, pc, havepos ? "" : "?", pos.x, pos.y, pos.z,
+            hoff.x, hoff.y, hoff.z, g_yaw, g_pitch, w, a, s, d);
 }
 
 /* M1 camera lock. Runs every frame. While FP is on, re-assert followObject on
@@ -344,30 +354,33 @@ static void fp_camera_override(void *gw)
         }
         SetCursorPos(cx, cy);  /* recenter so the cursor never drifts to edges */
 
-        /* Eye = the head bone. Offset LOCAL to `center` (kept at the character);
-         * (head - feet) is a world-axis displacement, and inheritOrientation is
-         * off (below) so it applies world-vertical. Falls back to a fixed eye
-         * height if the bone position looks invalid. */
-        Vec3 eye = { 0.0f, EYE_HEIGHT, 0.0f };
-        if (g_get_bone_world) {
-            void *pc = first_player_char(gw);
-            Vec3 feet, head;
-            if (pc && char_position(pc, &feet)) {
-                g_get_bone_world(pc, &head, g_head_bone);
-                Vec3 off = { head.x - feet.x, head.y - feet.y, head.z - feet.z };
-                if (off.x*off.x + off.y*off.y + off.z*off.z > 0.25f) eye = off;
+        /* Eye position, fully in WORLD space: centerWorld + (head - feet). The
+         * head-feet offset (world axes, from getBoneWorldPosition/getPosition)
+         * tracks animation + ragdoll; centerWorld comes from the center node's
+         * derived position. Both derived -> no dip, and orientation stays roll-
+         * free (below). */
+        void *center = *(void **)((uintptr_t)cam + CC_CENTER);
+        Vec3 centerW;
+        if (readable(center, 8) && g_node_get_dpos(center, &centerW)) {
+            Vec3 off = { 0.0f, EYE_HEIGHT, 0.0f };  /* fallback */
+            if (g_get_bone_world) {
+                void *pc = first_player_char(gw);
+                Vec3 feet, head;
+                if (pc && char_position(pc, &feet)) {
+                    g_get_bone_world(pc, &head, g_head_bone);
+                    Vec3 h = { head.x - feet.x, head.y - feet.y, head.z - feet.z };
+                    if (h.x*h.x + h.y*h.y + h.z*h.z > 0.25f) off = h;
+                }
             }
+            Vec3 eyeW = { centerW.x + off.x, centerW.y + off.y, centerW.z + off.z };
+            g_node_set_dpos(node, &eyeW);
         }
-        g_node_set_inhori(node, 0);   /* apply eye offset in world axes (no dip) */
 
         /* World look orientation q = q_yaw(Y) * q_pitch(X); no roll. Ogre camera
-         * looks down -Z at identity. Set DERIVED (world) so the parent center
-         * node's orientation can't induce roll. */
+         * looks down -Z at identity. DERIVED (world) with normal inheritance. */
         float qy = cosf(g_yaw * 0.5f),   sqy = sinf(g_yaw * 0.5f);
         float qp = cosf(g_pitch * 0.5f), sqp = sinf(g_pitch * 0.5f);
         Quat q = { qy * qp, qy * sqp, sqy * qp, -sqy * sqp };
-
-        g_node_set_pos(node, &eye);
         g_node_set_dori(node, &q);
 
         /* FOV: capture default once, then force the FP FOV each frame. */
@@ -390,7 +403,6 @@ static void fp_camera_override(void *gw)
             g_cam_set_fovy(ogre_cam, &g_fov_default);
             g_fov_saved = 0;
         }
-        g_node_set_inhori(node, 1);   /* restore normal node inheritance */
         Quat ident = { 1.0f, 0.0f, 0.0f, 0.0f };
         g_node_set_ori(node, &ident);
     }
@@ -497,10 +509,11 @@ __declspec(dllexport) void dllStartPlugin(void)
         g_node_set_pos  = (node_set_pos_t)GetProcAddress(ogre, OGRE_SETPOS_SYM);
         g_node_set_ori  = (node_set_ori_t)GetProcAddress(ogre, OGRE_SETORI_SYM);
         g_node_set_dori = (node_set_dori_t)GetProcAddress(ogre, OGRE_SETDORI_SYM);
-        g_node_set_inhori = (node_set_inhori_t)GetProcAddress(ogre, OGRE_SETINHORI_SYM);
+        g_node_set_dpos = (node_set_dpos_t)GetProcAddress(ogre, OGRE_SETDPOS_SYM);
+        g_node_get_dpos = (node_get_dpos_t)GetProcAddress(ogre, OGRE_GETDPOS_SYM);
         g_cam_set_fovy  = (cam_set_fovy_t)GetProcAddress(ogre, OGRE_SETFOVY_SYM);
         g_cam_get_fovy  = (cam_get_fovy_t)GetProcAddress(ogre, OGRE_GETFOVY_SYM);
-        g_ogre_ready = (g_node_set_pos && g_node_set_ori && g_node_set_dori && g_node_set_inhori);
+        g_ogre_ready = (g_node_set_dori && g_node_set_dpos && g_node_get_dpos);
         logline("Ogre FOV setters: set=%p get=%p", (void *)g_cam_set_fovy, (void *)g_cam_get_fovy);
     }
     logline(g_ogre_ready ? "Ogre node setters resolved (FP override armed)"

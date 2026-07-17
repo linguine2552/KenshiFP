@@ -468,7 +468,6 @@ static void fp_movement(void *gw)
     float len = sqrtf(dx * dx + dz * dz);
     if (len < 0.001f) return;
     dx /= len; dz /= len;
-    float dir = atan2f(dx, dz);    /* heading of the movement direction */
 
     /* Target distance from look pitch (pitch + = looking down = near/slow;
      * pitch - = looking up = far/run). The engine accelerates toward farther
@@ -481,28 +480,12 @@ static void fp_movement(void *gw)
     Vec3 here;
     if (!char_position(pc, &here)) return;
 
-    /* Re-issue only when needed — key change, a real turn, or once the char has
-     * closed most of the way to the current target — NOT every tick. Re-issuing
-     * a fresh nearby destination each frame is what made it stutter-step. */
-    DWORD now = GetTickCount();
-    float dturn = dir - g_last_move_dir;
-    while (dturn >  3.14159265f) dturn -= 6.2831853f;
-    while (dturn < -3.14159265f) dturn += 6.2831853f;
-    float rtx = g_move_tx - here.x, rtz = g_move_tz - here.z;
-    float remain = sqrtf(rtx * rtx + rtz * rtz);
-    int changed = !g_was_moving || keys != g_last_move_keys
-                || (dturn > MOVE_TURN_EPS || dturn < -MOVE_TURN_EPS)
-                || (remain < g_move_dist * MOVE_RETARGET_FRAC)
-                || (now - g_last_move_ms) > MOVE_KEEPALIVE_MS;
-    if (!changed) return;
-
+    /* Just move the destination, every frame — like holding right-click and
+     * dragging the marker. The target keeps sitting `dist` ahead of the moving
+     * character, so it walks continuously and smoothly; no re-fire throttling. */
     Vec3 tgt = { here.x + dx * dist, here.y, here.z + dz * dist };
     g_charmove_setdest(mv, &tgt, UPDATE_PRIORITY_HIGH, 0);
-    g_move_tx = tgt.x; g_move_tz = tgt.z; g_move_dist = dist;
     g_was_moving = 1;
-    g_last_move_ms = now;
-    g_last_move_dir = dir;
-    g_last_move_keys = keys;
 }
 
 static void hooked_mainloop(void *gw, float time)

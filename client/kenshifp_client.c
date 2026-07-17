@@ -76,12 +76,11 @@
  *   Node::setOrientation(Quaternion)      [local; 16B struct -> passed by ptr] */
 #define OGRE_SETPOS_SYM   "?setPosition@Node@Ogre@@QEAAXAEBVVector3@2@@Z"
 #define OGRE_SETORI_SYM   "?setOrientation@Node@Ogre@@QEAAXVQuaternion@2@@Z"
-/* Getters (const, return BY VALUE -> hidden retbuf in RCX, this in RDX). Used
- * to snapshot the camera node's local transform on FP enter so we can restore
- * it on exit — update() applies INCREMENTAL rotations, so without a restore the
- * camera keeps drifting from our last FP orientation instead of resetting. */
-#define OGRE_GETPOS_SYM   "?getPosition@Node@Ogre@@QEBA?AVVector3@2@XZ"
-#define OGRE_GETORI_SYM   "?getOrientation@Node@Ogre@@QEBA?AVQuaternion@2@XZ"
+/* NOTE: Ogre's getPosition/getOrientation return Vector3/Quaternion BY VALUE;
+ * calling them across our ABI boundary crashed, so we do NOT read node state.
+ * Clean FP exit instead just levels the node orientation to identity (below),
+ * which stops update()'s incremental rotations from drifting off our last FP
+ * angle. Only the setters (which work reliably) are used. */
 #define EYE_HEIGHT        1.85f   /* local units above `center`; tune in-game */
 
 /* ---- player character / position (proven in KenshiMP) ---- */
@@ -105,8 +104,6 @@ typedef void *(*follow_object_t)(void *cam, void *hand);
 typedef void (*stop_follow_t)(void *cam);
 typedef void (*node_set_pos_t)(void *node, const Vec3 *v);   /* local setPosition */
 typedef void (*node_set_ori_t)(void *node, const Quat *q);   /* local setOrientation */
-typedef Vec3 *(*node_get_pos_t)(Vec3 *ret, void *node);      /* local getPosition (by value) */
-typedef Quat *(*node_get_ori_t)(Quat *ret, void *node);      /* local getOrientation (by value) */
 
 static FILE *g_log;
 static uintptr_t g_base;
@@ -115,17 +112,12 @@ static follow_object_t g_follow_object;
 static stop_follow_t g_stop_following;
 static node_set_pos_t g_node_set_pos;   /* Ogre::Node::setPosition (local) */
 static node_set_ori_t g_node_set_ori;   /* Ogre::Node::setOrientation (local) */
-static node_get_pos_t g_node_get_pos;   /* Ogre::Node::getPosition (local) */
-static node_get_ori_t g_node_get_ori;   /* Ogre::Node::getOrientation (local) */
 static int g_ogre_ready;
 static DWORD g_last_tick_ms;
 static int g_fp_mode;              /* toggled by VK_TOGGLE_FP edge */
 static int g_toggle_was_down;
 static int g_prev_fp;             /* g_fp_mode from last frame (camera_lock edge) */
 static int g_ovr_prev;            /* was the FP node override active last frame */
-static int g_have_saved;          /* g_saved_* hold a valid pre-FP snapshot */
-static Vec3 g_saved_pos;          /* camera node local pos captured on FP enter */
-static Quat g_saved_ori;          /* camera node local orientation on FP enter */
 
 static void logline(const char *fmt, ...)
 {
@@ -266,14 +258,6 @@ static void fp_camera_override(void *gw)
     /* Only drive the override while FP is on AND not in free-cam mode. */
     int active = g_fp_mode && !*(unsigned char *)((uintptr_t)cam + CC_FREECAM);
 
-    if (active && !g_ovr_prev) {
-        /* FP enter: snapshot the node's current 3rd-person local transform so
-         * we can hand control cleanly back to update() on exit. */
-        g_node_get_pos(&g_saved_pos, node);
-        g_node_get_ori(&g_saved_ori, node);
-        g_have_saved = 1;
-    }
-
     if (active) {
         /* Eye offset LOCAL to `center` (game keeps center at the character). */
         Vec3 eye = { 0.0f, EYE_HEIGHT, 0.0f };
@@ -294,12 +278,12 @@ static void fp_camera_override(void *gw)
 
         g_node_set_pos(node, &eye);
         g_node_set_ori(node, &q);
-    } else if (g_ovr_prev && g_have_saved) {
-        /* FP exit: restore the pre-FP local transform so update() resumes the
-         * normal camera cleanly instead of drifting from our FP orientation. */
-        g_node_set_pos(node, &g_saved_pos);
-        g_node_set_ori(node, &g_saved_ori);
-        g_have_saved = 0;
+    } else if (g_ovr_prev) {
+        /* FP exit: level the node orientation to identity so update()'s
+         * incremental rotations no longer drift off our last FP angle. Position
+         * is left for update() to reset via its normal (non-follow) path. */
+        Quat ident = { 1.0f, 0.0f, 0.0f, 0.0f };
+        g_node_set_ori(node, &ident);
     }
     g_ovr_prev = active;
 }
@@ -332,9 +316,7 @@ __declspec(dllexport) void dllStartPlugin(void)
     if (ogre) {
         g_node_set_pos = (node_set_pos_t)GetProcAddress(ogre, OGRE_SETPOS_SYM);
         g_node_set_ori = (node_set_ori_t)GetProcAddress(ogre, OGRE_SETORI_SYM);
-        g_node_get_pos = (node_get_pos_t)GetProcAddress(ogre, OGRE_GETPOS_SYM);
-        g_node_get_ori = (node_get_ori_t)GetProcAddress(ogre, OGRE_GETORI_SYM);
-        g_ogre_ready = (g_node_set_pos && g_node_set_ori && g_node_get_pos && g_node_get_ori);
+        g_ogre_ready = (g_node_set_pos && g_node_set_ori);
     }
     logline(g_ogre_ready ? "Ogre node setters resolved (FP override armed)"
                          : "WARN: Ogre node setters NOT resolved (FP override disabled)");

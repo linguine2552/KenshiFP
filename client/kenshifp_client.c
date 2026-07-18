@@ -89,6 +89,7 @@
 #define MV_DESIRED_SPEED    0xBC   /* float (keep == current so accel logic doesn't idle us) */
 #define MV_WALK_SPEED       0xC0   /* float */
 #define MV_FACEDIR_VTOFF    6      /* faceDirection = live vtable slot 6 (+0x30) */
+#define MV_SETPOS_VTOFF     5      /* _setPositionSimple = live vtable slot 5 (+0x28) */
 /* Orient-to-direction movement: setDestination makes the character turn to face
  * the target and walk (no strafing). We aim FAR ahead so it commits to a full-
  * speed walk, and only RE-ISSUE when the heading or key set changes (or a slow
@@ -182,6 +183,9 @@ typedef void (*cam_set_fovy_t)(void *camera, const float *rad);
 typedef const float *(*cam_get_fovy_t)(void *camera);
 typedef void (*charmove_setdest_t)(void *mv, const Vec3 *dest, int pri, char shift);
 typedef void (*face_direction_t)(void *mv, const Vec3 *dir);
+/* _setPositionSimple(Ogre::Vector3 p): Vector3 is 12B, so MS x64 passes it by
+ * hidden pointer -> ABI (this RCX, const Vec3* RDX), same shape as faceDirection. */
+typedef void (*set_pos_simple_t)(void *mv, const Vec3 *pos);
 typedef void (*node_set_dpos_t)(void *node, const Vec3 *v);   /* world _setDerivedPosition */
 typedef Vec3 *(*node_get_dpos_t)(void *node, Vec3 *ret);      /* world _getDerivedPosition (this=RCX,ret=RDX) */
 /* member-struct-return: this=RCX, retbuf=RDX, name=R8 */
@@ -457,7 +461,7 @@ static void fp_camera_override(void *gw)
 /* M3: drive the followed character with WASD relative to where we're looking.
  * Breadcrumb CharMovement::setDestination a few metres ahead at ~10 Hz; halt at
  * the current position when all keys release. */
-static void fp_movement(void *gw)
+static void fp_movement(void *gw, float dt)
 {
     if (!g_fp_mode || !g_charmove_setdest) return;
     void *pc = first_player_char(gw);
@@ -511,13 +515,24 @@ static void fp_movement(void *gw)
     if (!(maxs > walk && maxs < 1000.0f)) maxs = 25.0f;
     float speed = (walk * 0.3f) + t * (maxs - walk * 0.3f);
 
-    /* Custom controller: rotate the character to the input direction, then
-     * drive the motion state directly — no move orders, nothing to fight. */
+    /* Custom controller: rotate the character to the input direction, drive the
+     * motion state (walk animation), and INTEGRATE THE POSITION OURSELVES — the
+     * engine's movement update recomputes motion from its own goals each frame
+     * (no goal = zero), so velocity writes alone don't translate the body.
+     * Position-drive via the engine's own _setPositionSimple (KenshiCoop's
+     * proxy technique) actually moves it. */
     Vec3 dir = { dx, 0.0f, dz };
     void **mvvt = *(void ***)mv;
     if (readable(mvvt, (MV_FACEDIR_VTOFF + 1) * 8)) {
         face_direction_t face = (face_direction_t)mvvt[MV_FACEDIR_VTOFF];
         if (readable((void *)face, 1)) face(mv, &dir);
+
+        Vec3 here;
+        if (dt > 0.0f && dt < 0.2f && char_position(pc, &here)) {
+            Vec3 np = { here.x + dx * speed * dt, here.y, here.z + dz * speed * dt };
+            set_pos_simple_t setpos = (set_pos_simple_t)mvvt[MV_SETPOS_VTOFF];
+            if (readable((void *)setpos, 1)) setpos(mv, &np);
+        }
     }
     *(unsigned char *)((uintptr_t)mv + MV_CURRENTLY_MOVING) = 1;
     *(float *)((uintptr_t)mv + MV_CURRENT_SPEED) = speed;
@@ -534,7 +549,7 @@ static void hooked_mainloop(void *gw, float time)
     poll_input();                  /* every frame: catch toggle edges */
     if (gw) camera_lock(gw);       /* every frame: assert/release the lock */
     if (gw) fp_camera_override(gw);/* every frame: force FP eye + mouse-look */
-    if (gw) fp_movement(gw);       /* every frame: WASD -> character move order */
+    if (gw) fp_movement(gw, time); /* every frame: WASD -> custom motion drive */
 
     DWORD now = GetTickCount();
     if (gw && (now - g_last_tick_ms) >= 1000) {   /* 1 Hz observation log */

@@ -268,8 +268,10 @@ static charmove_setdest_t g_charmove_setdest;  /* CharMovement::setDestination (
 static DWORD g_last_move_ms;
 static int g_was_moving;
 static float g_speed_scale = 0.6f; /* scrollwheel throttle: walk (low) .. run (high) */
-static int g_last_wheel;
 static int g_dbg_wheel;
+static HINSTANCE g_hinst;
+static HHOOK g_mouse_hook;
+static volatile LONG g_wheel_accum;  /* wheel notches*120, accumulated by the LL hook */
 static float g_last_move_dir;      /* heading of last issued destination (radians) */
 static int g_last_move_keys;       /* WASD bitmask of last issued destination */
 static float g_move_tx, g_move_tz, g_move_dist;  /* last issued target + its distance */
@@ -589,15 +591,14 @@ static void fp_movement(void *gw, float dt)
         ? *(void **)((uintptr_t)pc + CHAR_MOVEMENT) : NULL;
     if (!readable(mv, 8)) return;
 
-    /* Scrollwheel throttle: adjust the speed scale. InputHandler.mWheel is the
-     * OIS per-frame wheel delta (0 when idle, +/-120 per notch). */
-    int wheel = readable((void *)(g_base + RVA_INPUT_MWHEEL), 4)
-        ? *(int *)(g_base + RVA_INPUT_MWHEEL) : 0;
-    g_dbg_wheel = wheel;
-    if (wheel > 0)      g_speed_scale += 0.12f;
-    else if (wheel < 0) g_speed_scale -= 0.12f;
-    if (g_speed_scale < 0.15f) g_speed_scale = 0.15f;   /* slow walk */
-    if (g_speed_scale > 1.0f)  g_speed_scale = 1.0f;    /* full run */
+    /* Scrollwheel throttle: consume the wheel captured by our LL hook. */
+    LONG wheel = InterlockedExchange(&g_wheel_accum, 0);
+    g_dbg_wheel = (int)wheel;
+    if (wheel != 0) {
+        g_speed_scale += (wheel / 120.0f) * 0.15f;      /* one notch = 0.15 */
+        if (g_speed_scale < 0.15f) g_speed_scale = 0.15f;   /* slow walk */
+        if (g_speed_scale > 1.0f)  g_speed_scale = 1.0f;    /* full run */
+    }
 
     int w = (GetAsyncKeyState(VK_W) & 0x8000) != 0;
     int s = (GetAsyncKeyState(VK_S) & 0x8000) != 0;
@@ -695,6 +696,19 @@ static void hooked_mainloop(void *gw, float time)
     }
 }
 
+/* Low-level mouse hook: capture the wheel ourselves (the game clears its own
+ * mWheel before our per-frame hook can read it). Runs on the thread that
+ * installed it (main thread) as it pumps messages. */
+static LRESULT CALLBACK mouse_ll(int code, WPARAM wp, LPARAM lp)
+{
+    if (code == HC_ACTION && wp == WM_MOUSEWHEEL) {
+        MSLLHOOKSTRUCT *m = (MSLLHOOKSTRUCT *)lp;
+        int delta = (short)HIWORD(m->mouseData);   /* +120 / -120 per notch */
+        InterlockedExchangeAdd(&g_wheel_accum, delta);
+    }
+    return CallNextHookEx(NULL, code, wp, lp);
+}
+
 __declspec(dllexport) void dllStartPlugin(void)
 {
     g_log = fopen("KenshiFP.log", "w");
@@ -703,6 +717,10 @@ __declspec(dllexport) void dllStartPlugin(void)
     g_stop_following = (stop_follow_t)(g_base + RVA_STOP_FOLLOW);
     g_charmove_setdest = (charmove_setdest_t)(g_base + RVA_CHARMOVE_SETDEST);
     g_get_bone_world   = (get_bone_world_t)(g_base + RVA_GET_BONE_WORLD);
+
+    g_mouse_hook = SetWindowsHookExA(WH_MOUSE_LL, mouse_ll, g_hinst, 0);
+    logline(g_mouse_hook ? "mouse wheel hook installed" : "mouse wheel hook FAILED (err %lu)",
+            GetLastError());
     /* MSVC std::string SSO for the head bone name (size<=15 -> inline buffer). */
     memset(g_head_bone, 0, sizeof g_head_bone);
     memcpy(g_head_bone, HEAD_BONE_NAME, sizeof(HEAD_BONE_NAME) - 1);
@@ -766,7 +784,7 @@ __declspec(dllexport) void dllStopPlugin(void) { logline("dllStopPlugin"); }
 
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved)
 {
-    (void)h; (void)reserved;
-    if (reason == DLL_PROCESS_ATTACH) DisableThreadLibraryCalls(h);
+    (void)reserved;
+    if (reason == DLL_PROCESS_ATTACH) { g_hinst = h; DisableThreadLibraryCalls(h); }
     return TRUE;
 }

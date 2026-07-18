@@ -115,9 +115,13 @@
 #define RVA_SAVELOAD_PTR    0x212ebd8u  /* save/load dialogs: widget slots +0x100.. */
 #define RVA_MSGBOX_COUNT    0x1f29a30u  /* modal message boxes open */
 #define RVA_PLAYER_IFACE    0x2134690u  /* PlayerInterface* (GameWorld+0x580, verified) */
-#define PI_CTXMENU          0x48        /* PlayerInterface::contextMenu (INLINE object) */
-#define CTX_GUI1            0x48        /* ContextMenu::menuGUI  (created on open, */
-#define CTX_GUI2            0x50        /* ContextMenu::menuGUI2  destroyed on close) */
+#define RVA_CTXMENU_VISIBLE 0x21332d0u  /* game's own per-frame cache byte of
+                                         * ContextMenu::isVisible (written each frame
+                                         * by the mouse handler; decompile-verified).
+                                         * The REAL check = menuGUI->mMainWidget->
+                                         * getVisible (widget's OWN flag -- inherited
+                                         * visibility never updates, object lifetime
+                                         * never ends; both earlier heuristics wedged). */
 #define UIMASK_OVERVIEW     0x080       /* fullscreen map/factions/squads screen */
 #define RVA_CAM_UPDATE       0x6b0f90u   /* CameraClass::update(bool controlEnabled) -- verified
                                           * M1. Hooked so the FP eye is re-asserted MID-frame:
@@ -228,6 +232,7 @@
 #define MYGUI_GUI_GETINSTANCE_SYM "?getInstancePtr@?$Singleton@VGui@MyGUI@@@MyGUI@@SAPEAVGui@2@XZ"
 #define MYGUI_CREATEWIDGET_SYM "?createWidgetT@Gui@MyGUI@@QEAAPEAVWidget@2@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@0HHHHUAlign@2@00@Z"
 #define MYGUI_SETIMAGETEX_SYM  "?setImageTexture@ImageBox@MyGUI@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z"
+#define MYGUI_WIDGET_INHVIS_SYM "?getInheritedVisible@Widget@MyGUI@@QEBA_NXZ"
 #define MYGUI_WIDGET_SETVIS_SYM "?setVisible@Widget@MyGUI@@UEAAX_N@Z"
 #define OGRE_RGM_GETSINGLETON_SYM "?getSingletonPtr@ResourceGroupManager@Ogre@@SAPEAV12@XZ"
 #define OGRE_RGM_ADDLOCATION_SYM  "?addResourceLocation@ResourceGroupManager@Ogre@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@00_N1@Z"
@@ -313,6 +318,7 @@ typedef void *(*gui_createwidget_t)(void *gui, const void *type, const void *ski
                                     const void *layer, const void *name);
 typedef void (*imgbox_setimage_t)(void *imgbox, const void *texname);
 typedef void (*widget_setvisible_t)(void *widget, char visible);
+typedef char (*widget_inhvis_t)(void *widget);   /* Widget::getInheritedVisible */
 typedef void *(*rgm_getsingleton_t)(void);
 typedef void (*rgm_addlocation_t)(void *rgm, const void *name, const void *loctype,
                                   const void *group, char recursive, char readonly);
@@ -380,6 +386,7 @@ static gui_getinstance_t g_gui_getinstance;
 static gui_createwidget_t g_gui_createwidget;
 static imgbox_setimage_t g_imgbox_setimage;
 static widget_setvisible_t g_widget_setvisible;
+static widget_inhvis_t g_widget_inhvis;   /* Widget::getInheritedVisible */
 static rgm_getsingleton_t g_rgm_getsingleton;
 static rgm_addlocation_t g_rgm_addlocation;
 static rgm_creategroup_t g_rgm_creategroup;
@@ -914,21 +921,14 @@ static int ui_panels_open(void)
     }
     if (readable((void *)(B + RVA_MSGBOX_COUNT), 4)
         && *(unsigned *)(B + RVA_MSGBOX_COUNT)) mask |= 0x008;
+    /* right-click context menu: the engine's own cached isVisible byte */
+    if (readable((void *)(B + RVA_CTXMENU_VISIBLE), 1)
+        && *(unsigned char *)(B + RVA_CTXMENU_VISIBLE)) mask |= 0x400;
     if (readable((void *)(B + RVA_SAVELOAD_PTR), 8)) {
         unsigned char *sv = *(unsigned char **)(B + RVA_SAVELOAD_PTR);
         if (readable(sv, 0x118)
             && (*(void **)(sv + 0x100) || *(void **)(sv + 0x108) || *(void **)(sv + 0x110)))
             mask |= 0x010;
-    }
-    /* right-click context menu: ContextMenu is INLINE at PlayerInterface+0x48;
-     * its menuGUI/menuGUI2 are created on open, (delayed-)destroyed on close,
-     * so non-null == menu showing. Field-only -- no stale function RVAs. */
-    if (readable((void *)(B + RVA_PLAYER_IFACE), 8)) {
-        unsigned char *pl = *(unsigned char **)(B + RVA_PLAYER_IFACE);
-        if (readable(pl, PI_CTXMENU + CTX_GUI2 + 8)
-            && (*(void **)(pl + PI_CTXMENU + CTX_GUI1)
-             || *(void **)(pl + PI_CTXMENU + CTX_GUI2)))
-            mask |= 0x400;
     }
 
     /* optional singletons: null-check pointer, then a one-line getVisible */
@@ -1511,6 +1511,7 @@ __declspec(dllexport) void dllStartPlugin(void)
             g_gui_createwidget = (gui_createwidget_t)GetProcAddress(mygui, MYGUI_CREATEWIDGET_SYM);
             g_imgbox_setimage = (imgbox_setimage_t)GetProcAddress(mygui, MYGUI_SETIMAGETEX_SYM);
             g_widget_setvisible = (widget_setvisible_t)GetProcAddress(mygui, MYGUI_WIDGET_SETVIS_SYM);
+            g_widget_inhvis = (widget_inhvis_t)GetProcAddress(mygui, MYGUI_WIDGET_INHVIS_SYM);
             HMODULE ogremod = GetModuleHandleA("OgreMain_x64.dll");
             if (ogremod) {
                 g_rgm_getsingleton = (rgm_getsingleton_t)GetProcAddress(ogremod, OGRE_RGM_GETSINGLETON_SYM);

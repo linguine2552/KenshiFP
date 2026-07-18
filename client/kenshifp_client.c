@@ -430,16 +430,15 @@ static void fp_camera_override(void *gw)
                     if (h.x*h.x + h.y*h.y + h.z*h.z > 0.25f) {
                         eyeW.y = head.y - EYE_DROP;   /* head-bone Y directly (Y not rebased) */
                         /* head/feet are GAME coords, center is OGRE; they differ by
-                         * a constant floating-origin translation T. Calibrate T while
-                         * the character is still (center caught up), then use
-                         * head_game + T during movement -> exact, lag-free tracking. */
-                        float mvx = feet.x - g_last_feet_x, mvz = feet.z - g_last_feet_z;
-                        if (mvx*mvx + mvz*mvz < 0.25f) {   /* ~stationary */
+                         * a constant floating-origin translation T. Calibrate T ONLY
+                         * while idle (the center node has caught up); freeze it during
+                         * movement, when the center lags and would corrupt T. Then use
+                         * head_game + T -> exact, lag-free tracking. */
+                        if (!g_was_moving) {
                             g_tx = centerW.x - feet.x;
                             g_tz = centerW.z - feet.z;
                             g_have_t = 1;
                         }
-                        g_last_feet_x = feet.x; g_last_feet_z = feet.z;
 
                         if (g_have_t) {
                             eyeW.x = head.x + g_tx;
@@ -540,25 +539,12 @@ static void fp_movement(void *gw, float dt)
     Vec3 here;
     if (!char_position(pc, &here)) return;
 
-    /* Re-issue only on turn / key change / target approached / keepalive — not
-     * every frame (per-frame re-issue resets the path and stutter-steps). */
-    DWORD now = GetTickCount();
-    float dir = atan2f(dx, dz);
-    float dturn = dir - g_last_move_dir;
-    while (dturn >  3.14159265f) dturn -= 6.2831853f;
-    while (dturn < -3.14159265f) dturn += 6.2831853f;
-    float rtx = g_move_tx - here.x, rtz = g_move_tz - here.z;
-    float remain = sqrtf(rtx * rtx + rtz * rtz);
-    int changed = !g_was_moving || keys != g_last_move_keys
-                || (dturn > MOVE_TURN_EPS || dturn < -MOVE_TURN_EPS)
-                || (remain < g_move_dist * MOVE_RETARGET_FRAC)
-                || (now - g_last_move_ms) > MOVE_KEEPALIVE_MS;
-    if (changed) {
-        Vec3 tgt = { here.x + dx * dist, here.y, here.z + dz * dist };
-        g_charmove_setdest(mv, &tgt, UPDATE_PRIORITY_HIGH, 0);
-        g_move_tx = tgt.x; g_move_tz = tgt.z; g_move_dist = dist;
-        g_last_move_ms = now; g_last_move_dir = dir; g_last_move_keys = keys;
-    }
+    /* Re-issue the destination EVERY frame: the low-level CharMovement order does
+     * not "hold" like a right-click — the AI cancels it, so it walks a single
+     * tick then stops unless we keep re-asserting it. Target sits `dist` ahead in
+     * the look/WASD direction, so the character walks continuously toward it. */
+    Vec3 tgt = { here.x + dx * dist, here.y, here.z + dz * dist };
+    g_charmove_setdest(mv, &tgt, UPDATE_PRIORITY_HIGH, 0);
     g_was_moving = 1;
 }
 

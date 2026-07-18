@@ -124,6 +124,15 @@
 #define FP_FOV_DEG        70.0f    /* vertical FOV while first-person; tune */
 #define DEG2RAD           0.01745329f
 
+/* ---- near clip ----
+ * Kenshi's RTS camera sits far from everything, so its near clip is large; at
+ * eye level that clips nearby geometry and you see through walls/meshes. Pull it
+ * in while first-person. Frustum::setNearClipDistance(float) / getNearClipDistance
+ * (returns Real=float by value -> XMM0, safe scalar ABI). Kenshi is ~10 units/m. */
+#define OGRE_SETNEARCLIP_SYM "?setNearClipDistance@Frustum@Ogre@@UEAAXM@Z"
+#define OGRE_GETNEARCLIP_SYM "?getNearClipDistance@Frustum@Ogre@@UEBAMXZ"
+#define FP_NEARCLIP       0.5f     /* world units (~5 cm); tune */
+
 /* ---- M2 first-person (Ogre node override) ----
  * Scene graph (from the ctor): root -> center(+0x58) -> node(+0x70) -> camera
  * (+0x68 attached). CameraClass::update keeps `center` at the character and
@@ -190,6 +199,8 @@ typedef void (*node_set_ori_t)(void *node, const Quat *q);   /* local setOrienta
 typedef void (*node_set_dori_t)(void *node, const Quat *q);  /* world _setDerivedOrientation */
 typedef void (*cam_set_fovy_t)(void *camera, const float *rad);
 typedef const float *(*cam_get_fovy_t)(void *camera);
+typedef void (*cam_set_nearclip_t)(void *camera, float dist);
+typedef float (*cam_get_nearclip_t)(void *camera);
 typedef void (*charmove_setdest_t)(void *mv, const Vec3 *dest, int pri, char shift);
 typedef void (*face_direction_t)(void *mv, const Vec3 *dir);
 typedef void (*manual_move_t)(void *mv, const Vec3 *desiredMotion);
@@ -223,6 +234,10 @@ static cam_set_fovy_t g_cam_set_fovy;
 static cam_get_fovy_t g_cam_get_fovy;
 static int g_fov_saved;
 static float g_fov_default;
+static cam_set_nearclip_t g_cam_set_nearclip;
+static cam_get_nearclip_t g_cam_get_nearclip;
+static int g_nearclip_saved;
+static float g_nearclip_default;
 static charmove_setdest_t g_charmove_setdest;  /* CharMovement::setDestination (halt only) */
 static DWORD g_last_move_ms;
 static int g_was_moving;
@@ -475,6 +490,16 @@ static void fp_camera_override(void *gw)
             float rad = FP_FOV_DEG * DEG2RAD;
             g_cam_set_fovy(ogre_cam, &rad);
         }
+
+        /* Near clip: capture default once, then pull it in so nearby meshes
+         * don't get clipped away (seeing through walls) at eye level. */
+        if (g_cam_set_nearclip && readable(ogre_cam, 8)) {
+            if (!g_nearclip_saved && g_cam_get_nearclip) {
+                g_nearclip_default = g_cam_get_nearclip(ogre_cam);
+                g_nearclip_saved = 1;
+            }
+            g_cam_set_nearclip(ogre_cam, FP_NEARCLIP);
+        }
     } else if (g_ovr_prev) {
         /* FP exit: release the cursor, restore FOV, and level the node
          * orientation to identity so update()'s incremental rotations no longer
@@ -484,6 +509,10 @@ static void fp_camera_override(void *gw)
         if (g_fov_saved && g_cam_set_fovy && readable(ogre_cam, 8)) {
             g_cam_set_fovy(ogre_cam, &g_fov_default);
             g_fov_saved = 0;
+        }
+        if (g_nearclip_saved && g_cam_set_nearclip && readable(ogre_cam, 8)) {
+            g_cam_set_nearclip(ogre_cam, g_nearclip_default);
+            g_nearclip_saved = 0;
         }
         Quat ident = { 1.0f, 0.0f, 0.0f, 0.0f };
         g_node_set_ori(node, &ident);
@@ -588,6 +617,8 @@ __declspec(dllexport) void dllStartPlugin(void)
         g_node_get_dpos = (node_get_dpos_t)GetProcAddress(ogre, OGRE_GETDPOS_SYM);
         g_cam_set_fovy  = (cam_set_fovy_t)GetProcAddress(ogre, OGRE_SETFOVY_SYM);
         g_cam_get_fovy  = (cam_get_fovy_t)GetProcAddress(ogre, OGRE_GETFOVY_SYM);
+        g_cam_set_nearclip = (cam_set_nearclip_t)GetProcAddress(ogre, OGRE_SETNEARCLIP_SYM);
+        g_cam_get_nearclip = (cam_get_nearclip_t)GetProcAddress(ogre, OGRE_GETNEARCLIP_SYM);
         g_ogre_ready = (g_node_set_dori && g_node_set_dpos && g_node_get_dpos);
         logline("Ogre FOV setters: set=%p get=%p", (void *)g_cam_set_fovy, (void *)g_cam_get_fovy);
     }

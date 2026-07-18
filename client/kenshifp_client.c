@@ -499,6 +499,17 @@ static void fp_movement(void *gw, float dt)
         ? *(void **)((uintptr_t)pc + CHAR_MOVEMENT) : NULL;
     if (!readable(mv, 8)) return;
 
+    /* PROTOTYPE orient-to-control: the character faces where the camera looks
+     * every frame (turret model), regardless of movement direction. */
+    void **mvvt = *(void ***)mv;
+    if (in_module(mvvt)) {
+        face_direction_t face = (face_direction_t)mvvt[MV_FACEDIR_VTOFF];
+        if (in_module((void *)face)) {
+            Vec3 lookDir = { sinf(g_yaw), 0.0f, cosf(g_yaw) };
+            face(mv, &lookDir);
+        }
+    }
+
     int w = (GetAsyncKeyState(VK_W) & 0x8000) != 0;
     int s = (GetAsyncKeyState(VK_S) & 0x8000) != 0;
     int a = (GetAsyncKeyState(VK_A) & 0x8000) != 0;

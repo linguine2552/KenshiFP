@@ -162,6 +162,8 @@
 #define MYGUI_WIDGET_SETVIS_SYM "?setVisible@Widget@MyGUI@@UEAAX_N@Z"
 #define OGRE_RGM_GETSINGLETON_SYM "?getSingletonPtr@ResourceGroupManager@Ogre@@SAPEAV12@XZ"
 #define OGRE_RGM_ADDLOCATION_SYM  "?addResourceLocation@ResourceGroupManager@Ogre@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@00_N1@Z"
+#define OGRE_RGM_CREATEGROUP_SYM  "?createResourceGroup@ResourceGroupManager@Ogre@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@_N@Z"
+#define OGRE_RGM_INITGROUP_SYM    "?initialiseResourceGroup@ResourceGroupManager@Ogre@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z"
 #define CROSSHAIR_SIZE    40         /* px on screen; tune */
 
 /* ---- M2 first-person (Ogre node override) ----
@@ -245,6 +247,8 @@ typedef void (*widget_setvisible_t)(void *widget, char visible);
 typedef void *(*rgm_getsingleton_t)(void);
 typedef void (*rgm_addlocation_t)(void *rgm, const void *name, const void *loctype,
                                   const void *group, char recursive, char readonly);
+typedef void (*rgm_creategroup_t)(void *rgm, const void *group, char inGlobalPool);
+typedef void (*rgm_initgroup_t)(void *rgm, const void *group);
 typedef void (*charmove_setdest_t)(void *mv, const Vec3 *dest, int pri, char shift);
 typedef void (*face_direction_t)(void *mv, const Vec3 *dir);
 typedef void (*manual_move_t)(void *mv, const Vec3 *desiredMotion);
@@ -292,6 +296,8 @@ static imgbox_setimage_t g_imgbox_setimage;
 static widget_setvisible_t g_widget_setvisible;
 static rgm_getsingleton_t g_rgm_getsingleton;
 static rgm_addlocation_t g_rgm_addlocation;
+static rgm_creategroup_t g_rgm_creategroup;
+static rgm_initgroup_t g_rgm_initgroup;
 static void *g_crosshair;          /* the ImageBox widget */
 static int g_pointer_default = 1;  /* current MyGUI pointer is the default (arrow) */
 static charmove_setdest_t g_charmove_setdest;  /* CharMovement::setDestination (halt only) */
@@ -492,7 +498,7 @@ static void fp_camera_override(void *gw)
         if (!g_ovr_prev) { mygui_cursor(0); g_pointer_default = 1; }  /* FP enter */
         ensure_crosshair();
         if (g_crosshair && g_widget_setvisible)
-            g_widget_setvisible(g_crosshair, (g_pointer_default && !ui_open) ? 1 : 0);
+            g_widget_setvisible(g_crosshair, (!ui_open) ? 1 : 0);   /* DIAG: force-show to test texture */
 
         if (ui_open) {
             if (g_cursor_hidden) { while (ShowCursor(TRUE) < 0) { } g_cursor_hidden = 0; }
@@ -651,6 +657,18 @@ static void fp_movement(void *gw, float dt)
                 g_charmove_setdest(mv, &here, UPDATE_PRIORITY_HIGH, 0);
             g_was_moving = 0;
         }
+        /* Orient-to-control: while standing still, rotate the body to face the
+         * camera look direction via faceDirection (CharMovement vtable slot 6).
+         * Idle physics doesn't fight it, so it holds; during movement the order
+         * system drives facing toward the path instead. */
+        void **mvvt = *(void ***)mv;
+        if (in_module(mvvt)) {
+            face_direction_t face = (face_direction_t)mvvt[MV_FACEDIR_VTOFF];
+            if (in_module((void *)face)) {
+                Vec3 lookDir = { sinf(g_yaw), 0.0f, cosf(g_yaw) };
+                face(mv, &lookDir);
+            }
+        }
         return;
     }
 
@@ -713,11 +731,15 @@ static void ensure_crosshair(void)
     void *gui = g_gui_getinstance();
     if (!readable(gui, 8)) return;   /* MyGUI not initialised yet */
 
+    /* Register the image folder in Kenshi's "GUI" resource group -- that is the
+     * group MyGUI's data manager searches for textures (its ./data/gui/ folder).
+     * MyGUI globs the group live (findResourceNames), so a location added now is
+     * picked up; "General"/a fresh group are NOT searched by MyGUI. */
     if (g_rgm_getsingleton && g_rgm_addlocation) {
         void *rgm = g_rgm_getsingleton();
         if (readable(rgm, 8)) {
             unsigned char loc[32], ft[32], grp[32];
-            make_mstr(loc, "kenshifp"); make_mstr(ft, "FileSystem"); make_mstr(grp, "General");
+            make_mstr(loc, "kenshifp"); make_mstr(ft, "FileSystem"); make_mstr(grp, "GUI");
             g_rgm_addlocation(rgm, loc, ft, grp, 0, 1);
         }
     }
@@ -752,6 +774,8 @@ static void hooked_setpointer(void *pm, const void *name)
     read_mstring(name, cur, sizeof cur);
     read_mstring(g_pm_getdefault(pm), def, sizeof def);
     int is_default = (cur[0] != '\0' && strcmp(cur, def) == 0);
+    static int dbg_n;
+    if (dbg_n < 20) { dbg_n++; logline("[ptr] set='%s' default='%s' isDefault=%d", cur, def, is_default); }
     g_pm_setvisible(pm, is_default ? 0 : 1);   /* hide arrow (crosshair instead), show contextual */
     g_pointer_default = is_default;
 }
@@ -854,6 +878,8 @@ __declspec(dllexport) void dllStartPlugin(void)
             if (ogremod) {
                 g_rgm_getsingleton = (rgm_getsingleton_t)GetProcAddress(ogremod, OGRE_RGM_GETSINGLETON_SYM);
                 g_rgm_addlocation  = (rgm_addlocation_t)GetProcAddress(ogremod, OGRE_RGM_ADDLOCATION_SYM);
+                g_rgm_creategroup  = (rgm_creategroup_t)GetProcAddress(ogremod, OGRE_RGM_CREATEGROUP_SYM);
+                g_rgm_initgroup    = (rgm_initgroup_t)GetProcAddress(ogremod, OGRE_RGM_INITGROUP_SYM);
             }
             void *sp = GetProcAddress(mygui, MYGUI_SETPOINTER_SYM);
             MH_STATUS mh3 = sp ? MH_CreateHook(sp, (void *)hooked_setpointer,

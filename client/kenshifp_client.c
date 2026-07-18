@@ -231,6 +231,16 @@ static float g_tx, g_tz;           /* game->Ogre translation, calibrated when st
 static int g_have_t;
 static float g_last_feet_x, g_last_feet_z;
 
+/* True if p points inside the loaded kenshi_x64.exe image (where real vtables
+ * and functions live). Used to reject false-positive "objects" before calling
+ * through them — e.g. at the main menu there's no player, but a garbage pointer
+ * can still pass readable(); its "vtable" won't be in the module. */
+static int in_module(const void *p)
+{
+    uintptr_t a = (uintptr_t)p;
+    return a >= g_base && a < g_base + 0x3000000;   /* exe image ~36MB */
+}
+
 static void logline(const char *fmt, ...)
 {
     if (!g_log) return;
@@ -264,7 +274,11 @@ static void *first_player_char(void *gw)
     void **stuff   = *(void ***)((uintptr_t)player + PI_PLAYERCHARS + LEK_STUFF);
     if (count == 0 || count > 4096 || !readable(stuff, 8)) return NULL;
     void *c = stuff[0];
-    return readable(c, 0x60) ? c : NULL;
+    if (!readable(c, 0x60)) return NULL;
+    /* Reject anything whose vtable isn't in the exe (menu false positives). */
+    void **vt = *(void ***)c;
+    if (!readable(vt, (GETPOS_VTABLE_SLOT + 1) * 8) || !in_module(vt)) return NULL;
+    return c;
 }
 
 /* Character::getPosition via live vtable slot 8 (proven ABI). */
@@ -272,9 +286,9 @@ static int char_position(void *c, Vec3 *out)
 {
     if (!readable(c, 8)) return 0;
     void **vt = *(void ***)c;
-    if (!readable(vt, (GETPOS_VTABLE_SLOT + 1) * 8)) return 0;
+    if (!readable(vt, (GETPOS_VTABLE_SLOT + 1) * 8) || !in_module(vt)) return 0;
     get_position_t getpos = (get_position_t)vt[GETPOS_VTABLE_SLOT];
-    if (!readable((void *)getpos, 1)) return 0;
+    if (!in_module((void *)getpos)) return 0;   /* real fn lives in .text */
     Vec3 tmp = {0,0,0};
     getpos(c, &tmp);
     *out = tmp;

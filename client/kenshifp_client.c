@@ -41,6 +41,11 @@
  * 1.0.68: camera(Ogre::Camera*)+0x68, center(SceneNode*)+0x58, node+0x70,
  * objectCurrentlyFollowing(hand)+0x28. */
 #define RVA_CAM_INSTANCE  0x2133310u /* *(CameraClass**)(base + this) */
+/* InputHandler is statically located (its pan bools at +0xDB..0xDE line up with
+ * the camera update's DAT_14213344b..e -> base RVA 0x2133370). controlEnabled
+ * (+0xD0, RVA 0x2133440) is FALSE while a dialogue/menu grabs input -> release
+ * the FP cursor so the player can click UI. */
+#define RVA_INPUT_CONTROLENABLED 0x2133440u
 #define RVA_SCENE_CTX     0x2133308u /* scene/render context; +0x58 Ogre::Camera* */
 #define SCENE_OGRE_CAMERA 0x58
 /* CameraClass field offsets (KenshiLib header, ctor-confirmed layout): */
@@ -246,6 +251,9 @@ static int g_last_move_keys;       /* WASD bitmask of last issued destination */
 static float g_move_tx, g_move_tz, g_move_dist;  /* last issued target + its distance */
 static float g_dbg_center_y, g_dbg_eye_y;  /* diagnostics for eye-height tuning */
 static float g_dbg_head_x, g_dbg_center_x;  /* frame check: head vs center X */
+static int g_cursor_hidden;        /* our ShowCursor state */
+static int g_ui_prev;              /* dialogue/menu open last frame (edge) */
+static int g_dbg_control;          /* controlEnabled read, for verification */
 static float g_tx, g_tz;           /* game->Ogre translation, calibrated when still */
 static int g_have_t;
 static float g_last_feet_x, g_last_feet_z;
@@ -368,9 +376,9 @@ static void fp_tick(void *gw)
     (void)ogre_cam; (void)scene_cam; (void)center; (void)node;
     (void)yaw; (void)pitch; (void)alt; (void)freecam; (void)speedmult;
 
-    logline("[tick] fp=%d pos=(%.1f,%.1f,%.1f) posX=%.1f headX=%.1f centerX=%.1f eyeY=%.1f look(yaw=%.2f pitch=%.2f) | WASD=%d%d%d%d",
+    logline("[tick] fp=%d pos=(%.1f,%.1f,%.1f) eyeY=%.1f look(yaw=%.2f pitch=%.2f) control=%d cursorHidden=%d | WASD=%d%d%d%d",
             g_fp_mode, pos.x, pos.y, pos.z,
-            pos.x, g_dbg_head_x, g_dbg_center_x, g_dbg_eye_y, g_yaw, g_pitch, w, a, s, d);
+            g_dbg_eye_y, g_yaw, g_pitch, g_dbg_control, g_cursor_hidden, w, a, s, d);
 }
 
 /* M1 camera lock. Runs every frame. While FP is on, re-assert followObject on
@@ -413,18 +421,30 @@ static void fp_camera_override(void *gw)
         if (cy <= 0) cy = 540;
 
         POINT cur; GetCursorPos(&cur);
-        if (!g_ovr_prev) {
-            /* FP enter: zero the look and capture the cursor (hide + center). */
-            g_yaw = 0.0f; g_pitch = 0.0f;
-            while (ShowCursor(FALSE) >= 0) { }
+
+        /* Dialogue/menu open? Game control is disabled then -> free the cursor so
+         * the player can click UI; don't recenter or turn the camera. */
+        int control = readable((void *)(g_base + RVA_INPUT_CONTROLENABLED), 1)
+                      ? *(char *)(g_base + RVA_INPUT_CONTROLENABLED) : 1;
+        g_dbg_control = control;
+        int ui_open = (control == 0);
+
+        if (ui_open) {
+            if (g_cursor_hidden) { while (ShowCursor(TRUE) < 0) { } g_cursor_hidden = 0; }
+            /* cursor free; leave look angle frozen */
         } else {
-            /* relative mouse-look: accumulate delta from screen center */
-            g_yaw   -= (float)(cur.x - cx) * LOOK_SENS;   /* mouse right -> look right */
-            g_pitch += (float)(cur.y - cy) * LOOK_SENS;   /* mouse down  -> look down  */
-            if (g_pitch >  1.4f) g_pitch =  1.4f;
-            if (g_pitch < -1.4f) g_pitch = -1.4f;
+            if (!g_cursor_hidden) { while (ShowCursor(FALSE) >= 0) { } g_cursor_hidden = 1; }
+            if (!g_ovr_prev) {
+                g_yaw = 0.0f; g_pitch = 0.0f;   /* FP enter: zero the look */
+            } else if (!g_ui_prev) {            /* skip the delta on the frame a dialogue closes */
+                g_yaw   -= (float)(cur.x - cx) * LOOK_SENS;   /* mouse right -> look right */
+                g_pitch += (float)(cur.y - cy) * LOOK_SENS;   /* mouse down  -> look down  */
+                if (g_pitch >  1.4f) g_pitch =  1.4f;
+                if (g_pitch < -1.4f) g_pitch = -1.4f;
+            }
+            SetCursorPos(cx, cy);  /* recenter so the cursor never drifts to edges */
         }
-        SetCursorPos(cx, cy);  /* recenter so the cursor never drifts to edges */
+        g_ui_prev = ui_open;
 
         /* Eye position, fully in WORLD space: centerWorld + (head - feet). The
          * head-feet offset (world axes, from getBoneWorldPosition/getPosition)
@@ -505,6 +525,7 @@ static void fp_camera_override(void *gw)
          * orientation to identity so update()'s incremental rotations no longer
          * drift off our FP angle (position is left for update() to reset). */
         while (ShowCursor(TRUE) < 0) { }
+        g_cursor_hidden = 0; g_ui_prev = 0;
         void *ogre_cam = *(void **)((uintptr_t)cam + CC_CAMERA);
         if (g_fov_saved && g_cam_set_fovy && readable(ogre_cam, 8)) {
             g_cam_set_fovy(ogre_cam, &g_fov_default);

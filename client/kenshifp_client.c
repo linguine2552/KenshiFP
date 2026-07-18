@@ -114,6 +114,10 @@
 #define RVA_PRO_GETVIS      0x48bf50u
 #define RVA_SAVELOAD_PTR    0x212ebd8u  /* save/load dialogs: widget slots +0x100.. */
 #define RVA_MSGBOX_COUNT    0x1f29a30u  /* modal message boxes open */
+#define RVA_PLAYER_IFACE    0x2134690u  /* PlayerInterface* (GameWorld+0x580, verified) */
+#define PI_CTXMENU          0x48        /* PlayerInterface::contextMenu (INLINE object) */
+#define CTX_GUI1            0x48        /* ContextMenu::menuGUI  (created on open, */
+#define CTX_GUI2            0x50        /* ContextMenu::menuGUI2  destroyed on close) */
 #define UIMASK_OVERVIEW     0x080       /* fullscreen map/factions/squads screen */
 #define RVA_CAM_UPDATE       0x6b0f90u   /* CameraClass::update(bool controlEnabled) -- verified
                                           * M1. Hooked so the FP eye is re-asserted MID-frame:
@@ -915,6 +919,16 @@ static int ui_panels_open(void)
         if (readable(sv, 0x118)
             && (*(void **)(sv + 0x100) || *(void **)(sv + 0x108) || *(void **)(sv + 0x110)))
             mask |= 0x010;
+    }
+    /* right-click context menu: ContextMenu is INLINE at PlayerInterface+0x48;
+     * its menuGUI/menuGUI2 are created on open, (delayed-)destroyed on close,
+     * so non-null == menu showing. Field-only -- no stale function RVAs. */
+    if (readable((void *)(B + RVA_PLAYER_IFACE), 8)) {
+        unsigned char *pl = *(unsigned char **)(B + RVA_PLAYER_IFACE);
+        if (readable(pl, PI_CTXMENU + CTX_GUI2 + 8)
+            && (*(void **)(pl + PI_CTXMENU + CTX_GUI1)
+             || *(void **)(pl + PI_CTXMENU + CTX_GUI2)))
+            mask |= 0x400;
     }
 
     /* optional singletons: null-check pointer, then a one-line getVisible */

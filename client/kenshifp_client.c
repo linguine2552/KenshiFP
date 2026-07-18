@@ -503,17 +503,6 @@ static void fp_movement(void *gw, float dt)
         ? *(void **)((uintptr_t)pc + CHAR_MOVEMENT) : NULL;
     if (!readable(mv, 8)) return;
 
-    /* PROTOTYPE orient-to-control: the character faces where the camera looks
-     * every frame (turret model), regardless of movement direction. */
-    void **mvvt = *(void ***)mv;
-    if (in_module(mvvt)) {
-        face_direction_t face = (face_direction_t)mvvt[MV_FACEDIR_VTOFF];
-        if (in_module((void *)face)) {
-            Vec3 lookDir = { sinf(g_yaw), 0.0f, cosf(g_yaw) };
-            face(mv, &lookDir);
-        }
-    }
-
     int w = (GetAsyncKeyState(VK_W) & 0x8000) != 0;
     int s = (GetAsyncKeyState(VK_S) & 0x8000) != 0;
     int a = (GetAsyncKeyState(VK_A) & 0x8000) != 0;
@@ -523,14 +512,11 @@ static void fp_movement(void *gw, float dt)
     float mr = (float)(d - a);     /* left/right (turns the char, not strafe) */
 
     (void)dt;
-    manual_move_t mm = (in_module(mvvt) && readable(&mvvt[MV_MANUALMOVE_VTOFF], 8)
-                        && in_module(mvvt[MV_MANUALMOVE_VTOFF]))
-                       ? (manual_move_t)mvvt[MV_MANUALMOVE_VTOFF] : NULL;
-
     if (keys == 0 || (mf == 0.0f && mr == 0.0f)) {
-        if (g_was_moving) {         /* release: zero desired motion (stop) */
-            Vec3 zero = { 0.0f, 0.0f, 0.0f };
-            if (mm) mm(mv, &zero);
+        if (g_was_moving) {         /* release: halt at current position */
+            Vec3 here;
+            if (char_position(pc, &here))
+                g_charmove_setdest(mv, &here, UPDATE_PRIORITY_HIGH, 0);
             g_was_moving = 0;
         }
         return;
@@ -546,21 +532,18 @@ static void fp_movement(void *gw, float dt)
     if (len < 0.001f) return;
     dx = -dx / len; dz = -dz / len;
 
-    /* Speed from look pitch (down = slow, up = run), scaled by the character's
-     * own walk/max speeds so encumbrance/injury still matter. */
     float t = (1.4f - g_pitch) / 2.8f;
     if (t < 0.0f) t = 0.0f;
     if (t > 1.0f) t = 1.0f;
-    float walk = *(float *)((uintptr_t)mv + MV_WALK_SPEED);
-    float maxs = *(float *)((uintptr_t)mv + MV_MAX_SPEED);
-    if (!(walk > 0.1f && walk < 1000.0f)) walk = 8.0f;
-    if (!(maxs > walk && maxs < 1000.0f)) maxs = 25.0f;
-    float speed = (walk * 0.3f) + t * (maxs - walk * 0.3f);
+    float dist = MOVE_NEAR + t * (MOVE_FAR - MOVE_NEAR);
 
-    /* Engine-driven velocity move: no pathfinding, no auto-turn, but the engine
-     * still ground-clamps and animates. Facing stays on the camera (above). */
-    Vec3 motion = { dx * speed, 0.0f, dz * speed };
-    if (mm) mm(mv, &motion);
+    Vec3 here;
+    if (!char_position(pc, &here)) return;
+
+    /* Order-based move (animates + ground-clamps + turns to face path); re-issue
+     * every frame so it holds. Camera stays welded via calibrated T. */
+    Vec3 tgt = { here.x + dx * dist, here.y, here.z + dz * dist };
+    g_charmove_setdest(mv, &tgt, UPDATE_PRIORITY_HIGH, 0);
     g_was_moving = 1;
 }
 

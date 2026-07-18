@@ -46,6 +46,7 @@
  * (+0xD0, RVA 0x2133440) is FALSE while a dialogue/menu grabs input -> release
  * the FP cursor so the player can click UI. */
 #define RVA_INPUT_CONTROLENABLED 0x2133440u
+#define RVA_INPUT_MWHEEL         0x2133488u /* InputHandler.mWheel (+0x118); OIS wheel delta */
 #define RVA_SCENE_CTX     0x2133308u /* scene/render context; +0x58 Ogre::Camera* */
 #define SCENE_OGRE_CAMERA 0x58
 /* CameraClass field offsets (KenshiLib header, ctor-confirmed layout): */
@@ -199,7 +200,7 @@
 #define GETPOS_VTABLE_SLOT 8         /* Character::getPosition; ABI Vec3*(this RCX, out RDX) */
 
 /* ---- input (Win32, zero engine dependency for stage 0) ---- */
-#define VK_TOGGLE_FP      0x46       /* 'F' — enter/leave FP intent */
+#define VK_TOGGLE_FP      0xA5       /* Right Alt (VK_RMENU) — enter/leave FP */
 #define VK_W 0x57
 #define VK_A 0x41
 #define VK_S 0x53
@@ -266,6 +267,9 @@ static pm_getinstance_t g_pm_getinstance;
 static charmove_setdest_t g_charmove_setdest;  /* CharMovement::setDestination (halt only) */
 static DWORD g_last_move_ms;
 static int g_was_moving;
+static float g_speed_scale = 0.6f; /* scrollwheel throttle: walk (low) .. run (high) */
+static int g_last_wheel;
+static int g_dbg_wheel;
 static float g_last_move_dir;      /* heading of last issued destination (radians) */
 static int g_last_move_keys;       /* WASD bitmask of last issued destination */
 static float g_move_tx, g_move_tz, g_move_dist;  /* last issued target + its distance */
@@ -397,9 +401,9 @@ static void fp_tick(void *gw)
     (void)ogre_cam; (void)scene_cam; (void)center; (void)node;
     (void)yaw; (void)pitch; (void)alt; (void)freecam; (void)speedmult;
 
-    logline("[tick] fp=%d pos=(%.1f,%.1f,%.1f) eyeY=%.1f look(yaw=%.2f pitch=%.2f) control=%d cursorHidden=%d | WASD=%d%d%d%d",
+    logline("[tick] fp=%d pos=(%.1f,%.1f,%.1f) eyeY=%.1f look(yaw=%.2f pitch=%.2f) control=%d wheel=%d speed=%.2f | WASD=%d%d%d%d",
             g_fp_mode, pos.x, pos.y, pos.z,
-            g_dbg_eye_y, g_yaw, g_pitch, g_dbg_control, g_cursor_hidden, w, a, s, d);
+            g_dbg_eye_y, g_yaw, g_pitch, g_dbg_control, g_dbg_wheel, g_speed_scale, w, a, s, d);
 }
 
 /* M1 camera lock. Runs every frame. While FP is on, re-assert followObject on
@@ -585,6 +589,16 @@ static void fp_movement(void *gw, float dt)
         ? *(void **)((uintptr_t)pc + CHAR_MOVEMENT) : NULL;
     if (!readable(mv, 8)) return;
 
+    /* Scrollwheel throttle: adjust the speed scale. InputHandler.mWheel is the
+     * OIS per-frame wheel delta (0 when idle, +/-120 per notch). */
+    int wheel = readable((void *)(g_base + RVA_INPUT_MWHEEL), 4)
+        ? *(int *)(g_base + RVA_INPUT_MWHEEL) : 0;
+    g_dbg_wheel = wheel;
+    if (wheel > 0)      g_speed_scale += 0.12f;
+    else if (wheel < 0) g_speed_scale -= 0.12f;
+    if (g_speed_scale < 0.15f) g_speed_scale = 0.15f;   /* slow walk */
+    if (g_speed_scale > 1.0f)  g_speed_scale = 1.0f;    /* full run */
+
     int w = (GetAsyncKeyState(VK_W) & 0x8000) != 0;
     int s = (GetAsyncKeyState(VK_S) & 0x8000) != 0;
     int a = (GetAsyncKeyState(VK_A) & 0x8000) != 0;
@@ -614,10 +628,8 @@ static void fp_movement(void *gw, float dt)
     if (len < 0.001f) return;
     dx = -dx / len; dz = -dz / len;
 
-    float t = (1.4f - g_pitch) / 2.8f;
-    if (t < 0.0f) t = 0.0f;
-    if (t > 1.0f) t = 1.0f;
-    float dist = MOVE_NEAR + t * (MOVE_FAR - MOVE_NEAR);
+    /* Speed from the scrollwheel throttle (down = walk, up = run). */
+    float dist = MOVE_NEAR + g_speed_scale * (MOVE_FAR - MOVE_NEAR);
 
     Vec3 here;
     if (!char_position(pc, &here)) return;

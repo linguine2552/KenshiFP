@@ -209,6 +209,7 @@ static float g_last_move_dir;      /* heading of last issued destination (radian
 static int g_last_move_keys;       /* WASD bitmask of last issued destination */
 static float g_move_tx, g_move_tz, g_move_dist;  /* last issued target + its distance */
 static float g_dbg_center_y, g_dbg_eye_y;  /* diagnostics for eye-height tuning */
+static float g_dbg_head_x, g_dbg_center_x;  /* frame check: head vs center X */
 
 static void logline(const char *fmt, ...)
 {
@@ -314,9 +315,9 @@ static void fp_tick(void *gw)
     (void)ogre_cam; (void)scene_cam; (void)center; (void)node;
     (void)yaw; (void)pitch; (void)alt; (void)freecam; (void)speedmult;
 
-    logline("[tick] fp=%d pos=(%.1f,%.1f,%.1f) headOff.y=%.2f centerY=%.1f eyeY=%.1f look(yaw=%.2f pitch=%.2f) | WASD=%d%d%d%d",
+    logline("[tick] fp=%d pos=(%.1f,%.1f,%.1f) posX=%.1f headX=%.1f centerX=%.1f eyeY=%.1f look(yaw=%.2f pitch=%.2f) | WASD=%d%d%d%d",
             g_fp_mode, pos.x, pos.y, pos.z,
-            hoff.y, g_dbg_center_y, g_dbg_eye_y, g_yaw, g_pitch, w, a, s, d);
+            pos.x, g_dbg_head_x, g_dbg_center_x, g_dbg_eye_y, g_yaw, g_pitch, w, a, s, d);
 }
 
 /* M1 camera lock. Runs every frame. While FP is on, re-assert followObject on
@@ -393,9 +394,18 @@ static void fp_camera_override(void *gw)
                     g_get_bone_world(pc, &head, g_head_bone);
                     Vec3 h = { head.x - feet.x, head.y - feet.y, head.z - feet.z };
                     if (h.x*h.x + h.y*h.y + h.z*h.z > 0.25f) {
-                        eyeW.x = centerW.x + h.x;
                         eyeW.y = head.y - EYE_DROP;   /* head-bone Y directly (stable) */
-                        eyeW.z = centerW.z + h.z;
+                        /* If the head bone's world X/Z sit in the Ogre scene frame
+                         * (close to the center node), weld the eye straight to them
+                         * so it tracks the character with NO follow-lag; else (X/Z
+                         * rebased by the floating origin) anchor to center + lean. */
+                        float ddx = head.x - centerW.x, ddz = head.z - centerW.z;
+                        if (ddx*ddx + ddz*ddz < 10000.0f) {   /* within ~100u -> same frame */
+                            eyeW.x = head.x; eyeW.z = head.z;
+                        } else {
+                            eyeW.x = centerW.x + h.x; eyeW.z = centerW.z + h.z;
+                        }
+                        g_dbg_head_x = head.x; g_dbg_center_x = centerW.x;
                     }
                 }
             }
@@ -441,14 +451,12 @@ static void fp_camera_override(void *gw)
  * the current position when all keys release. */
 static void fp_movement(void *gw)
 {
-    if (!g_fp_mode || !g_set_destination) return;
+    if (!g_fp_mode || !g_charmove_setdest) return;
     void *pc = first_player_char(gw);
     if (!pc) return;
-    /* setDestination dereferences the character's movement (+0x640) and aux
-     * (+0x448) — validate before calling. */
-    if (!readable((void *)((uintptr_t)pc + CHAR_MOVEMENT), 8)
-        || !readable((void *)((uintptr_t)pc + CHAR_DEST_AUX), 8))
-        return;
+    void *mv = readable((void *)((uintptr_t)pc + CHAR_MOVEMENT), 8)
+        ? *(void **)((uintptr_t)pc + CHAR_MOVEMENT) : NULL;
+    if (!readable(mv, 8)) return;
 
     int w = (GetAsyncKeyState(VK_W) & 0x8000) != 0;
     int s = (GetAsyncKeyState(VK_S) & 0x8000) != 0;
@@ -462,7 +470,7 @@ static void fp_movement(void *gw)
         if (g_was_moving) {         /* release: halt at current position */
             Vec3 here;
             if (char_position(pc, &here))
-                g_set_destination(pc, &here, 0);
+                g_charmove_setdest(mv, &here, UPDATE_PRIORITY_HIGH, 0);
             g_was_moving = 0;
         }
         return;
@@ -494,7 +502,7 @@ static void fp_movement(void *gw)
      * dragging the marker. The target keeps sitting `dist` ahead of the moving
      * character, so it walks continuously and smoothly; no re-fire throttling. */
     Vec3 tgt = { here.x + dx * dist, here.y, here.z + dz * dist };
-    g_set_destination(pc, &tgt, 0);   /* player order path — camera stays synced */
+    g_charmove_setdest(mv, &tgt, UPDATE_PRIORITY_HIGH, 0);
     g_was_moving = 1;
 }
 

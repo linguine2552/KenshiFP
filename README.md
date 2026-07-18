@@ -4,6 +4,12 @@ Play Kenshi in true first person: the camera is welded to your character's
 head, and the RTS click-to-move scheme is replaced with WASD + mouse-look.
 Built as a native code plugin — no game files are modified.
 
+## Showcase
+
+[![KenshiFP showcase video](https://img.youtube.com/vi/-srKmsiw-Hc/maxresdefault.jpg)](https://youtu.be/-srKmsiw-Hc)
+
+*Click to watch the mod in action.*
+
 **Target: Steam Kenshi 1.0.68 x64** (the current build), Windows or
 Linux/Proton. Other game versions are not supported (the mod is built on
 version-specific reverse-engineered addresses).

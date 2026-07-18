@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <setjmp.h>
 #include "MinHook.h"
 
 /* ---- per-frame hook (proven in KenshiMP, same binary) ---- */
@@ -79,12 +80,20 @@
  * this won't move them and we'll switch to the Character-level order path. */
 #define CHAR_MOVEMENT      0x640   /* Character::movement (CharMovement*) */
 #define RVA_CHARMOVE_SETDEST 0x661270u   /* CharMovement::setDestination (raw move; no navmesh) */
-#define RVA_CHAR_SETDEST     0x5c84e0u   /* Character::setDestination -- PLAYER order path
-                                          * (pathfinds + ground-clamps, so it climbs slopes;
-                                          * per KenshiCoop this is what click-to-move uses). */
+#define RVA_CHAR_SETDEST     0x5c84e0u   /* NOT setDestination: teleport+facing placement
+                                          * (3rd arg = Ogre::Quaternion* facing). Unused. */
+#define RVA_MOVE_TO_POS      0x5d22b0u   /* Character::moveToPosition (vtable +0x318): the REAL
+                                          * right-click walk path. Issues/live-updates a
+                                          * Task_Move(0x1d) -- pathfinds, animates, and per-frame
+                                          * calls ARE the game's drag-move ("hold right-click"). */
 #define REISSUE_DIST         1.0f        /* re-issue the move order only when the target moved
                                           * this far -- per-frame re-issue restarts the path
                                           * (stutter) and was the earlier crash cause. */
+#define RVA_TERRAIN_PTR      0x2133318u  /* Terrain* singleton (holder+0x18, same setup struct
+                                          * as the camera globals). Class lives in
+                                          * Plugin_Terrain_x64.dll. */
+#define TERRAIN_GETHEIGHT_SYM "?getHeight@Terrain@@QEBA?AUHit@1@AEBVVector3@Ogre@@@Z"
+#define TERRAIN_INTERSECT_SYM "?intersect@Terrain@@QEBA?AUHit@1@AEBVRay@Ogre@@@Z"
 #define UPDATE_PRIORITY_HIGH 2
 
 /* ---- custom FP character controller (motion drive, NO move orders) ----
@@ -256,7 +265,19 @@ typedef void (*rgm_addlocation_t)(void *rgm, const void *name, const void *locty
 typedef void (*rgm_creategroup_t)(void *rgm, const void *group, char inGlobalPool);
 typedef void (*rgm_initgroup_t)(void *rgm, const void *group);
 typedef void (*charmove_setdest_t)(void *mv, const Vec3 *dest, int pri, char shift);
-typedef void (*char_setdest_t)(void *self, const Vec3 *pos, char shift);   /* player order path */
+typedef void (*char_setdest_t)(void *self, const Vec3 *pos, const void *facingQuat);
+typedef void (*move_to_pos_t)(void *ch, void *clickedObj, void *targetObj, const Vec3 *pos);
+
+/* Terrain::getHeight / intersect result (Plugin_Terrain_x64.dll). Retbuf ABI:
+ * this=RCX, TerrainHit* ret=RDX, arg=R8. Pure const query, main-thread safe. */
+typedef struct {
+    unsigned char hit, flag; unsigned short pad;
+    Vec3 position;    /* +0x04: ground point (y = height) */
+    Vec3 normal;      /* +0x10 */
+} TerrainHit;         /* 0x1C bytes */
+typedef TerrainHit *(*terrain_getheight_t)(void *self, TerrainHit *ret, const Vec3 *pos);
+typedef struct { Vec3 origin; Vec3 dir; } OgreRay;   /* Ogre::Ray, 24 bytes */
+typedef TerrainHit *(*terrain_intersect_t)(void *self, TerrainHit *ret, const OgreRay *ray);
 typedef void (*face_direction_t)(void *mv, const Vec3 *dir);
 typedef void (*manual_move_t)(void *mv, const Vec3 *desiredMotion);
 /* _setPositionAndTeleport(const Vec3& p, int floor): (this RCX, Vec3* RDX, floor R8) */
@@ -308,7 +329,12 @@ static rgm_initgroup_t g_rgm_initgroup;
 static void *g_crosshair;          /* the ImageBox widget */
 static int g_pointer_default = 1;  /* current MyGUI pointer is the default (arrow) */
 static charmove_setdest_t g_charmove_setdest;  /* CharMovement::setDestination (raw move) */
-static char_setdest_t g_char_setdest;          /* Character::setDestination (player path) */
+static char_setdest_t g_char_setdest;          /* teleport+facing placement (unused) */
+static move_to_pos_t g_move_to_pos;            /* Character::moveToPosition (walk order) */
+static int g_movetopos_dead;                   /* set if moveToPosition ever faults */
+static terrain_getheight_t g_terrain_getheight; /* Terrain::getHeight (Plugin_Terrain dll) */
+static terrain_intersect_t g_terrain_intersect; /* Terrain::intersect (ray -> ground point) */
+static int g_terrain_dead;                     /* set if the terrain query ever faults */
 static DWORD g_last_move_ms;
 static int g_was_moving;
 static float g_speed_scale = 0.6f; /* scrollwheel throttle: walk (low) .. run (high) */
@@ -652,6 +678,100 @@ static void fp_camera_override(void *gw)
 /* M3: drive the followed character with WASD relative to where we're looking.
  * Breadcrumb CharMovement::setDestination a few metres ahead at ~10 Hz; halt at
  * the current position when all keys release. */
+/* --- VEH crash guard: poor-man's __try/__except for calls into game code. ---
+ * mingw has no MSVC __try, so: arm a flag, setjmp, call the game fn; if it
+ * faults (or raises an MSVC C++ exception, 0xE06D7363 -- what KenshiCoop's SEH
+ * catches around this very call), the vectored handler longjmps back here.
+ * mingw-x64 setjmp passes a NULL frame, so longjmp restores registers without
+ * unwinding -- safe across foreign (game) frames. */
+static jmp_buf g_guard_jb;
+static volatile LONG g_guard_armed;
+
+static LONG CALLBACK veh_guard(EXCEPTION_POINTERS *ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (g_guard_armed &&
+        (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION
+         || code == EXCEPTION_PRIV_INSTRUCTION || code == 0xE06D7363u /* MSVC C++ throw */)) {
+        g_guard_armed = 0;
+        longjmp(g_guard_jb, 1);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* Character::moveToPosition (RVA 0x5d22b0 = vtable +0x318), crash-guarded: the
+ * GENUINE right-click walk path. Issues/live-updates a Task_Move(0x1d) --
+ * pathfinds, ground-follows, animates, and as a real player order makes a
+ * DOWNED character struggle back up. Per-frame calls are exactly the game's
+ * drag-move ("hold right-click") path: an active Task_Move just gets its
+ * destination Vec3 updated in place.
+ * Returns 1 if the call completed, 0 if unavailable or previously faulted. */
+static int try_move_to_pos(void *pc, const Vec3 *tgt)
+{
+    if (g_movetopos_dead || !g_move_to_pos) return 0;
+    if (!in_module(*(void ***)pc)) return 0;
+    if (setjmp(g_guard_jb)) {          /* longjmp target: the call blew up */
+        g_movetopos_dead = 1;
+        logline("moveToPosition FAULTED -- disabled for this session");
+        return 0;
+    }
+    g_guard_armed = 1;
+    g_move_to_pos(pc, NULL, NULL, tgt);   /* NULL,NULL = plain ground point */
+    g_guard_armed = 0;
+    return 1;
+}
+
+/* Clamp a target point onto the terrain surface via Terrain::getHeight
+ * (Plugin_Terrain_x64.dll; pure const query). THE slope fix: the raw mover
+ * stalls when the fabricated target Y is underground (uphill) or midair
+ * (downhill); an on-ground destination walks fine (right-click parity). */
+static void terrain_clamp(Vec3 *p)
+{
+    if (g_terrain_dead || !g_terrain_getheight) return;
+    void *terr = readable((void *)(g_base + RVA_TERRAIN_PTR), 8)
+        ? *(void **)(g_base + RVA_TERRAIN_PTR) : NULL;
+    if (!readable(terr, 8)) return;
+    if (setjmp(g_guard_jb)) {
+        g_terrain_dead = 1;
+        logline("Terrain::getHeight FAULTED -- disabled for this session");
+        return;
+    }
+    g_guard_armed = 1;
+    TerrainHit hit; memset(&hit, 0, sizeof hit);
+    g_terrain_getheight(terr, &hit, p);
+    g_guard_armed = 0;
+    if (hit.hit) {
+        static int logged;
+        if (!logged) { logged = 1; logline("terrain clamp live: y %.1f -> %.1f", p->y, hit.position.y); }
+        p->y = hit.position.y;
+    }
+}
+
+/* Cast a ray into the terrain (Terrain::intersect -- the SAME function the
+ * game's right-click picking uses). Returns 1 + the surface point on hit.
+ * With the FP cursor locked to screen center, eye+look ray == "where a
+ * right-click would land". */
+static int terrain_ray(const Vec3 *origin, const Vec3 *dir, Vec3 *out)
+{
+    if (g_terrain_dead || !g_terrain_intersect) return 0;
+    void *terr = readable((void *)(g_base + RVA_TERRAIN_PTR), 8)
+        ? *(void **)(g_base + RVA_TERRAIN_PTR) : NULL;
+    if (!readable(terr, 8)) return 0;
+    if (setjmp(g_guard_jb)) {
+        g_terrain_dead = 1;
+        logline("Terrain::intersect FAULTED -- disabled for this session");
+        return 0;
+    }
+    g_guard_armed = 1;
+    OgreRay ray; ray.origin = *origin; ray.dir = *dir;
+    TerrainHit hit; memset(&hit, 0, sizeof hit);
+    g_terrain_intersect(terr, &hit, &ray);
+    g_guard_armed = 0;
+    if (!hit.hit) return 0;
+    *out = hit.position;
+    return 1;
+}
+
 static void fp_movement(void *gw, float dt)
 {
     if (!g_fp_mode || !g_charmove_setdest) return;
@@ -682,8 +802,10 @@ static void fp_movement(void *gw, float dt)
     if (keys == 0 || (mf == 0.0f && mr == 0.0f)) {
         if (g_was_moving) {         /* release: halt at current position */
             Vec3 here;
-            if (char_position(pc, &here))
-                g_charmove_setdest(mv, &here, UPDATE_PRIORITY_HIGH, 0);
+            if (char_position(pc, &here)) {
+                if (!try_move_to_pos(pc, &here))   /* order to current pos = stop */
+                    g_charmove_setdest(mv, &here, UPDATE_PRIORITY_HIGH, 0);
+            }
             g_was_moving = 0;
             g_have_dest = 0;
         }
@@ -724,8 +846,47 @@ static void fp_movement(void *gw, float dt)
      * struggles on steep slopes (target Y is fixed). The player-path
      * Character::setDestination (0x5c84e0) DOES pathfind but crashes when called
      * from our post-frame hook without the game's SEH-guarded order setup. */
-    Vec3 tgt = { here.x + dx * dist, here.y, here.z + dz * dist };
-    g_charmove_setdest(mv, &tgt, UPDATE_PRIORITY_HIGH, 0);
+    /* Destination: replicate right-click as faithfully as possible.
+     * Moving forward: cast the camera LOOK ray into the terrain (the very pick
+     * right-click uses; FP cursor == screen center) -> the visible surface
+     * point ahead. On a steep slope face that's a NEAR, reachable point, so
+     * climbing works exactly like drag-move -- a fabricated far target lands
+     * beyond the crest / inside the hill and stalls the pathfinder (observed:
+     * stall at y=1555 with target y=1511 214u ahead). Capped to `dist` so the
+     * scrollwheel speed control (distance = speed) still rules.
+     * Strafe/backpedal (look != move dir) or sky-aimed ray: fabricate the
+     * point ahead and ground-clamp its height. */
+    Vec3 tgt; int via_ray = 0;
+    if (mf > 0.0f && mr == 0.0f) {
+        float cp = cosf(g_pitch);
+        Vec3 ro = { here.x, here.y + 16.0f, here.z };            /* ~eye, game frame */
+        Vec3 rd = { dx * cp, -sinf(g_pitch), dz * cp };          /* unit look dir */
+        Vec3 hitp;
+        if (terrain_ray(&ro, &rd, &hitp)) {
+            float vx = hitp.x - here.x, vz = hitp.z - here.z;
+            float hd = sqrtf(vx * vx + vz * vz);
+            if (hd > dist) {              /* looking far: cap for speed control */
+                tgt.x = here.x + vx * (dist / hd);
+                tgt.z = here.z + vz * (dist / hd);
+                tgt.y = here.y;
+                terrain_clamp(&tgt);
+            } else {
+                tgt = hitp;               /* the exact point you're looking at */
+            }
+            via_ray = 1;
+        }
+    }
+    if (!via_ray) {
+        tgt.x = here.x + dx * dist; tgt.y = here.y; tgt.z = here.z + dz * dist;
+        terrain_clamp(&tgt);
+    }
+
+    /* Primary drive: the REAL right-click walk order (Task_Move) -- pathfinds
+     * over slopes, animates, triggers get-up when downed. Per-frame call = the
+     * game's own drag-move. Fallback to the raw mover if it ever faults. */
+    if (!try_move_to_pos(pc, &tgt))
+        g_charmove_setdest(mv, &tgt, UPDATE_PRIORITY_HIGH, 1);
+
     g_was_moving = 1;
 }
 
@@ -860,6 +1021,20 @@ __declspec(dllexport) void dllStartPlugin(void)
     g_stop_following = (stop_follow_t)(g_base + RVA_STOP_FOLLOW);
     g_charmove_setdest = (charmove_setdest_t)(g_base + RVA_CHARMOVE_SETDEST);
     g_char_setdest     = (char_setdest_t)(g_base + RVA_CHAR_SETDEST);
+    g_move_to_pos      = (move_to_pos_t)(g_base + RVA_MOVE_TO_POS);
+    AddVectoredExceptionHandler(1, veh_guard);   /* crash guard for game-fn calls */
+    {
+        HMODULE terr = GetModuleHandleA("Plugin_Terrain_x64.dll");
+        if (terr) {
+            g_terrain_getheight =
+                (terrain_getheight_t)GetProcAddress(terr, TERRAIN_GETHEIGHT_SYM);
+            g_terrain_intersect =
+                (terrain_intersect_t)GetProcAddress(terr, TERRAIN_INTERSECT_SYM);
+        }
+        logline("Terrain getHeight=%s intersect=%s",
+                g_terrain_getheight ? "ok" : "MISSING",
+                g_terrain_intersect ? "ok" : "MISSING");
+    }
     g_get_bone_world   = (get_bone_world_t)(g_base + RVA_GET_BONE_WORLD);
 
     g_mouse_hook = SetWindowsHookExA(WH_MOUSE_LL, mouse_ll, g_hinst, 0);

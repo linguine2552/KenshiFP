@@ -246,3 +246,45 @@ player path only. AWAITING test (movement works? forward/strafe sign correct?).
 - Character::setDestination RVA: no clean string (movement is Havok task-based:
   MoveTo_Addon, Task_MoveToDoor RTTI). Find via the right-click order path or
   by runtime-probing the Character vtable/methods once we have a live Character.
+
+### 2026-07-17 late — 0x5c84e0 CORRECTED + real order machinery (agent digs)
+**0x5c84e0 is NOT Character::setDestination.** Full decompile: 3 unconditional
+stmts — copy pos to char+0x48; call CharMovement(char+0x640) vt+0xC0 =
+_setPositionDirectionAndTeleport(pos, dir); update render obj (char+0x448) via
+thunk_FUN_1405b1a30. 3rd arg = Ogre::Quaternion* FACING (w,x,y,z floats; NULL
+crashes = 16B read; zeroed = degenerate quat). It ALWAYS teleports (that's its
+job: placement). Its "handler" callers 0x347950/0x358040 are begin-callbacks of
+play-anim-at-position orders (bed/furniture snap; order+0x78 anim name string,
++0xa4 snap pos, +0xb0 facing quat), registered in an .rdata order-descriptor
+table (0x192ebd0..). KenshiCoop's ID was wrong for 1.0.68.
+**Real order injection**: Character+0x650 -> +0x20 = order queue.
+FUN_1405c8da0(char, int orderType, hand* tgt, u8, char, x) wraps
+FUN_1405086d0(queue, orderType, hand* tgt, Vec3* pos, char asJob) -> looks up
+descriptor map DAT_141ce90f0, creates order via FUN_14032ebd0(factory@
+queue[0x37]+0x2a8, type, tgt, 3, 1.0f, pos, 0, 100), appends to current-orders
+or jobs. Missing: plain move-to-point orderType id (0x1f/0x2d are the anim-jobs;
+0x1f remaps 0x121 when char->vt+0x248 non-null). Dig in flight.
+**Terrain (Plugin_Terrain_x64.dll)**: Terrain* singleton = *(exeBase+0x2133318).
+Exports: ?getHeight@Terrain@@QEBA?AUHit@1@AEBVVector3@Ogre@@@Z (DLL RVA
+0x132b0), ?intersect@...Ray... (0x134e0), getApproximateHeight (0x133f0). Hit
+struct 0x1C: +0 u8 hit, +4 Vec3 position, +0x10 Vec3 normal. ABI this=RCX,
+retbuf=RDX, arg=R8. Pure const queries, main-thread. Right-click pick flow:
+FUN_140800250 (0x800250, per-frame mouse pick) builds cursor ray ->
+Terrain::intersect -> hit.position -> event 0x1d to selected chars (writes
+order+0xa4); no persistent cursor-world-pos global.
+**Ghidra toolchain**: project DB upgraded to format 75 — use
+~/.local/opt/ghidra_12.1.2_PUBLIC (11.3.2 can no longer open it). New scripts in
+../KenshiMP/re/scripts: Dump/Callers/Strs/PtrScan/Ptr4/RdData/HexDmp.java.
+
+### Move order SOLVED: Character::moveToPosition = RVA 0x5d22b0 (vt +0x318)
+Signature: void(Character* ch, void* clickedObj, void* targetObj, Vec3* pos);
+(NULL,NULL,pos) = plain ground walk. Issues Task_Move (orderType 0x1d) via
+FUN_1405d20d0 -> queue append; if current task already Task_Move it LIVE-UPDATES
+task+0x58 dest Vec3 (the drag-move path) — per-frame calls are exactly "hold
+right-click". Never refused by the order validator (no 0x1d case). Right-click
+GUI dispatcher = FUN_1407f9e20 (0x7f9e20; scatter for multi-select there, not in
+moveToPosition). Chains: mind=*(ch+0x650); queue=*(mind+0x20); dest cache
+mind+0x2c0. Cancel: FUN_1405074a0(queue) abort in-flight + clear queued;
+FUN_140507530(queue) clear + reset target hand. Replace-vs-queue global shift
+flag byte @0x2133449 (0=replace). Main thread only. CLIENT: try_move_to_pos()
+(VEH-guarded) is now the primary WASD drive; raw CharMovement setdest = fallback.

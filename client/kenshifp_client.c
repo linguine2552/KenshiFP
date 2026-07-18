@@ -72,14 +72,23 @@
  * NOTE: KenshiCoop found player chars can ignore a bare CharMovement dest; if so
  * this won't move them and we'll switch to the Character-level order path. */
 #define CHAR_MOVEMENT      0x640   /* Character::movement (CharMovement*) */
-#define CHAR_DEST_AUX      0x448   /* object setDestination also notifies */
-#define RVA_CHARMOVE_SETDEST 0x661270u
+#define RVA_CHARMOVE_SETDEST 0x661270u   /* CharMovement::setDestination (halt use only) */
 #define UPDATE_PRIORITY_HIGH 2
-/* Character::setDestination(Character* self, const Vec3* pos, bool shift) — RVA
- * 0x5c84e0. THE player move-order path: the right-click handler (FUN_140347950)
- * calls exactly this, so using it moves the character AND keeps the camera-follow
- * synced (CharMovement::setDestination moved the body but the camera lagged). */
-#define RVA_SET_DESTINATION 0x5c84e0u
+
+/* ---- custom FP character controller (motion drive, NO move orders) ----
+ * Re-issuing destinations fought the order system (path/"official position"
+ * bookkeeping resets are why the camera lagged while a plain right-click was
+ * perfect). Instead we drive CharMovement's motion state directly each frame —
+ * the same technique KenshiCoop's applyMotion uses to animate proxy bodies —
+ * and rotate the character to the input direction with faceDirection.
+ * CharMovement fields (KenshiLib layout, KenshiCoop-proven):   */
+#define MV_CURRENTLY_MOVING 0x24   /* bool  */
+#define MV_CURRENT_MOTION   0xA8   /* Ogre::Vector3 (velocity) */
+#define MV_MAX_SPEED        0xB4   /* float */
+#define MV_CURRENT_SPEED    0xB8   /* float */
+#define MV_DESIRED_SPEED    0xBC   /* float (keep == current so accel logic doesn't idle us) */
+#define MV_WALK_SPEED       0xC0   /* float */
+#define MV_FACEDIR_VTOFF    6      /* faceDirection = live vtable slot 6 (+0x30) */
 /* Orient-to-direction movement: setDestination makes the character turn to face
  * the target and walk (no strafing). We aim FAR ahead so it commits to a full-
  * speed walk, and only RE-ISSUE when the heading or key set changes (or a slow
@@ -172,7 +181,7 @@ typedef void (*node_set_dori_t)(void *node, const Quat *q);  /* world _setDerive
 typedef void (*cam_set_fovy_t)(void *camera, const float *rad);
 typedef const float *(*cam_get_fovy_t)(void *camera);
 typedef void (*charmove_setdest_t)(void *mv, const Vec3 *dest, int pri, char shift);
-typedef void (*set_dest_t)(void *character, const Vec3 *pos, char shift);
+typedef void (*face_direction_t)(void *mv, const Vec3 *dir);
 typedef void (*node_set_dpos_t)(void *node, const Vec3 *v);   /* world _setDerivedPosition */
 typedef Vec3 *(*node_get_dpos_t)(void *node, Vec3 *ret);      /* world _getDerivedPosition (this=RCX,ret=RDX) */
 /* member-struct-return: this=RCX, retbuf=RDX, name=R8 */
@@ -201,8 +210,7 @@ static cam_set_fovy_t g_cam_set_fovy;
 static cam_get_fovy_t g_cam_get_fovy;
 static int g_fov_saved;
 static float g_fov_default;
-static charmove_setdest_t g_charmove_setdest;  /* CharMovement::setDestination (unused; body path) */
-static set_dest_t g_set_destination;           /* Character::setDestination (player order path) */
+static charmove_setdest_t g_charmove_setdest;  /* CharMovement::setDestination (halt only) */
 static DWORD g_last_move_ms;
 static int g_was_moving;
 static float g_last_move_dir;      /* heading of last issued destination (radians) */
@@ -467,7 +475,12 @@ static void fp_movement(void *gw)
     float mr = (float)(d - a);     /* left/right (turns the char, not strafe) */
 
     if (keys == 0 || (mf == 0.0f && mr == 0.0f)) {
-        if (g_was_moving) {         /* release: halt at current position */
+        if (g_was_moving) {         /* release: zero the motion state + halt order */
+            *(unsigned char *)((uintptr_t)mv + MV_CURRENTLY_MOVING) = 0;
+            *(float *)((uintptr_t)mv + MV_CURRENT_SPEED) = 0.0f;
+            *(float *)((uintptr_t)mv + MV_DESIRED_SPEED) = 0.0f;
+            Vec3 *cm = (Vec3 *)((uintptr_t)mv + MV_CURRENT_MOTION);
+            cm->x = cm->y = cm->z = 0.0f;
             Vec3 here;
             if (char_position(pc, &here))
                 g_charmove_setdest(mv, &here, UPDATE_PRIORITY_HIGH, 0);
@@ -487,22 +500,30 @@ static void fp_movement(void *gw)
     if (len < 0.001f) return;
     dx = -dx / len; dz = -dz / len;   /* negate: W=forward, S=back, A=left, D=right */
 
-    /* Target distance from look pitch (pitch + = looking down = near/slow;
-     * pitch - = looking up = far/run). The engine accelerates toward farther
-     * orders, so this gives smooth analog speed control by where you look. */
+    /* Speed from look pitch (down = slow walk, up = full run), scaled by the
+     * character's own walk/max speeds so encumbrance/injury still matter. */
     float t = (1.4f - g_pitch) / 2.8f;      /* 0 at full-down, 1 at full-up */
     if (t < 0.0f) t = 0.0f;
     if (t > 1.0f) t = 1.0f;
-    float dist = MOVE_NEAR + t * (MOVE_FAR - MOVE_NEAR);
+    float walk = *(float *)((uintptr_t)mv + MV_WALK_SPEED);
+    float maxs = *(float *)((uintptr_t)mv + MV_MAX_SPEED);
+    if (!(walk > 0.1f && walk < 1000.0f)) walk = 8.0f;
+    if (!(maxs > walk && maxs < 1000.0f)) maxs = 25.0f;
+    float speed = (walk * 0.3f) + t * (maxs - walk * 0.3f);
 
-    Vec3 here;
-    if (!char_position(pc, &here)) return;
-
-    /* Just move the destination, every frame — like holding right-click and
-     * dragging the marker. The target keeps sitting `dist` ahead of the moving
-     * character, so it walks continuously and smoothly; no re-fire throttling. */
-    Vec3 tgt = { here.x + dx * dist, here.y, here.z + dz * dist };
-    g_charmove_setdest(mv, &tgt, UPDATE_PRIORITY_HIGH, 0);
+    /* Custom controller: rotate the character to the input direction, then
+     * drive the motion state directly — no move orders, nothing to fight. */
+    Vec3 dir = { dx, 0.0f, dz };
+    void **mvvt = *(void ***)mv;
+    if (readable(mvvt, (MV_FACEDIR_VTOFF + 1) * 8)) {
+        face_direction_t face = (face_direction_t)mvvt[MV_FACEDIR_VTOFF];
+        if (readable((void *)face, 1)) face(mv, &dir);
+    }
+    *(unsigned char *)((uintptr_t)mv + MV_CURRENTLY_MOVING) = 1;
+    *(float *)((uintptr_t)mv + MV_CURRENT_SPEED) = speed;
+    *(float *)((uintptr_t)mv + MV_DESIRED_SPEED) = speed;  /* keep accel logic from idling us */
+    Vec3 *cm = (Vec3 *)((uintptr_t)mv + MV_CURRENT_MOTION);
+    cm->x = dx * speed; cm->y = 0.0f; cm->z = dz * speed;
     g_was_moving = 1;
 }
 
@@ -529,7 +550,6 @@ __declspec(dllexport) void dllStartPlugin(void)
     g_follow_object  = (follow_object_t)(g_base + RVA_FOLLOW_OBJECT);
     g_stop_following = (stop_follow_t)(g_base + RVA_STOP_FOLLOW);
     g_charmove_setdest = (charmove_setdest_t)(g_base + RVA_CHARMOVE_SETDEST);
-    g_set_destination  = (set_dest_t)(g_base + RVA_SET_DESTINATION);
     g_get_bone_world   = (get_bone_world_t)(g_base + RVA_GET_BONE_WORLD);
     /* MSVC std::string SSO for the head bone name (size<=15 -> inline buffer). */
     memset(g_head_bone, 0, sizeof g_head_bone);

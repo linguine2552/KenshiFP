@@ -89,6 +89,9 @@
 #define MV_DESIRED_SPEED    0xBC   /* float (keep == current so accel logic doesn't idle us) */
 #define MV_WALK_SPEED       0xC0   /* float */
 #define MV_FACEDIR_VTOFF    6      /* faceDirection = live vtable slot 6 (+0x30) */
+#define MV_MANUALMOVE_VTOFF 14     /* manualMovement(desiredMotion) = slot 14 (+0x70);
+                                    * engine-driven velocity move (combat-strafe path):
+                                    * ground-clamps + animates + NO auto-turn */
 /* CharMovement OVERRIDES the position setters at higher slots than the
  * AbstractMovementBase ones (+0x20/0x28 are the base-class members — calling
  * slot 5 did nothing). The real overrides (header +0xB8/0xC0/0xC8):
@@ -189,6 +192,7 @@ typedef void (*cam_set_fovy_t)(void *camera, const float *rad);
 typedef const float *(*cam_get_fovy_t)(void *camera);
 typedef void (*charmove_setdest_t)(void *mv, const Vec3 *dest, int pri, char shift);
 typedef void (*face_direction_t)(void *mv, const Vec3 *dir);
+typedef void (*manual_move_t)(void *mv, const Vec3 *desiredMotion);
 /* _setPositionAndTeleport(const Vec3& p, int floor): (this RCX, Vec3* RDX, floor R8) */
 typedef void (*set_pos_tele_t)(void *mv, const Vec3 *pos, int floor);
 typedef void (*node_set_dpos_t)(void *node, const Vec3 *v);   /* world _setDerivedPosition */
@@ -518,13 +522,15 @@ static void fp_movement(void *gw, float dt)
     float mf = (float)(w - s);     /* forward/back */
     float mr = (float)(d - a);     /* left/right (turns the char, not strafe) */
 
+    (void)dt;
+    manual_move_t mm = (in_module(mvvt) && readable(&mvvt[MV_MANUALMOVE_VTOFF], 8)
+                        && in_module(mvvt[MV_MANUALMOVE_VTOFF]))
+                       ? (manual_move_t)mvvt[MV_MANUALMOVE_VTOFF] : NULL;
+
     if (keys == 0 || (mf == 0.0f && mr == 0.0f)) {
-        if (g_was_moving) {         /* release: zero the motion state */
-            *(unsigned char *)((uintptr_t)mv + MV_CURRENTLY_MOVING) = 0;
-            *(float *)((uintptr_t)mv + MV_CURRENT_SPEED) = 0.0f;
-            *(float *)((uintptr_t)mv + MV_DESIRED_SPEED) = 0.0f;
-            Vec3 *cm = (Vec3 *)((uintptr_t)mv + MV_CURRENT_MOTION);
-            cm->x = cm->y = cm->z = 0.0f;
+        if (g_was_moving) {         /* release: zero desired motion (stop) */
+            Vec3 zero = { 0.0f, 0.0f, 0.0f };
+            if (mm) mm(mv, &zero);
             g_was_moving = 0;
         }
         return;
@@ -551,22 +557,10 @@ static void fp_movement(void *gw, float dt)
     if (!(maxs > walk && maxs < 1000.0f)) maxs = 25.0f;
     float speed = (walk * 0.3f) + t * (maxs - walk * 0.3f);
 
-    /* Orient-to-control body drive: move in the WASD direction WITHOUT the
-     * engine's auto-turn (which fights the look-facing). Position-integrate via
-     * _setPositionAndTeleport; set the motion state for animation. */
-    Vec3 here;
-    if (dt > 0.0f && dt < 0.2f && char_position(pc, &here)
-        && in_module(mvvt) && readable(&mvvt[MV_SETPOSTELE_VTOFF], 8)
-        && in_module(mvvt[MV_SETPOSTELE_VTOFF])) {
-        Vec3 np = { here.x + dx * speed * dt, here.y, here.z + dz * speed * dt };
-        set_pos_tele_t setpos = (set_pos_tele_t)mvvt[MV_SETPOSTELE_VTOFF];
-        setpos(mv, &np, 0);
-    }
-    *(unsigned char *)((uintptr_t)mv + MV_CURRENTLY_MOVING) = 1;
-    *(float *)((uintptr_t)mv + MV_CURRENT_SPEED) = speed;
-    *(float *)((uintptr_t)mv + MV_DESIRED_SPEED) = speed;
-    Vec3 *cm = (Vec3 *)((uintptr_t)mv + MV_CURRENT_MOTION);
-    cm->x = dx * speed; cm->y = 0.0f; cm->z = dz * speed;
+    /* Engine-driven velocity move: no pathfinding, no auto-turn, but the engine
+     * still ground-clamps and animates. Facing stays on the camera (above). */
+    Vec3 motion = { dx * speed, 0.0f, dz * speed };
+    if (mm) mm(mv, &motion);
     g_was_moving = 1;
 }
 

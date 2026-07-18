@@ -1,5 +1,7 @@
 # build output
 client/*.dll
-# scratch
+dist/
+*.dll
 *.log
 *.o
+# scratch

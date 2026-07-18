@@ -3,7 +3,8 @@
 # Self-contained under Proton: imports only KERNEL32 / msvcrt / USER32.
 set -e
 cd "$(dirname "$0")"
-MH=../../KenshiMP/reference/minhook
+MH=../third_party/minhook                       # vendored (BSD-2-Clause)
+[ -d "$MH" ] || MH=../../KenshiMP/reference/minhook   # dev-tree fallback
 x86_64-w64-mingw32-gcc -O2 -shared -static-libgcc -o KenshiFP_x64.dll \
     kenshifp_client.c \
     "$MH"/src/hook.c "$MH"/src/buffer.c "$MH"/src/trampoline.c "$MH"/src/hde/hde64.c \

@@ -89,7 +89,13 @@
 #define MV_DESIRED_SPEED    0xBC   /* float (keep == current so accel logic doesn't idle us) */
 #define MV_WALK_SPEED       0xC0   /* float */
 #define MV_FACEDIR_VTOFF    6      /* faceDirection = live vtable slot 6 (+0x30) */
-#define MV_SETPOS_VTOFF     5      /* _setPositionSimple = live vtable slot 5 (+0x28) */
+/* CharMovement OVERRIDES the position setters at higher slots than the
+ * AbstractMovementBase ones (+0x20/0x28 are the base-class members — calling
+ * slot 5 did nothing). The real overrides (header +0xB8/0xC0/0xC8):
+ *   slot 23 _setPositionAndTeleport(const Vec3&, int floor)  <- the one KenshiCoop
+ *   slot 24 _setPositionDirectionAndTeleport(Vec3&, Quat&)      proves moves the
+ *   slot 25 _setPositionSimple(const Vec3&)                     physics proxy too */
+#define MV_SETPOSTELE_VTOFF 23
 /* Orient-to-direction movement: setDestination makes the character turn to face
  * the target and walk (no strafing). We aim FAR ahead so it commits to a full-
  * speed walk, and only RE-ISSUE when the heading or key set changes (or a slow
@@ -183,9 +189,8 @@ typedef void (*cam_set_fovy_t)(void *camera, const float *rad);
 typedef const float *(*cam_get_fovy_t)(void *camera);
 typedef void (*charmove_setdest_t)(void *mv, const Vec3 *dest, int pri, char shift);
 typedef void (*face_direction_t)(void *mv, const Vec3 *dir);
-/* _setPositionSimple(Ogre::Vector3 p): Vector3 is 12B, so MS x64 passes it by
- * hidden pointer -> ABI (this RCX, const Vec3* RDX), same shape as faceDirection. */
-typedef void (*set_pos_simple_t)(void *mv, const Vec3 *pos);
+/* _setPositionAndTeleport(const Vec3& p, int floor): (this RCX, Vec3* RDX, floor R8) */
+typedef void (*set_pos_tele_t)(void *mv, const Vec3 *pos, int floor);
 typedef void (*node_set_dpos_t)(void *node, const Vec3 *v);   /* world _setDerivedPosition */
 typedef Vec3 *(*node_get_dpos_t)(void *node, Vec3 *ret);      /* world _getDerivedPosition (this=RCX,ret=RDX) */
 /* member-struct-return: this=RCX, retbuf=RDX, name=R8 */
@@ -528,10 +533,11 @@ static void fp_movement(void *gw, float dt)
         if (readable((void *)face, 1)) face(mv, &dir);
 
         Vec3 here;
-        if (dt > 0.0f && dt < 0.2f && char_position(pc, &here)) {
+        if (dt > 0.0f && dt < 0.2f && char_position(pc, &here)
+            && readable(&mvvt[MV_SETPOSTELE_VTOFF], 8)) {
             Vec3 np = { here.x + dx * speed * dt, here.y, here.z + dz * speed * dt };
-            set_pos_simple_t setpos = (set_pos_simple_t)mvvt[MV_SETPOS_VTOFF];
-            if (readable((void *)setpos, 1)) setpos(mv, &np);
+            set_pos_tele_t setpos = (set_pos_tele_t)mvvt[MV_SETPOSTELE_VTOFF];
+            if (readable((void *)setpos, 1)) setpos(mv, &np, 0);
         }
     }
     *(unsigned char *)((uintptr_t)mv + MV_CURRENTLY_MOVING) = 1;

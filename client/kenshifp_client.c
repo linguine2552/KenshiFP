@@ -94,6 +94,21 @@
                                           * Plugin_Terrain_x64.dll. */
 #define TERRAIN_GETHEIGHT_SYM "?getHeight@Terrain@@QEBA?AUHit@1@AEBVVector3@Ogre@@@Z"
 #define TERRAIN_INTERSECT_SYM "?intersect@Terrain@@QEBA?AUHit@1@AEBVRay@Ogre@@@Z"
+
+/* --- Building-interior preload (FP QoL): show interiors when NEAR, not only
+ * when inside. All RVAs decompile-verified for 1.0.68. --- */
+#define RVA_TOWNMGR_PTR    0x2134100u  /* TownManager* global */
+#define RVA_NEAREST_TOWN   0x928890u   /* Town* fn(TownManager*, const Vec3*, int 0) */
+#define RVA_INTERIOR_LOAD  0x562540u   /* void fn(BuildingInterior*): idempotent lazy
+                                        * graphics load + keep-alive refresh; the fn the
+                                        * game itself calls per visible interior. Does
+                                        * NOT cut the roof/shell away. */
+#define TOWN_GETLIST_VTOFF (0x2d8 / 8) /* Town vtable slot: lektor* fn(Town*, int, void*) */
+#define BLDG_LIST_TYPE     0x13        /* list id: buildings with interior layouts */
+#define BLDG_POS_X         0x48        /* Building world pos floats +0x48/+0x4C/+0x50 */
+#define BLDG_INTERIOR      0x1F0       /* Building::myInterior (BuildingInterior*) */
+#define BLDG_DESTROYED     0x1A1       /* Building::destroyed (bool) -- ruins */
+#define INTERIOR_RADIUS    400.0f      /* preload interiors within this range (~40 m) */
 #define UPDATE_PRIORITY_HIGH 2
 
 /* ---- custom FP character controller (motion drive, NO move orders) ----
@@ -278,6 +293,9 @@ typedef struct {
 typedef TerrainHit *(*terrain_getheight_t)(void *self, TerrainHit *ret, const Vec3 *pos);
 typedef struct { Vec3 origin; Vec3 dir; } OgreRay;   /* Ogre::Ray, 24 bytes */
 typedef TerrainHit *(*terrain_intersect_t)(void *self, TerrainHit *ret, const OgreRay *ray);
+typedef void *(*nearest_town_t)(void *mgr, const Vec3 *pos, int flags);
+typedef void *(*town_getlist_t)(void *town, int listType, void *unused);
+typedef void (*interior_load_t)(void *buildingInterior);
 typedef void (*face_direction_t)(void *mv, const Vec3 *dir);
 typedef void (*manual_move_t)(void *mv, const Vec3 *desiredMotion);
 /* _setPositionAndTeleport(const Vec3& p, int floor): (this RCX, Vec3* RDX, floor R8) */
@@ -335,6 +353,9 @@ static int g_movetopos_dead;                   /* set if moveToPosition ever fau
 static terrain_getheight_t g_terrain_getheight; /* Terrain::getHeight (Plugin_Terrain dll) */
 static terrain_intersect_t g_terrain_intersect; /* Terrain::intersect (ray -> ground point) */
 static int g_terrain_dead;                     /* set if the terrain query ever faults */
+static nearest_town_t g_nearest_town;          /* TownManager -> nearest Town */
+static interior_load_t g_interior_load;        /* BuildingInterior lazy load + keep-alive */
+static int g_interiors_dead;                   /* set if the interior preload ever faults */
 static DWORD g_last_move_ms;
 static int g_was_moving;
 static float g_speed_scale = 0.6f; /* scrollwheel throttle: walk (low) .. run (high) */
@@ -984,6 +1005,74 @@ static void mygui_cursor(int visible)
     if (readable(pm, 8)) g_pm_setvisible(pm, (char)(visible ? 1 : 0));
 }
 
+/* FP QoL: preload interiors of nearby buildings while approaching from OUTSIDE
+ * (vanilla shows an interior only once a character is inside / build mode).
+ * ~1 Hz: nearest Town at the player's position -> its buildings-with-layout
+ * list (Town vt slot +0x2d8, list id 0x13) -> for each with a BuildingInterior
+ * within INTERIOR_RADIUS, call the game's own idempotent lazy-loader (0x562540:
+ * loads graphics once + refreshes the 10s keep-alive; roof stays on). The
+ * game's visibility diff only hides hands from its OWN set, so it won't fight
+ * this. VEH-guarded like every other game call. */
+static void fp_load_nearby_interiors(void *gw)
+{
+    if (!g_fp_mode || g_interiors_dead || !g_nearest_town || !g_interior_load) return;
+    static int cooldown;
+    if (cooldown > 0) { cooldown--; return; }
+    cooldown = 60;                                  /* ~1 Hz at 60 fps */
+
+    void *pc = first_player_char(gw);
+    Vec3 here;
+    if (!pc || !char_position(pc, &here)) return;
+
+    void *mgr = readable((void *)(g_base + RVA_TOWNMGR_PTR), 8)
+        ? *(void **)(g_base + RVA_TOWNMGR_PTR) : NULL;
+    if (!readable(mgr, 8)) return;
+
+    if (setjmp(g_guard_jb)) {
+        g_interiors_dead = 1;
+        logline("interior preload FAULTED -- disabled for this session");
+        return;
+    }
+    g_guard_armed = 1;
+    int loaded = 0;
+    void *town = g_nearest_town(mgr, &here, 0);
+    if (readable(town, 8) && in_module(*(void ***)town)) {
+        town_getlist_t getlist = (town_getlist_t)(*(void ***)town)[TOWN_GETLIST_VTOFF];
+        if (in_module((void *)getlist)) {
+            void *lek = getlist(town, BLDG_LIST_TYPE, NULL);
+            if (readable(lek, 0x18)) {
+                unsigned int n = *(unsigned int *)((uintptr_t)lek + 0x8);
+                void **data = *(void ***)((uintptr_t)lek + 0x10);
+                if (n < 4096 && readable(data, (size_t)n * sizeof(void *))) {
+                    for (unsigned int i = 0; i < n; i++) {
+                        void *b = data[i];
+                        if (!readable(b, BLDG_INTERIOR + 8)) continue;
+                        /* skip ruins: the vanilla updater gates on isDestroyed()
+                         * too -- refreshing a ruin resurrects its intact
+                         * walls/roof at low LOD */
+                        if (*(unsigned char *)((uintptr_t)b + BLDG_DESTROYED)) continue;
+                        void *bi = *(void **)((uintptr_t)b + BLDG_INTERIOR);
+                        if (!readable(bi, 0x30)) continue;   /* no interior layout */
+                        float bx = *(float *)((uintptr_t)b + BLDG_POS_X);
+                        float bz = *(float *)((uintptr_t)b + BLDG_POS_X + 8);
+                        float ddx = bx - here.x, ddz = bz - here.z;
+                        if (ddx * ddx + ddz * ddz > INTERIOR_RADIUS * INTERIOR_RADIUS)
+                            continue;
+                        g_interior_load(bi);
+                        loaded++;
+                    }
+                }
+            }
+        }
+    }
+    g_guard_armed = 0;
+    static int last_loaded = -1;
+    if (loaded != last_loaded) {                    /* log on change only */
+        last_loaded = loaded;
+        logline("interior preload: %d building(s) in range", loaded);
+    }
+}
+
 static void hooked_mainloop(void *gw, float time)
 {
     g_mainloop_orig(gw, time);     /* run the game's frame first */
@@ -992,6 +1081,7 @@ static void hooked_mainloop(void *gw, float time)
     if (gw) camera_lock(gw);       /* every frame: assert/release the lock */
     if (gw) fp_camera_override(gw);/* every frame: force FP eye + mouse-look */
     if (gw) fp_movement(gw, time); /* every frame: WASD -> custom motion drive */
+    if (gw) fp_load_nearby_interiors(gw); /* ~1 Hz: preload nearby building interiors */
 
     DWORD now = GetTickCount();
     if (gw && (now - g_last_tick_ms) >= 1000) {   /* 1 Hz observation log */
@@ -1022,6 +1112,8 @@ __declspec(dllexport) void dllStartPlugin(void)
     g_charmove_setdest = (charmove_setdest_t)(g_base + RVA_CHARMOVE_SETDEST);
     g_char_setdest     = (char_setdest_t)(g_base + RVA_CHAR_SETDEST);
     g_move_to_pos      = (move_to_pos_t)(g_base + RVA_MOVE_TO_POS);
+    g_nearest_town     = (nearest_town_t)(g_base + RVA_NEAREST_TOWN);
+    g_interior_load    = (interior_load_t)(g_base + RVA_INTERIOR_LOAD);
     AddVectoredExceptionHandler(1, veh_guard);   /* crash guard for game-fn calls */
     {
         HMODULE terr = GetModuleHandleA("Plugin_Terrain_x64.dll");

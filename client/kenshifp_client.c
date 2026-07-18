@@ -518,12 +518,13 @@ static void fp_movement(void *gw, float dt)
     float mf = (float)(w - s);     /* forward/back */
     float mr = (float)(d - a);     /* left/right (turns the char, not strafe) */
 
-    (void)dt;
     if (keys == 0 || (mf == 0.0f && mr == 0.0f)) {
-        if (g_was_moving) {         /* release: halt at current position */
-            Vec3 here;
-            if (char_position(pc, &here))
-                g_charmove_setdest(mv, &here, UPDATE_PRIORITY_HIGH, 0);
+        if (g_was_moving) {         /* release: zero the motion state */
+            *(unsigned char *)((uintptr_t)mv + MV_CURRENTLY_MOVING) = 0;
+            *(float *)((uintptr_t)mv + MV_CURRENT_SPEED) = 0.0f;
+            *(float *)((uintptr_t)mv + MV_DESIRED_SPEED) = 0.0f;
+            Vec3 *cm = (Vec3 *)((uintptr_t)mv + MV_CURRENT_MOTION);
+            cm->x = cm->y = cm->z = 0.0f;
             g_was_moving = 0;
         }
         return;
@@ -539,23 +540,33 @@ static void fp_movement(void *gw, float dt)
     if (len < 0.001f) return;
     dx = -dx / len; dz = -dz / len;
 
-    /* Look pitch -> target distance (down = near/slow, up = far/run). The order
-     * system walks the character toward the point — it animates and turns to
-     * face it naturally, and the camera (calibrated T) tracks it lag-free. */
+    /* Speed from look pitch (down = slow, up = run), scaled by the character's
+     * own walk/max speeds so encumbrance/injury still matter. */
     float t = (1.4f - g_pitch) / 2.8f;
     if (t < 0.0f) t = 0.0f;
     if (t > 1.0f) t = 1.0f;
-    float dist = MOVE_NEAR + t * (MOVE_FAR - MOVE_NEAR);
+    float walk = *(float *)((uintptr_t)mv + MV_WALK_SPEED);
+    float maxs = *(float *)((uintptr_t)mv + MV_MAX_SPEED);
+    if (!(walk > 0.1f && walk < 1000.0f)) walk = 8.0f;
+    if (!(maxs > walk && maxs < 1000.0f)) maxs = 25.0f;
+    float speed = (walk * 0.3f) + t * (maxs - walk * 0.3f);
 
+    /* Orient-to-control body drive: move in the WASD direction WITHOUT the
+     * engine's auto-turn (which fights the look-facing). Position-integrate via
+     * _setPositionAndTeleport; set the motion state for animation. */
     Vec3 here;
-    if (!char_position(pc, &here)) return;
-
-    /* Re-issue the destination EVERY frame: the low-level CharMovement order does
-     * not "hold" like a right-click — the AI cancels it, so it walks a single
-     * tick then stops unless we keep re-asserting it. Target sits `dist` ahead in
-     * the look/WASD direction, so the character walks continuously toward it. */
-    Vec3 tgt = { here.x + dx * dist, here.y, here.z + dz * dist };
-    g_charmove_setdest(mv, &tgt, UPDATE_PRIORITY_HIGH, 0);
+    if (dt > 0.0f && dt < 0.2f && char_position(pc, &here)
+        && in_module(mvvt) && readable(&mvvt[MV_SETPOSTELE_VTOFF], 8)
+        && in_module(mvvt[MV_SETPOSTELE_VTOFF])) {
+        Vec3 np = { here.x + dx * speed * dt, here.y, here.z + dz * speed * dt };
+        set_pos_tele_t setpos = (set_pos_tele_t)mvvt[MV_SETPOSTELE_VTOFF];
+        setpos(mv, &np, 0);
+    }
+    *(unsigned char *)((uintptr_t)mv + MV_CURRENTLY_MOVING) = 1;
+    *(float *)((uintptr_t)mv + MV_CURRENT_SPEED) = speed;
+    *(float *)((uintptr_t)mv + MV_DESIRED_SPEED) = speed;
+    Vec3 *cm = (Vec3 *)((uintptr_t)mv + MV_CURRENT_MOTION);
+    cm->x = dx * speed; cm->y = 0.0f; cm->z = dz * speed;
     g_was_moving = 1;
 }
 

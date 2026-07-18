@@ -6,7 +6,7 @@ Built as a native code plugin — no game files are modified.
 
 ## Showcase
 
-[![KenshiFP showcase video](https://img.youtube.com/vi/-srKmsiw-Hc/maxresdefault.jpg)](https://youtu.be/-srKmsiw-Hc)
+[![KenshiFP showcase video](https://img.youtube.com/vi/fRytSR9aURI/maxresdefault.jpg)](https://youtu.be/fRytSR9aURI)
 
 *Click to watch the mod in action.*
 

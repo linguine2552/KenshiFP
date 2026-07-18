@@ -93,6 +93,28 @@
 #define TASK_DESC            0x70        /* task+0x70 = descriptor */
 #define TASKDESC_TYPE        0x44        /* descriptor+0x44 = order type id */
 #define TASK_MOVE_ID         0x1d        /* Task_Move (player walk order) */
+/* --- UI-panel-open detection (decompile-verified 1.0.68). ForgottenGUI is a
+ * static INSTANCE at 0x21337b0; other window singletons are static pointers.
+ * Everything below is a pure read or a tiny getVisible (widget flag read). --- */
+#define RVA_GUI_INV_COUNT   0x2133870u  /* gui+0xC0: inventoryWindowsOpen map SIZE --
+                                         * covers inventory, loot, trade, animal,
+                                         * research inventories */
+#define RVA_GUI_STATS_BEG   0x2133978u  /* gui+0x1C8: stats-windows vector begin */
+#define RVA_GUI_STATS_END   0x2133980u  /* gui+0x1D0: vector end */
+#define RVA_GUI_WINSTACK    0x21339c0u  /* gui+0x210: open-window stack count */
+#define RVA_GUI_DLGWND      0x21337d0u  /* gui+0x20: DialogueWindow* */
+#define RVA_DLG_GETVIS      0x721ec0u
+#define RVA_ESCMENU_PTR     0x212f4b8u  /* EscMenu singleton */
+#define RVA_ESC_GETVIS      0x913040u
+#define RVA_OVERVIEW_PTR    0x212f4f8u  /* OverviewWindow: map/factions/squads/etc */
+#define RVA_OVW_GETVIS      0x48bb70u
+#define RVA_OPTIONS_PTR     0x212f090u  /* OptionsWindow */
+#define RVA_OPT_GETVIS      0x3e7240u
+#define RVA_PROSPECT_PTR    0x212ea60u  /* ProspectingWindow */
+#define RVA_PRO_GETVIS      0x48bf50u
+#define RVA_SAVELOAD_PTR    0x212ebd8u  /* save/load dialogs: widget slots +0x100.. */
+#define RVA_MSGBOX_COUNT    0x1f29a30u  /* modal message boxes open */
+#define UIMASK_OVERVIEW     0x080       /* fullscreen map/factions/squads screen */
 #define RVA_CAM_UPDATE       0x6b0f90u   /* CameraClass::update(bool controlEnabled) -- verified
                                           * M1. Hooked so the FP eye is re-asserted MID-frame:
                                           * the game's follow camera lags 30-100u behind the eye
@@ -374,6 +396,7 @@ static int  g_have_eye;                        /* re-assert mid-frame only when 
 static int  g_calib_wait;                      /* frames until T may recalibrate */
 static void *g_gw_cache;                       /* GameWorld* for the mid-frame hook */
 static float g_frame_dt;                       /* last frame's dt (stutter diag) */
+static int g_ui_mask;                          /* which panel checks are open */
 static Vec3 g_eye_sm;                          /* smoothed eye (X/Z low-pass) */
 static int  g_eye_sm_ok;
 static float g_lead_sm;                        /* smoothed W-ray lead distance */
@@ -549,6 +572,7 @@ static void camera_lock(void *gw)
  * (read-only, no cursor recenter -> no fight with the engine's own cursor). */
 static void mygui_cursor(int visible);   /* forward decl (defined below) */
 static void ensure_crosshair(void);
+static int ui_panels_open(void);         /* forward decl (needs the VEH guard) */
 
 /* --- DirectInput mouse (FP look deltas) ---------------------------------
  * The one delta source that both FEELS right and COEXISTS with the game:
@@ -635,7 +659,16 @@ static void fp_camera_override(void *gw)
         int control = readable((void *)(g_base + RVA_INPUT_CONTROLENABLED), 1)
                       ? *(char *)(g_base + RVA_INPUT_CONTROLENABLED) : 1;
         g_dbg_control = control;
-        int ui_open = (control == 0);
+        /* Debounce the panel checks: the game transiently creates inventory
+         * window state for ~0.5s during some NPC interactions (mask blips
+         * 0x005 in the log). Reacting to those churned halt/restart orders
+         * into the middle of NPC-driven task changes -> crash. Dialogue
+         * (control==0) stays immediate. */
+        int panels_now = ui_panels_open();
+        static int panel_frames;
+        if (panels_now) { if (panel_frames < 1000) panel_frames++; }
+        else panel_frames = 0;
+        int ui_open = (control == 0) || (panels_now && panel_frames >= 8);
         g_ui_open = ui_open;                    /* read by the setPointer hook */
         if (!g_ovr_prev) { mygui_cursor(0); g_pointer_default = 1; }  /* FP enter */
         ensure_crosshair();
@@ -669,6 +702,18 @@ static void fp_camera_override(void *gw)
             SetCursorPos(cx, cy);  /* recenter so the cursor never drifts to edges */
         }
         g_ui_prev = ui_open;
+
+        /* Fullscreen overview (map/factions/squads) REPURPOSES the render view:
+         * keeping our per-frame camera writes running while the map owns the
+         * camera crashed the game seconds after opening it. Stand down fully --
+         * cursor is already freed above; resume when it closes. (Dialogue and
+         * item panels keep the normal 3D view, so the override continues for
+         * them and the FP framing is preserved.) */
+        if (ui_open && (g_ui_mask & UIMASK_OVERVIEW)) {
+            g_have_eye = 0;            /* no mid-frame re-asserts either */
+            g_ovr_prev = active;
+            return;
+        }
 
         /* Eye position, fully in WORLD space: centerWorld + (head - feet). The
          * head-feet offset (world axes, from getBoneWorldPosition/getPosition)
@@ -836,6 +881,74 @@ static LONG CALLBACK veh_guard(EXCEPTION_POINTERS *ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+/* Any interactive UI panel open? (inventory/loot/trade, stats, window stack,
+ * dialogue, ESC menu, overview map/factions/squads, options, prospecting,
+ * save/load, modal boxes). Pure reads + tiny getVisible calls, VEH-guarded.
+ * Used to free the captured FP cursor whenever the player needs to click UI. */
+typedef char (*ui_getvis_t)(void *w);
+static int ui_panels_open(void)
+{
+    static int dead;
+    if (dead) return 0;
+    uintptr_t B = g_base;
+
+    int mask = 0;
+
+    /* pure static reads */
+    if (readable((void *)(B + RVA_GUI_INV_COUNT), 8)
+        && *(unsigned long long *)(B + RVA_GUI_INV_COUNT)) mask |= 0x001;
+    if (readable((void *)(B + RVA_GUI_STATS_BEG), 16)
+        && *(void **)(B + RVA_GUI_STATS_BEG) != *(void **)(B + RVA_GUI_STATS_END)) mask |= 0x002;
+    if (readable((void *)(B + RVA_GUI_WINSTACK), 4)) {
+        /* The stack holds persistent members (main HUD) even with nothing
+         * open -- baseline was 1, which kept the gate stuck. Track the
+         * session minimum and flag only counts ABOVE it. */
+        unsigned ws = *(unsigned *)(B + RVA_GUI_WINSTACK);
+        static unsigned ws_min = 0xffffffffu;
+        if (ws < ws_min) ws_min = ws;
+        if (ws > ws_min) mask |= 0x004;
+    }
+    if (readable((void *)(B + RVA_MSGBOX_COUNT), 4)
+        && *(unsigned *)(B + RVA_MSGBOX_COUNT)) mask |= 0x008;
+    if (readable((void *)(B + RVA_SAVELOAD_PTR), 8)) {
+        unsigned char *sv = *(unsigned char **)(B + RVA_SAVELOAD_PTR);
+        if (readable(sv, 0x118)
+            && (*(void **)(sv + 0x100) || *(void **)(sv + 0x108) || *(void **)(sv + 0x110)))
+            mask |= 0x010;
+    }
+
+    /* optional singletons: null-check pointer, then a one-line getVisible */
+    static const struct { unsigned ptr_rva, fn_rva; } chk[] = {
+        { RVA_GUI_DLGWND,   RVA_DLG_GETVIS },   /* 0x020 */
+        { RVA_ESCMENU_PTR,  RVA_ESC_GETVIS },   /* 0x040 */
+        { RVA_OVERVIEW_PTR, RVA_OVW_GETVIS },   /* 0x080 */
+        { RVA_OPTIONS_PTR,  RVA_OPT_GETVIS },   /* 0x100 */
+        { RVA_PROSPECT_PTR, RVA_PRO_GETVIS },   /* 0x200 */
+    };
+    if (setjmp(g_guard_jb)) {
+        dead = 1;
+        logline("ui_panels_open FAULTED -- disabled for this session");
+        return 0;
+    }
+    g_guard_armed = 1;
+    int i;
+    for (i = 0; i < 5; i++) {
+        if (!readable((void *)(B + chk[i].ptr_rva), 8)) continue;
+        void *w = *(void **)(B + chk[i].ptr_rva);
+        if (!readable(w, 0x60)) continue;
+        if (((ui_getvis_t)(B + chk[i].fn_rva))(w)) mask |= (0x020 << i);
+    }
+    g_guard_armed = 0;
+
+    static int last_mask = -1;
+    if (mask != last_mask) {           /* diag: which check flips the gate */
+        last_mask = mask;
+        logline("[ui] panel mask=0x%03x", mask);
+    }
+    g_ui_mask = mask;
+    return mask != 0;
+}
+
 /* Character::moveToPosition (RVA 0x5d22b0 = vtable +0x318), crash-guarded: the
  * GENUINE right-click walk path. Issues/live-updates a Task_Move(0x1d) --
  * pathfinds, ground-follows, animates, and as a real player order makes a
@@ -856,6 +969,21 @@ static int try_move_to_pos(void *pc, const Vec3 *tgt)
     g_move_to_pos(pc, NULL, NULL, tgt);   /* NULL,NULL = plain ground point */
     g_guard_armed = 0;
     return 1;
+}
+
+/* Is the character's CURRENT task our walk order (Task_Move 0x1d)? Used to
+ * choose moveToPosition's cheap live-update path vs the queue-clearing create
+ * path, and to avoid stomping NPC-forced tasks (dialogue, grabs, jobs). */
+static int char_task_is_move(void *pc)
+{
+    void *tholder = readable((void *)((uintptr_t)pc + CHAR_TASKHOLDER), 8)
+        ? *(void **)((uintptr_t)pc + CHAR_TASKHOLDER) : NULL;
+    if (!readable(tholder, TASK_CUR + 8)) return 0;
+    void *cur = *(void **)((uintptr_t)tholder + TASK_CUR);
+    if (!readable(cur, TASK_DESC + 8)) return 0;
+    void *desc = *(void **)((uintptr_t)cur + TASK_DESC);
+    return readable(desc, TASKDESC_TYPE + 4)
+        && *(int *)((uintptr_t)desc + TASKDESC_TYPE) == TASK_MOVE_ID;
 }
 
 /* Clamp a target point onto the terrain surface via Terrain::getHeight
@@ -936,10 +1064,15 @@ static void fp_movement(void *gw, float dt)
     float mr = (float)(d - a);     /* left/right (turns the char, not strafe) */
 
     (void)dt;
-    if (keys == 0 || (mf == 0.0f && mr == 0.0f)) {
+    /* Treat "UI panel open" as keys-released: halts if we were moving, and no
+     * WASD while typing/clicking in panels. */
+    if (g_ui_open || keys == 0 || (mf == 0.0f && mr == 0.0f)) {
         if (g_was_moving) {         /* release: halt at current position */
             Vec3 here;
-            if (char_position(pc, &here)) {
+            /* Halt ONLY if our walk task still owns the character. If an
+             * NPC-forced task (dialogue, grab, arrest) took over, issuing a
+             * halt would CLEAR their queue mid-mutation -> crash. */
+            if (char_task_is_move(pc) && char_position(pc, &here)) {
                 if (!try_move_to_pos(pc, &here))   /* order to current pos = stop */
                     g_charmove_setdest(mv, &here, UPDATE_PRIORITY_HIGH, 0);
             }
@@ -1031,13 +1164,25 @@ static void fp_movement(void *gw, float dt)
     }
 
     /* Primary drive: the REAL right-click walk order (Task_Move) -- pathfinds
-     * over slopes, animates, triggers get-up when downed. Per-frame call = the
-     * game's own drag-move (live destination update). NOTE: attempts to
-     * throttle this via current-task-type detection (Character+0x648 chain)
-     * made turning chunky (sluggish-then-teleport camera) -- the detection
-     * offsets are unreliable; keep it unconditional like vanilla drag-move. */
-    if (!try_move_to_pos(pc, &tgt))
-        g_charmove_setdest(mv, &tgt, UPDATE_PRIORITY_HIGH, 1);
+     * over slopes, animates, triggers get-up when downed.
+     * moveToPosition live-updates the destination when the CURRENT task is
+     * already Task_Move (drag-move path, cheap, per-frame safe). When it is
+     * NOT (movement start, stagger, or a JOB like Bodyguard holds the task
+     * slot), each call CLEARS the queue + allocates a fresh task -- at 60/s
+     * that wars with the job system's own queue mutations (heap-churn crash
+     * when assigning Bodyguard). So: per-frame updates while the walk task is
+     * current; task CREATION allowed instantly a few times, then ~4/s.
+     * (An earlier removal of this throttle blamed it for chunky turning --
+     * that was actually the warp-mouse input, since fixed by DirectInput.) */
+    int cur_is_move = char_task_is_move(pc);
+    static int create_streak, issue_cd;
+    if (cur_is_move) create_streak = 0;
+    if (issue_cd > 0) issue_cd--;
+    if (cur_is_move || create_streak < 3 || issue_cd <= 0) {
+        if (!try_move_to_pos(pc, &tgt))
+            g_charmove_setdest(mv, &tgt, UPDATE_PRIORITY_HIGH, 1);
+        if (!cur_is_move) { create_streak++; issue_cd = 15; }
+    }
 
     g_was_moving = 1;
 }

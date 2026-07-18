@@ -227,6 +227,9 @@ static int g_last_move_keys;       /* WASD bitmask of last issued destination */
 static float g_move_tx, g_move_tz, g_move_dist;  /* last issued target + its distance */
 static float g_dbg_center_y, g_dbg_eye_y;  /* diagnostics for eye-height tuning */
 static float g_dbg_head_x, g_dbg_center_x;  /* frame check: head vs center X */
+static float g_tx, g_tz;           /* game->Ogre translation, calibrated when still */
+static int g_have_t;
+static float g_last_feet_x, g_last_feet_z;
 
 static void logline(const char *fmt, ...)
 {
@@ -411,15 +414,23 @@ static void fp_camera_override(void *gw)
                     g_get_bone_world(pc, &head, g_head_bone);
                     Vec3 h = { head.x - feet.x, head.y - feet.y, head.z - feet.z };
                     if (h.x*h.x + h.y*h.y + h.z*h.z > 0.25f) {
-                        eyeW.y = head.y - EYE_DROP;   /* head-bone Y directly (stable) */
-                        /* If the head bone's world X/Z sit in the Ogre scene frame
-                         * (close to the center node), weld the eye straight to them
-                         * so it tracks the character with NO follow-lag; else (X/Z
-                         * rebased by the floating origin) anchor to center + lean. */
-                        float ddx = head.x - centerW.x, ddz = head.z - centerW.z;
-                        if (ddx*ddx + ddz*ddz < 10000.0f) {   /* within ~100u -> same frame */
-                            eyeW.x = head.x; eyeW.z = head.z;
-                        } else {
+                        eyeW.y = head.y - EYE_DROP;   /* head-bone Y directly (Y not rebased) */
+                        /* head/feet are GAME coords, center is OGRE; they differ by
+                         * a constant floating-origin translation T. Calibrate T while
+                         * the character is still (center caught up), then use
+                         * head_game + T during movement -> exact, lag-free tracking. */
+                        float mvx = feet.x - g_last_feet_x, mvz = feet.z - g_last_feet_z;
+                        if (mvx*mvx + mvz*mvz < 0.25f) {   /* ~stationary */
+                            g_tx = centerW.x - feet.x;
+                            g_tz = centerW.z - feet.z;
+                            g_have_t = 1;
+                        }
+                        g_last_feet_x = feet.x; g_last_feet_z = feet.z;
+
+                        if (g_have_t) {
+                            eyeW.x = head.x + g_tx;
+                            eyeW.z = head.z + g_tz;
+                        } else {                       /* until first calibration */
                             eyeW.x = centerW.x + h.x; eyeW.z = centerW.z + h.z;
                         }
                         g_dbg_head_x = head.x; g_dbg_center_x = centerW.x;
@@ -483,13 +494,9 @@ static void fp_movement(void *gw, float dt)
     float mf = (float)(w - s);     /* forward/back */
     float mr = (float)(d - a);     /* left/right (turns the char, not strafe) */
 
+    (void)dt;
     if (keys == 0 || (mf == 0.0f && mr == 0.0f)) {
-        if (g_was_moving) {         /* release: zero the motion state + halt order */
-            *(unsigned char *)((uintptr_t)mv + MV_CURRENTLY_MOVING) = 0;
-            *(float *)((uintptr_t)mv + MV_CURRENT_SPEED) = 0.0f;
-            *(float *)((uintptr_t)mv + MV_DESIRED_SPEED) = 0.0f;
-            Vec3 *cm = (Vec3 *)((uintptr_t)mv + MV_CURRENT_MOTION);
-            cm->x = cm->y = cm->z = 0.0f;
+        if (g_was_moving) {         /* release: halt at current position */
             Vec3 here;
             if (char_position(pc, &here))
                 g_charmove_setdest(mv, &here, UPDATE_PRIORITY_HIGH, 0);
@@ -498,8 +505,7 @@ static void fp_movement(void *gw, float dt)
         return;
     }
 
-    /* Desired heading, relative to the camera yaw. Ogre Y-up, camera looks -Z:
-     * forward = (-sin,0,-cos), right = (cos,0,-sin). */
+    /* Heading relative to camera yaw (negated: W=forward, S=back, A=left, D=right). */
     float th = g_yaw;
     float fx = -sinf(th), fz = -cosf(th);
     float rx =  cosf(th), rz = -sinf(th);
@@ -507,44 +513,38 @@ static void fp_movement(void *gw, float dt)
     float dz = fz * mf + rz * mr;
     float len = sqrtf(dx * dx + dz * dz);
     if (len < 0.001f) return;
-    dx = -dx / len; dz = -dz / len;   /* negate: W=forward, S=back, A=left, D=right */
+    dx = -dx / len; dz = -dz / len;
 
-    /* Speed from look pitch (down = slow walk, up = full run), scaled by the
-     * character's own walk/max speeds so encumbrance/injury still matter. */
-    float t = (1.4f - g_pitch) / 2.8f;      /* 0 at full-down, 1 at full-up */
+    /* Look pitch -> target distance (down = near/slow, up = far/run). The order
+     * system walks the character toward the point — it animates and turns to
+     * face it naturally, and the camera (calibrated T) tracks it lag-free. */
+    float t = (1.4f - g_pitch) / 2.8f;
     if (t < 0.0f) t = 0.0f;
     if (t > 1.0f) t = 1.0f;
-    float walk = *(float *)((uintptr_t)mv + MV_WALK_SPEED);
-    float maxs = *(float *)((uintptr_t)mv + MV_MAX_SPEED);
-    if (!(walk > 0.1f && walk < 1000.0f)) walk = 8.0f;
-    if (!(maxs > walk && maxs < 1000.0f)) maxs = 25.0f;
-    float speed = (walk * 0.3f) + t * (maxs - walk * 0.3f);
+    float dist = MOVE_NEAR + t * (MOVE_FAR - MOVE_NEAR);
 
-    /* Custom controller: rotate the character to the input direction, drive the
-     * motion state (walk animation), and INTEGRATE THE POSITION OURSELVES — the
-     * engine's movement update recomputes motion from its own goals each frame
-     * (no goal = zero), so velocity writes alone don't translate the body.
-     * Position-drive via the engine's own _setPositionSimple (KenshiCoop's
-     * proxy technique) actually moves it. */
-    Vec3 dir = { dx, 0.0f, dz };
-    void **mvvt = *(void ***)mv;
-    if (readable(mvvt, (MV_FACEDIR_VTOFF + 1) * 8)) {
-        face_direction_t face = (face_direction_t)mvvt[MV_FACEDIR_VTOFF];
-        if (readable((void *)face, 1)) face(mv, &dir);
+    Vec3 here;
+    if (!char_position(pc, &here)) return;
 
-        Vec3 here;
-        if (dt > 0.0f && dt < 0.2f && char_position(pc, &here)
-            && readable(&mvvt[MV_SETPOSTELE_VTOFF], 8)) {
-            Vec3 np = { here.x + dx * speed * dt, here.y, here.z + dz * speed * dt };
-            set_pos_tele_t setpos = (set_pos_tele_t)mvvt[MV_SETPOSTELE_VTOFF];
-            if (readable((void *)setpos, 1)) setpos(mv, &np, 0);
-        }
+    /* Re-issue only on turn / key change / target approached / keepalive — not
+     * every frame (per-frame re-issue resets the path and stutter-steps). */
+    DWORD now = GetTickCount();
+    float dir = atan2f(dx, dz);
+    float dturn = dir - g_last_move_dir;
+    while (dturn >  3.14159265f) dturn -= 6.2831853f;
+    while (dturn < -3.14159265f) dturn += 6.2831853f;
+    float rtx = g_move_tx - here.x, rtz = g_move_tz - here.z;
+    float remain = sqrtf(rtx * rtx + rtz * rtz);
+    int changed = !g_was_moving || keys != g_last_move_keys
+                || (dturn > MOVE_TURN_EPS || dturn < -MOVE_TURN_EPS)
+                || (remain < g_move_dist * MOVE_RETARGET_FRAC)
+                || (now - g_last_move_ms) > MOVE_KEEPALIVE_MS;
+    if (changed) {
+        Vec3 tgt = { here.x + dx * dist, here.y, here.z + dz * dist };
+        g_charmove_setdest(mv, &tgt, UPDATE_PRIORITY_HIGH, 0);
+        g_move_tx = tgt.x; g_move_tz = tgt.z; g_move_dist = dist;
+        g_last_move_ms = now; g_last_move_dir = dir; g_last_move_keys = keys;
     }
-    *(unsigned char *)((uintptr_t)mv + MV_CURRENTLY_MOVING) = 1;
-    *(float *)((uintptr_t)mv + MV_CURRENT_SPEED) = speed;
-    *(float *)((uintptr_t)mv + MV_DESIRED_SPEED) = speed;  /* keep accel logic from idling us */
-    Vec3 *cm = (Vec3 *)((uintptr_t)mv + MV_CURRENT_MOTION);
-    cm->x = dx * speed; cm->y = 0.0f; cm->z = dz * speed;
     g_was_moving = 1;
 }
 

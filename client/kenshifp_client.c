@@ -78,7 +78,13 @@
  * NOTE: KenshiCoop found player chars can ignore a bare CharMovement dest; if so
  * this won't move them and we'll switch to the Character-level order path. */
 #define CHAR_MOVEMENT      0x640   /* Character::movement (CharMovement*) */
-#define RVA_CHARMOVE_SETDEST 0x661270u   /* CharMovement::setDestination (halt use only) */
+#define RVA_CHARMOVE_SETDEST 0x661270u   /* CharMovement::setDestination (raw move; no navmesh) */
+#define RVA_CHAR_SETDEST     0x5c84e0u   /* Character::setDestination -- PLAYER order path
+                                          * (pathfinds + ground-clamps, so it climbs slopes;
+                                          * per KenshiCoop this is what click-to-move uses). */
+#define REISSUE_DIST         1.0f        /* re-issue the move order only when the target moved
+                                          * this far -- per-frame re-issue restarts the path
+                                          * (stutter) and was the earlier crash cause. */
 #define UPDATE_PRIORITY_HIGH 2
 
 /* ---- custom FP character controller (motion drive, NO move orders) ----
@@ -164,7 +170,7 @@
 #define OGRE_RGM_ADDLOCATION_SYM  "?addResourceLocation@ResourceGroupManager@Ogre@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@00_N1@Z"
 #define OGRE_RGM_CREATEGROUP_SYM  "?createResourceGroup@ResourceGroupManager@Ogre@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@_N@Z"
 #define OGRE_RGM_INITGROUP_SYM    "?initialiseResourceGroup@ResourceGroupManager@Ogre@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z"
-#define CROSSHAIR_SIZE    40         /* px on screen; tune */
+#define CROSSHAIR_SIZE    80         /* px on screen; tune */
 
 /* ---- M2 first-person (Ogre node override) ----
  * Scene graph (from the ctor): root -> center(+0x58) -> node(+0x70) -> camera
@@ -250,6 +256,7 @@ typedef void (*rgm_addlocation_t)(void *rgm, const void *name, const void *locty
 typedef void (*rgm_creategroup_t)(void *rgm, const void *group, char inGlobalPool);
 typedef void (*rgm_initgroup_t)(void *rgm, const void *group);
 typedef void (*charmove_setdest_t)(void *mv, const Vec3 *dest, int pri, char shift);
+typedef void (*char_setdest_t)(void *self, const Vec3 *pos, char shift);   /* player order path */
 typedef void (*face_direction_t)(void *mv, const Vec3 *dir);
 typedef void (*manual_move_t)(void *mv, const Vec3 *desiredMotion);
 /* _setPositionAndTeleport(const Vec3& p, int floor): (this RCX, Vec3* RDX, floor R8) */
@@ -300,10 +307,13 @@ static rgm_creategroup_t g_rgm_creategroup;
 static rgm_initgroup_t g_rgm_initgroup;
 static void *g_crosshair;          /* the ImageBox widget */
 static int g_pointer_default = 1;  /* current MyGUI pointer is the default (arrow) */
-static charmove_setdest_t g_charmove_setdest;  /* CharMovement::setDestination (halt only) */
+static charmove_setdest_t g_charmove_setdest;  /* CharMovement::setDestination (raw move) */
+static char_setdest_t g_char_setdest;          /* Character::setDestination (player path) */
 static DWORD g_last_move_ms;
 static int g_was_moving;
 static float g_speed_scale = 0.6f; /* scrollwheel throttle: walk (low) .. run (high) */
+static Vec3 g_last_dest;           /* last issued move-order target (for the re-issue gate) */
+static int  g_have_dest;
 static int g_dbg_wheel;
 static HINSTANCE g_hinst;
 static HHOOK g_mouse_hook;
@@ -481,6 +491,12 @@ static void fp_camera_override(void *gw)
     int active = g_fp_mode && !*(unsigned char *)((uintptr_t)cam + CC_FREECAM);
 
     if (active) {
+        /* [foliage diag] sample the camera node's derived position as the game left
+         * it this frame -- i.e. what foliage paging/culling saw during g_mainloop_orig,
+         * before our override runs. Compared against the FP eye below. */
+        Vec3 cam_pre = { 0, 0, 0 };
+        int have_pre = g_node_get_dpos && g_node_get_dpos(node, &cam_pre);
+
         int cx = GetSystemMetrics(SM_CXSCREEN) / 2;
         int cy = GetSystemMetrics(SM_CYSCREEN) / 2;
         if (cx <= 0) cx = 960;
@@ -498,7 +514,7 @@ static void fp_camera_override(void *gw)
         if (!g_ovr_prev) { mygui_cursor(0); g_pointer_default = 1; }  /* FP enter */
         ensure_crosshair();
         if (g_crosshair && g_widget_setvisible)
-            g_widget_setvisible(g_crosshair, (!ui_open) ? 1 : 0);   /* DIAG: force-show to test texture */
+            g_widget_setvisible(g_crosshair, (g_pointer_default && !ui_open) ? 1 : 0);
 
         if (ui_open) {
             if (g_cursor_hidden) { while (ShowCursor(TRUE) < 0) { } g_cursor_hidden = 0; }
@@ -568,6 +584,19 @@ static void fp_camera_override(void *gw)
 
             g_dbg_center_y = centerW.y; g_dbg_eye_y = eyeW.y;   /* for tuning */
             g_node_set_dpos(node, &eyeW);
+
+            /* [foliage diag] how far is the game's per-frame camera position (used
+             * by grass paging) from our FP eye? A large gap => grass pages around
+             * the wrong point => pop-in under the feet. */
+            if (have_pre) {
+                static int fcnt;
+                if (((++fcnt) % 120) == 0) {
+                    float ddx = cam_pre.x - eyeW.x, ddy = cam_pre.y - eyeW.y, ddz = cam_pre.z - eyeW.z;
+                    logline("[foliage] cam_pre=(%.1f,%.1f,%.1f) fp_eye=(%.1f,%.1f,%.1f) gap=%.1f (dY=%.1f)",
+                            cam_pre.x, cam_pre.y, cam_pre.z, eyeW.x, eyeW.y, eyeW.z,
+                            sqrtf(ddx*ddx + ddy*ddy + ddz*ddz), ddy);
+                }
+            }
         }
 
         /* World look orientation q = q_yaw(Y) * q_pitch(X); no roll. Ogre camera
@@ -656,6 +685,7 @@ static void fp_movement(void *gw, float dt)
             if (char_position(pc, &here))
                 g_charmove_setdest(mv, &here, UPDATE_PRIORITY_HIGH, 0);
             g_was_moving = 0;
+            g_have_dest = 0;
         }
         /* Orient-to-control: while standing still, rotate the body to face the
          * camera look direction via faceDirection (CharMovement vtable slot 6).
@@ -689,7 +719,11 @@ static void fp_movement(void *gw, float dt)
     if (!char_position(pc, &here)) return;
 
     /* Order-based move (animates + ground-clamps + turns to face path); re-issue
-     * every frame so it holds. Camera stays welded via calibrated T. */
+     * every frame so it holds. Camera stays welded via calibrated T.
+     * NOTE: this is the raw CharMovement mover -- no navmesh pathfinding, so it
+     * struggles on steep slopes (target Y is fixed). The player-path
+     * Character::setDestination (0x5c84e0) DOES pathfind but crashes when called
+     * from our post-frame hook without the game's SEH-guarded order setup. */
     Vec3 tgt = { here.x + dx * dist, here.y, here.z + dz * dist };
     g_charmove_setdest(mv, &tgt, UPDATE_PRIORITY_HIGH, 0);
     g_was_moving = 1;
@@ -747,8 +781,11 @@ static void ensure_crosshair(void)
     int cx = GetSystemMetrics(SM_CXSCREEN), cy = GetSystemMetrics(SM_CYSCREEN);
     if (cx <= 0) cx = 1920;
     if (cy <= 0) cy = 1080;
+    /* Skin MUST be "ImageBox" (defined in Kenshi's common_skins.xml): a widget
+     * renders through its skin's sub-items, so an empty skin draws nothing --
+     * that was why the widget existed + texture loaded, yet nothing showed. */
     unsigned char type[32], skin[32], layer[32], name[32], tex[32];
-    make_mstr(type, "ImageBox"); make_mstr(skin, ""); make_mstr(layer, "Pointer");
+    make_mstr(type, "ImageBox"); make_mstr(skin, "ImageBox"); make_mstr(layer, "Pointer");
     make_mstr(name, "FPCrosshair"); make_mstr(tex, "crosshair.png");
     void *w = g_gui_createwidget(gui, type, skin,
                                  cx / 2 - CROSSHAIR_SIZE / 2, cy / 2 - CROSSHAIR_SIZE / 2,
@@ -774,8 +811,6 @@ static void hooked_setpointer(void *pm, const void *name)
     read_mstring(name, cur, sizeof cur);
     read_mstring(g_pm_getdefault(pm), def, sizeof def);
     int is_default = (cur[0] != '\0' && strcmp(cur, def) == 0);
-    static int dbg_n;
-    if (dbg_n < 20) { dbg_n++; logline("[ptr] set='%s' default='%s' isDefault=%d", cur, def, is_default); }
     g_pm_setvisible(pm, is_default ? 0 : 1);   /* hide arrow (crosshair instead), show contextual */
     g_pointer_default = is_default;
 }
@@ -824,6 +859,7 @@ __declspec(dllexport) void dllStartPlugin(void)
     g_follow_object  = (follow_object_t)(g_base + RVA_FOLLOW_OBJECT);
     g_stop_following = (stop_follow_t)(g_base + RVA_STOP_FOLLOW);
     g_charmove_setdest = (charmove_setdest_t)(g_base + RVA_CHARMOVE_SETDEST);
+    g_char_setdest     = (char_setdest_t)(g_base + RVA_CHAR_SETDEST);
     g_get_bone_world   = (get_bone_world_t)(g_base + RVA_GET_BONE_WORLD);
 
     g_mouse_hook = SetWindowsHookExA(WH_MOUSE_LL, mouse_ll, g_hinst, 0);

@@ -72,8 +72,14 @@
  * NOTE: KenshiCoop found player chars can ignore a bare CharMovement dest; if so
  * this won't move them and we'll switch to the Character-level order path. */
 #define CHAR_MOVEMENT      0x640   /* Character::movement (CharMovement*) */
+#define CHAR_DEST_AUX      0x448   /* object setDestination also notifies */
 #define RVA_CHARMOVE_SETDEST 0x661270u
 #define UPDATE_PRIORITY_HIGH 2
+/* Character::setDestination(Character* self, const Vec3* pos, bool shift) — RVA
+ * 0x5c84e0. THE player move-order path: the right-click handler (FUN_140347950)
+ * calls exactly this, so using it moves the character AND keeps the camera-follow
+ * synced (CharMovement::setDestination moved the body but the camera lagged). */
+#define RVA_SET_DESTINATION 0x5c84e0u
 /* Orient-to-direction movement: setDestination makes the character turn to face
  * the target and walk (no strafing). We aim FAR ahead so it commits to a full-
  * speed walk, and only RE-ISSUE when the heading or key set changes (or a slow
@@ -166,6 +172,7 @@ typedef void (*node_set_dori_t)(void *node, const Quat *q);  /* world _setDerive
 typedef void (*cam_set_fovy_t)(void *camera, const float *rad);
 typedef const float *(*cam_get_fovy_t)(void *camera);
 typedef void (*charmove_setdest_t)(void *mv, const Vec3 *dest, int pri, char shift);
+typedef void (*set_dest_t)(void *character, const Vec3 *pos, char shift);
 typedef void (*node_set_dpos_t)(void *node, const Vec3 *v);   /* world _setDerivedPosition */
 typedef Vec3 *(*node_get_dpos_t)(void *node, Vec3 *ret);      /* world _getDerivedPosition (this=RCX,ret=RDX) */
 /* member-struct-return: this=RCX, retbuf=RDX, name=R8 */
@@ -194,7 +201,8 @@ static cam_set_fovy_t g_cam_set_fovy;
 static cam_get_fovy_t g_cam_get_fovy;
 static int g_fov_saved;
 static float g_fov_default;
-static charmove_setdest_t g_charmove_setdest;  /* CharMovement::setDestination */
+static charmove_setdest_t g_charmove_setdest;  /* CharMovement::setDestination (unused; body path) */
+static set_dest_t g_set_destination;           /* Character::setDestination (player order path) */
 static DWORD g_last_move_ms;
 static int g_was_moving;
 static float g_last_move_dir;      /* heading of last issued destination (radians) */
@@ -433,12 +441,14 @@ static void fp_camera_override(void *gw)
  * the current position when all keys release. */
 static void fp_movement(void *gw)
 {
-    if (!g_fp_mode || !g_charmove_setdest) return;
+    if (!g_fp_mode || !g_set_destination) return;
     void *pc = first_player_char(gw);
     if (!pc) return;
-    void *mv = readable((void *)((uintptr_t)pc + CHAR_MOVEMENT), 8)
-        ? *(void **)((uintptr_t)pc + CHAR_MOVEMENT) : NULL;
-    if (!readable(mv, 8)) return;
+    /* setDestination dereferences the character's movement (+0x640) and aux
+     * (+0x448) — validate before calling. */
+    if (!readable((void *)((uintptr_t)pc + CHAR_MOVEMENT), 8)
+        || !readable((void *)((uintptr_t)pc + CHAR_DEST_AUX), 8))
+        return;
 
     int w = (GetAsyncKeyState(VK_W) & 0x8000) != 0;
     int s = (GetAsyncKeyState(VK_S) & 0x8000) != 0;
@@ -452,7 +462,7 @@ static void fp_movement(void *gw)
         if (g_was_moving) {         /* release: halt at current position */
             Vec3 here;
             if (char_position(pc, &here))
-                g_charmove_setdest(mv, &here, UPDATE_PRIORITY_HIGH, 0);
+                g_set_destination(pc, &here, 0);
             g_was_moving = 0;
         }
         return;
@@ -484,7 +494,7 @@ static void fp_movement(void *gw)
      * dragging the marker. The target keeps sitting `dist` ahead of the moving
      * character, so it walks continuously and smoothly; no re-fire throttling. */
     Vec3 tgt = { here.x + dx * dist, here.y, here.z + dz * dist };
-    g_charmove_setdest(mv, &tgt, UPDATE_PRIORITY_HIGH, 0);
+    g_set_destination(pc, &tgt, 0);   /* player order path — camera stays synced */
     g_was_moving = 1;
 }
 
@@ -511,6 +521,7 @@ __declspec(dllexport) void dllStartPlugin(void)
     g_follow_object  = (follow_object_t)(g_base + RVA_FOLLOW_OBJECT);
     g_stop_following = (stop_follow_t)(g_base + RVA_STOP_FOLLOW);
     g_charmove_setdest = (charmove_setdest_t)(g_base + RVA_CHARMOVE_SETDEST);
+    g_set_destination  = (set_dest_t)(g_base + RVA_SET_DESTINATION);
     g_get_bone_world   = (get_bone_world_t)(g_base + RVA_GET_BONE_WORLD);
     /* MSVC std::string SSO for the head bone name (size<=15 -> inline buffer). */
     memset(g_head_bone, 0, sizeof g_head_bone);

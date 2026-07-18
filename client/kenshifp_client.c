@@ -118,6 +118,7 @@
 #define MOVE_KEEPALIVE_MS  2000    /* safety re-issue if nothing else triggers */
 #define MOVE_TURN_EPS      0.12f   /* radians of heading change that forces a re-issue */
 #define EYE_DROP           (-1.5f) /* offset from the head bone Y (negative = raise); tune */
+#define FP_EYE_FORWARD     2.0f    /* move the eye forward (toward look) out of the head; tune */
 
 /* ---- FOV ----
  * Ogre::Frustum::setFOVy(const Radian&) [Camera inherits it]; Radian == {float}.
@@ -489,6 +490,11 @@ static void fp_camera_override(void *gw)
                     }
                 }
             }
+            /* Push the eye forward (horizontal look dir) so it sits at the face,
+             * not inside the head mesh. */
+            eyeW.x += sinf(g_yaw) * FP_EYE_FORWARD;
+            eyeW.z += cosf(g_yaw) * FP_EYE_FORWARD;
+
             g_dbg_center_y = centerW.y; g_dbg_eye_y = eyeW.y;   /* for tuning */
             g_node_set_dpos(node, &eyeW);
         }

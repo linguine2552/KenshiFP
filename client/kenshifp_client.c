@@ -139,6 +139,17 @@
 #define OGRE_GETNEARCLIP_SYM "?getNearClipDistance@Frustum@Ogre@@UEBAMXZ"
 #define FP_NEARCLIP       0.5f     /* world units (~5 cm); tune */
 
+/* ---- MyGUI cursor (hide the default arrow, keep contextual sword/speech) ----
+ * The visible cursor is a MyGUI sprite (ShowCursor can't touch it). MyGUI is a
+ * separate DLL with PointerManager exports. We hook setPointer(const string&) —
+ * Kenshi calls it when the cursor type changes — and, while FP is on, hide the
+ * cursor when the new pointer == the default (arrow) and show it otherwise. */
+#define MYGUI_DLL         "MyGUIEngine_x64.dll"
+#define MYGUI_SETPOINTER_SYM  "?setPointer@PointerManager@MyGUI@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z"
+#define MYGUI_SETVISIBLE_SYM  "?setVisible@PointerManager@MyGUI@@QEAAX_N@Z"
+#define MYGUI_GETDEFAULT_SYM  "?getDefaultPointer@PointerManager@MyGUI@@QEBAAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@XZ"
+#define MYGUI_GETINSTANCE_SYM "?getInstancePtr@?$Singleton@VPointerManager@MyGUI@@@MyGUI@@SAPEAVPointerManager@2@XZ"
+
 /* ---- M2 first-person (Ogre node override) ----
  * Scene graph (from the ctor): root -> center(+0x58) -> node(+0x70) -> camera
  * (+0x68 attached). CameraClass::update keeps `center` at the character and
@@ -207,6 +218,10 @@ typedef void (*cam_set_fovy_t)(void *camera, const float *rad);
 typedef const float *(*cam_get_fovy_t)(void *camera);
 typedef void (*cam_set_nearclip_t)(void *camera, float dist);
 typedef float (*cam_get_nearclip_t)(void *camera);
+typedef void (*pm_setpointer_t)(void *pm, const void *name_stdstr);
+typedef void (*pm_setvisible_t)(void *pm, char visible);
+typedef const void *(*pm_getdefault_t)(void *pm);   /* returns std::string* */
+typedef void *(*pm_getinstance_t)(void);
 typedef void (*charmove_setdest_t)(void *mv, const Vec3 *dest, int pri, char shift);
 typedef void (*face_direction_t)(void *mv, const Vec3 *dir);
 typedef void (*manual_move_t)(void *mv, const Vec3 *desiredMotion);
@@ -244,6 +259,10 @@ static cam_set_nearclip_t g_cam_set_nearclip;
 static cam_get_nearclip_t g_cam_get_nearclip;
 static int g_nearclip_saved;
 static float g_nearclip_default;
+static pm_setpointer_t g_pm_setpointer_orig;   /* MinHook trampoline */
+static pm_setvisible_t g_pm_setvisible;
+static pm_getdefault_t g_pm_getdefault;
+static pm_getinstance_t g_pm_getinstance;
 static charmove_setdest_t g_charmove_setdest;  /* CharMovement::setDestination (halt only) */
 static DWORD g_last_move_ms;
 static int g_was_moving;
@@ -254,6 +273,7 @@ static float g_dbg_center_y, g_dbg_eye_y;  /* diagnostics for eye-height tuning 
 static float g_dbg_head_x, g_dbg_center_x;  /* frame check: head vs center X */
 static int g_cursor_hidden;        /* our ShowCursor state */
 static int g_ui_prev;              /* dialogue/menu open last frame (edge) */
+static int g_ui_open;              /* dialogue/menu open THIS frame (read by the setPointer hook) */
 static int g_dbg_control;          /* controlEnabled read, for verification */
 static float g_tx, g_tz;           /* game->Ogre translation, calibrated when still */
 static int g_have_t;
@@ -404,6 +424,8 @@ static void camera_lock(void *gw)
  * force the camera node to the character's eye position and a mouse-look
  * orientation. Mouse-look v1: absolute cursor position maps to yaw/pitch
  * (read-only, no cursor recenter -> no fight with the engine's own cursor). */
+static void mygui_cursor(int visible);   /* forward decl (defined below) */
+
 static void fp_camera_override(void *gw)
 {
     if (!g_ogre_ready) return;
@@ -429,9 +451,12 @@ static void fp_camera_override(void *gw)
                       ? *(char *)(g_base + RVA_INPUT_CONTROLENABLED) : 1;
         g_dbg_control = control;
         int ui_open = (control == 0);
+        g_ui_open = ui_open;                    /* read by the setPointer hook */
+        if (!g_ovr_prev) mygui_cursor(0);       /* FP enter: hide the default arrow */
 
         if (ui_open) {
             if (g_cursor_hidden) { while (ShowCursor(TRUE) < 0) { } g_cursor_hidden = 0; }
+            mygui_cursor(1);                    /* dialogue: keep the game cursor visible */
             /* cursor free; leave look angle frozen */
         } else {
             if (!g_cursor_hidden) { while (ShowCursor(FALSE) >= 0) { } g_cursor_hidden = 1; }
@@ -531,7 +556,8 @@ static void fp_camera_override(void *gw)
          * orientation to identity so update()'s incremental rotations no longer
          * drift off our FP angle (position is left for update() to reset). */
         while (ShowCursor(TRUE) < 0) { }
-        g_cursor_hidden = 0; g_ui_prev = 0;
+        g_cursor_hidden = 0; g_ui_prev = 0; g_ui_open = 0;
+        mygui_cursor(1);                        /* FP exit: restore the game cursor */
         void *ogre_cam = *(void **)((uintptr_t)cam + CC_CAMERA);
         if (g_fov_saved && g_cam_set_fovy && readable(ogre_cam, 8)) {
             g_cam_set_fovy(ogre_cam, &g_fov_default);
@@ -603,6 +629,44 @@ static void fp_movement(void *gw, float dt)
     g_was_moving = 1;
 }
 
+/* Read an MSVC std::string into out. Layout: [+0x0] SSO buf or heap ptr,
+ * [+0x10] size, [+0x18] capacity; heap when capacity >= 16. */
+static void read_mstring(const void *str, char *out, size_t outsz)
+{
+    out[0] = '\0';
+    if (!readable(str, 0x20)) return;
+    size_t cap  = *(size_t *)((uintptr_t)str + 0x18);
+    size_t size = *(size_t *)((uintptr_t)str + 0x10);
+    const char *data = (cap >= 16) ? *(const char **)str : (const char *)str;
+    if (size >= outsz) size = outsz - 1;
+    if (size > 512 || !readable(data, size + 1)) return;
+    memcpy(out, data, size);
+    out[size] = '\0';
+}
+
+/* MyGUI PointerManager::setPointer hook: while FP is on, hide the cursor when it
+ * becomes the default (arrow), show it for any contextual pointer (sword/speech). */
+static void hooked_setpointer(void *pm, const void *name)
+{
+    g_pm_setpointer_orig(pm, name);
+    if (!g_fp_mode || !g_pm_setvisible) return;
+    if (g_ui_open) { g_pm_setvisible(pm, 1); return; }   /* dialogue: keep cursor */
+    if (!g_pm_getdefault) return;
+    char cur[128], def[128];
+    read_mstring(name, cur, sizeof cur);
+    read_mstring(g_pm_getdefault(pm), def, sizeof def);
+    int is_default = (cur[0] != '\0' && strcmp(cur, def) == 0);
+    g_pm_setvisible(pm, is_default ? 0 : 1);   /* hide arrow, show contextual */
+}
+
+/* Force the MyGUI cursor visible/hidden (used on FP enter/exit). */
+static void mygui_cursor(int visible)
+{
+    if (!g_pm_setvisible || !g_pm_getinstance) return;
+    void *pm = g_pm_getinstance();
+    if (readable(pm, 8)) g_pm_setvisible(pm, (char)(visible ? 1 : 0));
+}
+
 static void hooked_mainloop(void *gw, float time)
 {
     g_mainloop_orig(gw, time);     /* run the game's frame first */
@@ -661,6 +725,23 @@ __declspec(dllexport) void dllStartPlugin(void)
         ok = (mh == MH_OK);
         logline(ok ? "per-frame hook installed (mainLoop_GPUSensitiveStuff)"
                    : "per-frame hook FAILED (MH_STATUS %d)", (int)mh);
+
+        /* MyGUI cursor: resolve + hook setPointer to hide the default arrow. */
+        HMODULE mygui = GetModuleHandleA(MYGUI_DLL);
+        if (mygui) {
+            g_pm_setvisible  = (pm_setvisible_t)GetProcAddress(mygui, MYGUI_SETVISIBLE_SYM);
+            g_pm_getdefault  = (pm_getdefault_t)GetProcAddress(mygui, MYGUI_GETDEFAULT_SYM);
+            g_pm_getinstance = (pm_getinstance_t)GetProcAddress(mygui, MYGUI_GETINSTANCE_SYM);
+            void *sp = GetProcAddress(mygui, MYGUI_SETPOINTER_SYM);
+            MH_STATUS mh3 = sp ? MH_CreateHook(sp, (void *)hooked_setpointer,
+                                               (void **)&g_pm_setpointer_orig)
+                               : MH_ERROR_NOT_EXECUTABLE;
+            if (mh3 == MH_OK) mh3 = MH_EnableHook(sp);
+            logline(mh3 == MH_OK ? "MyGUI setPointer hook installed (hide default cursor)"
+                                 : "MyGUI setPointer hook FAILED (MH_STATUS %d)", (int)mh3);
+        } else {
+            logline("MyGUIEngine_x64.dll not found — cursor hide disabled");
+        }
     } else {
         logline("MH_Initialize failed (MH_STATUS %d)", (int)mh);
     }

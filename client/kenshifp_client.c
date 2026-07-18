@@ -24,6 +24,8 @@
 #include <string.h>
 #include <math.h>
 #include <setjmp.h>
+#define DIRECTINPUT_VERSION 0x0800
+#include <dinput.h>
 #include "MinHook.h"
 
 /* ---- per-frame hook (proven in KenshiMP, same binary) ---- */
@@ -86,6 +88,16 @@
                                           * right-click walk path. Issues/live-updates a
                                           * Task_Move(0x1d) -- pathfinds, animates, and per-frame
                                           * calls ARE the game's drag-move ("hold right-click"). */
+#define CHAR_TASKHOLDER      0x648       /* Character+0x648 -> task holder */
+#define TASK_CUR             0x68        /* holder+0x68 = current task */
+#define TASK_DESC            0x70        /* task+0x70 = descriptor */
+#define TASKDESC_TYPE        0x44        /* descriptor+0x44 = order type id */
+#define TASK_MOVE_ID         0x1d        /* Task_Move (player walk order) */
+#define RVA_CAM_UPDATE       0x6b0f90u   /* CameraClass::update(bool controlEnabled) -- verified
+                                          * M1. Hooked so the FP eye is re-asserted MID-frame:
+                                          * the game's follow camera lags 30-100u behind the eye
+                                          * while moving, and foliage paging + mesh LOD read that
+                                          * stale position right after update() -> flicker. */
 #define REISSUE_DIST         1.0f        /* re-issue the move order only when the target moved
                                           * this far -- per-frame re-issue restarts the path
                                           * (stutter) and was the earlier crash cause. */
@@ -168,7 +180,8 @@
  * (returns Real=float by value -> XMM0, safe scalar ABI). Kenshi is ~10 units/m. */
 #define OGRE_SETNEARCLIP_SYM "?setNearClipDistance@Frustum@Ogre@@UEAAXM@Z"
 #define OGRE_GETNEARCLIP_SYM "?getNearClipDistance@Frustum@Ogre@@UEBAMXZ"
-#define FP_NEARCLIP       0.5f     /* world units (~5 cm); tune */
+#define FP_NEARCLIP       1.0f     /* world units (~10 cm); clip very-near geometry
+                                    * (own head/hair edges) a tiny bit; tune */
 
 /* ---- MyGUI cursor (hide the default arrow, keep contextual sword/speech) ----
  * The visible cursor is a MyGUI sprite (ShowCursor can't touch it). MyGUI is a
@@ -293,6 +306,7 @@ typedef struct {
 typedef TerrainHit *(*terrain_getheight_t)(void *self, TerrainHit *ret, const Vec3 *pos);
 typedef struct { Vec3 origin; Vec3 dir; } OgreRay;   /* Ogre::Ray, 24 bytes */
 typedef TerrainHit *(*terrain_intersect_t)(void *self, TerrainHit *ret, const OgreRay *ray);
+typedef void (*cam_update_t)(void *cam, char controlEnabled);
 typedef void *(*nearest_town_t)(void *mgr, const Vec3 *pos, int flags);
 typedef void *(*town_getlist_t)(void *town, int listType, void *unused);
 typedef void (*interior_load_t)(void *buildingInterior);
@@ -353,6 +367,16 @@ static int g_movetopos_dead;                   /* set if moveToPosition ever fau
 static terrain_getheight_t g_terrain_getheight; /* Terrain::getHeight (Plugin_Terrain dll) */
 static terrain_intersect_t g_terrain_intersect; /* Terrain::intersect (ray -> ground point) */
 static int g_terrain_dead;                     /* set if the terrain query ever faults */
+static cam_update_t g_cam_update_orig;         /* CameraClass::update trampoline */
+static Vec3 g_last_eye;                        /* FP eye from the previous frame */
+static Quat g_last_ori;                        /* FP look from the previous frame */
+static int  g_have_eye;                        /* re-assert mid-frame only when valid */
+static int  g_calib_wait;                      /* frames until T may recalibrate */
+static void *g_gw_cache;                       /* GameWorld* for the mid-frame hook */
+static float g_frame_dt;                       /* last frame's dt (stutter diag) */
+static Vec3 g_eye_sm;                          /* smoothed eye (X/Z low-pass) */
+static int  g_eye_sm_ok;
+static float g_lead_sm;                        /* smoothed W-ray lead distance */
 static nearest_town_t g_nearest_town;          /* TownManager -> nearest Town */
 static interior_load_t g_interior_load;        /* BuildingInterior lazy load + keep-alive */
 static int g_interiors_dead;                   /* set if the interior preload ever faults */
@@ -526,6 +550,61 @@ static void camera_lock(void *gw)
 static void mygui_cursor(int visible);   /* forward decl (defined below) */
 static void ensure_crosshair(void);
 
+/* --- DirectInput mouse (FP look deltas) ---------------------------------
+ * The one delta source that both FEELS right and COEXISTS with the game:
+ *  - RegisterRawInputDevices stole Wine-dinput's registration -> right-click
+ *    broke (one raw-input target per device per process).
+ *  - Cursor-warp / LL-hook positions ride the laggy coalesced cursor stream
+ *    -> sluggish-then-teleport look.
+ *  - A second NON-EXCLUSIVE BACKGROUND DirectInput mouse device reads the
+ *    same high-rate relative stream the game does; Wine serves both. */
+static IDirectInputDevice8A *g_di_mouse;
+static int g_di_ready;
+static const GUID g_guid_sysmouse =
+    {0x6F1D2B60,0xD5A0,0x11CF,{0xBF,0xC7,0x44,0x45,0x53,0x54,0x00,0x00}};
+static const GUID g_iid_idi8a =
+    {0xBF798030,0x483A,0x4DA2,{0xAA,0x99,0x5D,0x64,0xED,0x36,0x97,0x00}};
+typedef HRESULT (WINAPI *di8create_t)(HINSTANCE, DWORD, REFIID, LPVOID *, LPUNKNOWN);
+
+static void ensure_dinput(void)
+{
+    static int tried;
+    if (g_di_ready || tried >= 600) return;   /* retry through early frames */
+    tried++;
+    HWND w = FindWindowA("OgreD3D11Wnd", NULL);
+    if (!w) w = GetForegroundWindow();
+    if (!w) return;
+    if (!g_di_mouse) {
+        HMODULE dll = LoadLibraryA("dinput8.dll");
+        di8create_t create = dll ? (di8create_t)GetProcAddress(dll, "DirectInput8Create") : NULL;
+        IDirectInput8A *di = NULL;
+        if (!create || FAILED(create(g_hinst, DIRECTINPUT_VERSION, &g_iid_idi8a,
+                                     (void **)&di, NULL)) || !di) { tried = 600; return; }
+        if (FAILED(di->lpVtbl->CreateDevice(di, &g_guid_sysmouse, &g_di_mouse, NULL))
+            || !g_di_mouse) { tried = 600; return; }
+        g_di_mouse->lpVtbl->SetDataFormat(g_di_mouse, &c_dfDIMouse2);
+    }
+    g_di_mouse->lpVtbl->SetCooperativeLevel(g_di_mouse, w,
+                                            DISCL_BACKGROUND | DISCL_NONEXCLUSIVE);
+    if (SUCCEEDED(g_di_mouse->lpVtbl->Acquire(g_di_mouse))) {
+        g_di_ready = 1;
+        logline("DirectInput mouse acquired (non-exclusive background)");
+    }
+}
+
+/* Relative deltas since the previous call (mouse axes default to relative). */
+static int di_get_deltas(LONG *dx, LONG *dy)
+{
+    if (!g_di_ready) return 0;
+    DIMOUSESTATE2 st;
+    if (FAILED(g_di_mouse->lpVtbl->GetDeviceState(g_di_mouse, sizeof st, &st))) {
+        g_di_mouse->lpVtbl->Acquire(g_di_mouse);   /* lost: re-acquire, skip frame */
+        return 0;
+    }
+    *dx = st.lX; *dy = st.lY;
+    return 1;
+}
+
 static void fp_camera_override(void *gw)
 {
     if (!g_ogre_ready) return;
@@ -569,13 +648,23 @@ static void fp_camera_override(void *gw)
             /* cursor free; leave look angle frozen */
         } else {
             if (!g_cursor_hidden) { while (ShowCursor(FALSE) >= 0) { } g_cursor_hidden = 1; }
+            ensure_dinput();
             if (!g_ovr_prev) {
                 g_yaw = 0.0f; g_pitch = 0.0f;   /* FP enter: zero the look */
+                LONG jx, jy; di_get_deltas(&jx, &jy);   /* drain pre-FP motion */
             } else if (!g_ui_prev) {            /* skip the delta on the frame a dialogue closes */
-                g_yaw   -= (float)(cur.x - cx) * LOOK_SENS;   /* mouse right -> look right */
-                g_pitch += (float)(cur.y - cy) * LOOK_SENS;   /* mouse down  -> look down  */
+                /* DirectInput relative deltas (see ensure_dinput comment);
+                 * cursor-warp deltas only as fallback. */
+                LONG rdx, rdy;
+                if (!di_get_deltas(&rdx, &rdy)) {
+                    rdx = cur.x - cx; rdy = cur.y - cy;
+                }
+                g_yaw   -= (float)rdx * LOOK_SENS;   /* mouse right -> look right */
+                g_pitch += (float)rdy * LOOK_SENS;   /* mouse down  -> look down  */
                 if (g_pitch >  1.4f) g_pitch =  1.4f;
                 if (g_pitch < -1.4f) g_pitch = -1.4f;
+            } else {
+                LONG jx, jy; di_get_deltas(&jx, &jy);   /* dialogue frame: discard */
             }
             SetCursorPos(cx, cy);  /* recenter so the cursor never drifts to edges */
         }
@@ -608,7 +697,15 @@ static void fp_camera_override(void *gw)
                          * while idle (the center node has caught up); freeze it during
                          * movement, when the center lags and would corrupt T. Then use
                          * head_game + T -> exact, lag-free tracking. */
-                        if (!g_was_moving) {
+                        /* Calibrate T only after the center node has settled:
+                         * during movement we snap the center to the eye (grass
+                         * paging fix), so give it ~0.5s post-stop to lerp back
+                         * to its vanilla follow point before trusting it. */
+                        if (g_was_moving) {
+                            g_calib_wait = 30;
+                        } else if (g_calib_wait > 0) {
+                            g_calib_wait--;
+                        } else {
                             g_tx = centerW.x - feet.x;
                             g_tz = centerW.z - feet.z;
                             g_have_t = 1;
@@ -629,8 +726,20 @@ static void fp_camera_override(void *gw)
             eyeW.x += sinf(g_yaw) * FP_EYE_FORWARD;
             eyeW.z += cosf(g_yaw) * FP_EYE_FORWARD;
 
+            /* Low-pass the eye X/Z while moving: per-frame Task_Move
+             * retargeting during mouse turns makes the body re-face constantly
+             * and the head bone swings laterally with each correction --
+             * welded raw, that reads as camera jitter. Y stays raw so the
+             * natural gait bob survives. */
+            if (g_was_moving && g_eye_sm_ok) {
+                eyeW.x = g_eye_sm.x + (eyeW.x - g_eye_sm.x) * 0.5f;
+                eyeW.z = g_eye_sm.z + (eyeW.z - g_eye_sm.z) * 0.5f;
+            }
+            g_eye_sm = eyeW; g_eye_sm_ok = 1;
+
             g_dbg_center_y = centerW.y; g_dbg_eye_y = eyeW.y;   /* for tuning */
             g_node_set_dpos(node, &eyeW);
+            g_last_eye = eyeW;             /* for the mid-frame re-assert */
 
             /* [foliage diag] how far is the game's per-frame camera position (used
              * by grass paging) from our FP eye? A large gap => grass pages around
@@ -652,13 +761,18 @@ static void fp_camera_override(void *gw)
         float qp = cosf(g_pitch * 0.5f), sqp = sinf(g_pitch * 0.5f);
         Quat q = { qy * qp, qy * sqp, sqy * qp, -sqy * sqp };
         g_node_set_dori(node, &q);
+        g_last_ori = q; g_have_eye = 1;    /* mid-frame re-assert now armed */
 
         /* FOV: capture default once, then force the FP FOV each frame. */
         void *ogre_cam = *(void **)((uintptr_t)cam + CC_CAMERA);
         if (g_cam_set_fovy && readable(ogre_cam, 8)) {
             if (!g_fov_saved && g_cam_get_fovy) {
                 const float *d = g_cam_get_fovy(ogre_cam);
-                if (readable((void *)d, 4)) { g_fov_default = *d; g_fov_saved = 1; }
+                /* sanity range ~17..115 deg: never trust a transitional value,
+                 * it would get restored on exit and poison future captures */
+                if (readable((void *)d, 4) && *d > 0.30f && *d < 2.0f) {
+                    g_fov_default = *d; g_fov_saved = 1;
+                }
             }
             float rad = FP_FOV_DEG * DEG2RAD;
             g_cam_set_fovy(ogre_cam, &rad);
@@ -681,15 +795,17 @@ static void fp_camera_override(void *gw)
         g_cursor_hidden = 0; g_ui_prev = 0; g_ui_open = 0;
         mygui_cursor(1);                        /* FP exit: restore the game cursor */
         if (g_crosshair && g_widget_setvisible) g_widget_setvisible(g_crosshair, 0);
+        g_have_eye = 0;                         /* stop the mid-frame re-assert */
+        g_eye_sm_ok = 0; g_lead_sm = 0.0f;      /* reset smoothing state */
+        /* Restore FOV/near-clip but KEEP the cached defaults (g_*_saved stays
+         * set): re-capturing on every FP enter meant one bad capture (mid-zoom
+         * transition) got restored on exit, then read back as "default" on the
+         * next enter -- permanently poisoned FOV. Capture once per session. */
         void *ogre_cam = *(void **)((uintptr_t)cam + CC_CAMERA);
-        if (g_fov_saved && g_cam_set_fovy && readable(ogre_cam, 8)) {
+        if (g_fov_saved && g_cam_set_fovy && readable(ogre_cam, 8))
             g_cam_set_fovy(ogre_cam, &g_fov_default);
-            g_fov_saved = 0;
-        }
-        if (g_nearclip_saved && g_cam_set_nearclip && readable(ogre_cam, 8)) {
+        if (g_nearclip_saved && g_cam_set_nearclip && readable(ogre_cam, 8))
             g_cam_set_nearclip(ogre_cam, g_nearclip_default);
-            g_nearclip_saved = 0;
-        }
         Quat ident = { 1.0f, 0.0f, 0.0f, 0.0f };
         g_node_set_ori(node, &ident);
     }
@@ -829,6 +945,7 @@ static void fp_movement(void *gw, float dt)
             }
             g_was_moving = 0;
             g_have_dest = 0;
+            g_lead_sm = 0.0f;           /* fresh lead estimate on next move */
         }
         /* Orient-to-control: while standing still, rotate the body to face the
          * camera look direction via faceDirection (CharMovement vtable slot 6).
@@ -886,15 +1003,26 @@ static void fp_movement(void *gw, float dt)
         if (terrain_ray(&ro, &rd, &hitp)) {
             float vx = hitp.x - here.x, vz = hitp.z - here.z;
             float hd = sqrtf(vx * vx + vz * vz);
-            if (hd > dist) {              /* looking far: cap for speed control */
-                tgt.x = here.x + vx * (dist / hd);
-                tgt.z = here.z + vz * (dist / hd);
+            if (hd > 0.5f) {
+                if (hd > dist) hd = dist; /* cap: scrollwheel speed still rules */
+                if (hd < 25.0f) hd = 25.0f; /* min lead: never ARRIVE mid-hold --
+                                             * arrival completes the task and the
+                                             * restart gap reads as stutter/stall
+                                             * (broke slope climbing) */
+                /* Smooth the lead distance: the raw ray distance jumps every
+                 * frame while the view sweeps terrain, and Kenshi scales run
+                 * speed by target distance -> surge/brake = jittery mouse feel
+                 * while moving. Converges in ~0.1s so steep-face near targeting
+                 * (the slope fix) engages promptly. */
+                if (g_lead_sm <= 0.0f) g_lead_sm = hd;
+                g_lead_sm += (hd - g_lead_sm) * 0.3f;
+                float hl = sqrtf(vx * vx + vz * vz);
+                tgt.x = here.x + (vx / hl) * g_lead_sm;
+                tgt.z = here.z + (vz / hl) * g_lead_sm;
                 tgt.y = here.y;
                 terrain_clamp(&tgt);
-            } else {
-                tgt = hitp;               /* the exact point you're looking at */
+                via_ray = 1;
             }
-            via_ray = 1;
         }
     }
     if (!via_ray) {
@@ -904,7 +1032,10 @@ static void fp_movement(void *gw, float dt)
 
     /* Primary drive: the REAL right-click walk order (Task_Move) -- pathfinds
      * over slopes, animates, triggers get-up when downed. Per-frame call = the
-     * game's own drag-move. Fallback to the raw mover if it ever faults. */
+     * game's own drag-move (live destination update). NOTE: attempts to
+     * throttle this via current-task-type detection (Character+0x648 chain)
+     * made turning chunky (sluggish-then-teleport camera) -- the detection
+     * offsets are unreliable; keep it unconditional like vanilla drag-move. */
     if (!try_move_to_pos(pc, &tgt))
         g_charmove_setdest(mv, &tgt, UPDATE_PRIORITY_HIGH, 1);
 
@@ -1073,13 +1204,44 @@ static void fp_load_nearby_interiors(void *gw)
     }
 }
 
+/* CameraClass::update hook: right after the game's follow camera runs, compute
+ * and apply the FP camera FRESH (fp_camera_override), so every consumer later
+ * in the same frame -- foliage paging, mesh LOD, shadow cascades, culling,
+ * render -- sees ONE consistent, current camera. (Re-asserting last frame's
+ * eye here instead caused shadow shimmer on distant meshes + rotation jitter
+ * while moving: mid-frame passes used a one-frame-stale camera vs the render.)
+ * Also snap the CENTER (look-at/focus) node to the eye while moving: it is the
+ * lagging source grass paging keys off (proven fix for underfoot pop-in). At
+ * idle the center stays vanilla for the floating-origin T calibration. */
+static void hooked_cam_update(void *cam, char controlEnabled)
+{
+    g_cam_update_orig(cam, controlEnabled);
+    /* Fully inert unless FP is (or was just) engaged: at the main menu / load
+     * screens this hook fires while the game is half-initialised, and running
+     * the override there crashed the title screen. */
+    if (!g_fp_mode && !g_ovr_prev) return;
+    if (g_gw_cache) fp_camera_override(g_gw_cache);   /* fresh eye/ori, mid-frame */
+    if (!g_fp_mode || !g_have_eye) return;
+    if (!readable(cam, CC_FREECAM + 1)) return;
+    if (*(unsigned char *)((uintptr_t)cam + CC_FREECAM)) return;   /* free-cam: hands off */
+    if (g_was_moving && g_node_set_dpos) {
+        void *center = *(void **)((uintptr_t)cam + CC_CENTER);
+        if (readable(center, 8)) g_node_set_dpos(center, &g_last_eye);
+    }
+}
+
 static void hooked_mainloop(void *gw, float time)
 {
+    g_gw_cache = gw;               /* CameraClass::update fires inside the frame */
+    g_frame_dt = time;             /* stutter diag */
     g_mainloop_orig(gw, time);     /* run the game's frame first */
 
     poll_input();                  /* every frame: catch toggle edges */
     if (gw) camera_lock(gw);       /* every frame: assert/release the lock */
-    if (gw) fp_camera_override(gw);/* every frame: force FP eye + mouse-look */
+    /* Camera now runs mid-frame via the CameraClass::update hook (consistent
+     * camera for shadows/LOD/foliage/render); this is only a fallback if that
+     * hook failed to install. */
+    if (gw && !g_cam_update_orig) fp_camera_override(gw);
     if (gw) fp_movement(gw, time); /* every frame: WASD -> custom motion drive */
     if (gw) fp_load_nearby_interiors(gw); /* ~1 Hz: preload nearby building interiors */
 
@@ -1091,8 +1253,8 @@ static void hooked_mainloop(void *gw, float time)
 }
 
 /* Low-level mouse hook: capture the wheel ourselves (the game clears its own
- * mWheel before our per-frame hook can read it). Runs on the thread that
- * installed it (main thread) as it pumps messages. */
+ * mWheel before our per-frame hook can read it). Look deltas come from the
+ * DirectInput device instead (see ensure_dinput). */
 static LRESULT CALLBACK mouse_ll(int code, WPARAM wp, LPARAM lp)
 {
     if (code == HC_ACTION && wp == WM_MOUSEWHEEL) {
@@ -1132,6 +1294,9 @@ __declspec(dllexport) void dllStartPlugin(void)
     g_mouse_hook = SetWindowsHookExA(WH_MOUSE_LL, mouse_ll, g_hinst, 0);
     logline(g_mouse_hook ? "mouse wheel hook installed" : "mouse wheel hook FAILED (err %lu)",
             GetLastError());
+
+    /* FP look deltas: DirectInput non-exclusive device, created lazily on the
+     * first FP frame (the game window must exist). See ensure_dinput. */
     /* MSVC std::string SSO for the head bone name (size<=15 -> inline buffer). */
     memset(g_head_bone, 0, sizeof g_head_bone);
     memcpy(g_head_bone, HEAD_BONE_NAME, sizeof(HEAD_BONE_NAME) - 1);
@@ -1166,6 +1331,16 @@ __declspec(dllexport) void dllStartPlugin(void)
         ok = (mh == MH_OK);
         logline(ok ? "per-frame hook installed (mainLoop_GPUSensitiveStuff)"
                    : "per-frame hook FAILED (MH_STATUS %d)", (int)mh);
+
+        /* CameraClass::update hook: mid-frame FP-eye re-assert (foliage/LOD fix). */
+        {
+            void *cu = (void *)(g_base + RVA_CAM_UPDATE);
+            MH_STATUS mh2 = MH_CreateHook(cu, (void *)hooked_cam_update,
+                                          (void **)&g_cam_update_orig);
+            if (mh2 == MH_OK) mh2 = MH_EnableHook(cu);
+            logline(mh2 == MH_OK ? "camera update hook installed (mid-frame eye)"
+                                 : "camera update hook FAILED (MH_STATUS %d)", (int)mh2);
+        }
 
         /* MyGUI cursor: resolve + hook setPointer to hide the default arrow. */
         HMODULE mygui = GetModuleHandleA(MYGUI_DLL);

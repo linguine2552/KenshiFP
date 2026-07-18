@@ -151,6 +151,19 @@
 #define MYGUI_GETDEFAULT_SYM  "?getDefaultPointer@PointerManager@MyGUI@@QEBAAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@XZ"
 #define MYGUI_GETINSTANCE_SYM "?getInstancePtr@?$Singleton@VPointerManager@MyGUI@@@MyGUI@@SAPEAVPointerManager@2@XZ"
 
+/* ---- crosshair (replace the hidden default cursor with our image) ----
+ * Create a MyGUI ImageBox at screen center showing crosshair.png (deployed to
+ * <install>/kenshifp/, registered as an Ogre resource location). Show it while
+ * the pointer is the default (gameplay, looking at nothing); the contextual
+ * sword/speech cursors still render via the normal (un-hidden) pointer. */
+#define MYGUI_GUI_GETINSTANCE_SYM "?getInstancePtr@?$Singleton@VGui@MyGUI@@@MyGUI@@SAPEAVGui@2@XZ"
+#define MYGUI_CREATEWIDGET_SYM "?createWidgetT@Gui@MyGUI@@QEAAPEAVWidget@2@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@0HHHHUAlign@2@00@Z"
+#define MYGUI_SETIMAGETEX_SYM  "?setImageTexture@ImageBox@MyGUI@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z"
+#define MYGUI_WIDGET_SETVIS_SYM "?setVisible@Widget@MyGUI@@UEAAX_N@Z"
+#define OGRE_RGM_GETSINGLETON_SYM "?getSingletonPtr@ResourceGroupManager@Ogre@@SAPEAV12@XZ"
+#define OGRE_RGM_ADDLOCATION_SYM  "?addResourceLocation@ResourceGroupManager@Ogre@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@00_N1@Z"
+#define CROSSHAIR_SIZE    40         /* px on screen; tune */
+
 /* ---- M2 first-person (Ogre node override) ----
  * Scene graph (from the ctor): root -> center(+0x58) -> node(+0x70) -> camera
  * (+0x68 attached). CameraClass::update keeps `center` at the character and
@@ -223,6 +236,15 @@ typedef void (*pm_setpointer_t)(void *pm, const void *name_stdstr);
 typedef void (*pm_setvisible_t)(void *pm, char visible);
 typedef const void *(*pm_getdefault_t)(void *pm);   /* returns std::string* */
 typedef void *(*pm_getinstance_t)(void);
+typedef void *(*gui_getinstance_t)(void);
+typedef void *(*gui_createwidget_t)(void *gui, const void *type, const void *skin,
+                                    int l, int t, int w, int h, int align,
+                                    const void *layer, const void *name);
+typedef void (*imgbox_setimage_t)(void *imgbox, const void *texname);
+typedef void (*widget_setvisible_t)(void *widget, char visible);
+typedef void *(*rgm_getsingleton_t)(void);
+typedef void (*rgm_addlocation_t)(void *rgm, const void *name, const void *loctype,
+                                  const void *group, char recursive, char readonly);
 typedef void (*charmove_setdest_t)(void *mv, const Vec3 *dest, int pri, char shift);
 typedef void (*face_direction_t)(void *mv, const Vec3 *dir);
 typedef void (*manual_move_t)(void *mv, const Vec3 *desiredMotion);
@@ -264,6 +286,14 @@ static pm_setpointer_t g_pm_setpointer_orig;   /* MinHook trampoline */
 static pm_setvisible_t g_pm_setvisible;
 static pm_getdefault_t g_pm_getdefault;
 static pm_getinstance_t g_pm_getinstance;
+static gui_getinstance_t g_gui_getinstance;
+static gui_createwidget_t g_gui_createwidget;
+static imgbox_setimage_t g_imgbox_setimage;
+static widget_setvisible_t g_widget_setvisible;
+static rgm_getsingleton_t g_rgm_getsingleton;
+static rgm_addlocation_t g_rgm_addlocation;
+static void *g_crosshair;          /* the ImageBox widget */
+static int g_pointer_default = 1;  /* current MyGUI pointer is the default (arrow) */
 static charmove_setdest_t g_charmove_setdest;  /* CharMovement::setDestination (halt only) */
 static DWORD g_last_move_ms;
 static int g_was_moving;
@@ -431,6 +461,7 @@ static void camera_lock(void *gw)
  * orientation. Mouse-look v1: absolute cursor position maps to yaw/pitch
  * (read-only, no cursor recenter -> no fight with the engine's own cursor). */
 static void mygui_cursor(int visible);   /* forward decl (defined below) */
+static void ensure_crosshair(void);
 
 static void fp_camera_override(void *gw)
 {
@@ -458,7 +489,10 @@ static void fp_camera_override(void *gw)
         g_dbg_control = control;
         int ui_open = (control == 0);
         g_ui_open = ui_open;                    /* read by the setPointer hook */
-        if (!g_ovr_prev) mygui_cursor(0);       /* FP enter: hide the default arrow */
+        if (!g_ovr_prev) { mygui_cursor(0); g_pointer_default = 1; }  /* FP enter */
+        ensure_crosshair();
+        if (g_crosshair && g_widget_setvisible)
+            g_widget_setvisible(g_crosshair, (g_pointer_default && !ui_open) ? 1 : 0);
 
         if (ui_open) {
             if (g_cursor_hidden) { while (ShowCursor(TRUE) < 0) { } g_cursor_hidden = 0; }
@@ -564,6 +598,7 @@ static void fp_camera_override(void *gw)
         while (ShowCursor(TRUE) < 0) { }
         g_cursor_hidden = 0; g_ui_prev = 0; g_ui_open = 0;
         mygui_cursor(1);                        /* FP exit: restore the game cursor */
+        if (g_crosshair && g_widget_setvisible) g_widget_setvisible(g_crosshair, 0);
         void *ogre_cam = *(void **)((uintptr_t)cam + CC_CAMERA);
         if (g_fov_saved && g_cam_set_fovy && readable(ogre_cam, 8)) {
             g_cam_set_fovy(ogre_cam, &g_fov_default);
@@ -657,19 +692,68 @@ static void read_mstring(const void *str, char *out, size_t outsz)
     out[size] = '\0';
 }
 
-/* MyGUI PointerManager::setPointer hook: while FP is on, hide the cursor when it
- * becomes the default (arrow), show it for any contextual pointer (sword/speech). */
+/* Build an MSVC std::string (SSO) in a 32-byte buffer. len must be < 16. */
+static void make_mstr(unsigned char *b32, const char *s)
+{
+    memset(b32, 0, 32);
+    size_t len = strlen(s);
+    if (len > 15) len = 15;
+    memcpy(b32, s, len);
+    *(size_t *)(b32 + 0x10) = len;
+    *(size_t *)(b32 + 0x18) = 15;   /* SSO capacity */
+}
+
+/* Lazily create the crosshair ImageBox once MyGUI is up (retried each FP enter
+ * until it succeeds). Registers the image folder as an Ogre resource location. */
+static void ensure_crosshair(void)
+{
+    if (g_crosshair) return;
+    if (!g_gui_getinstance || !g_gui_createwidget || !g_imgbox_setimage
+        || !g_widget_setvisible) return;
+    void *gui = g_gui_getinstance();
+    if (!readable(gui, 8)) return;   /* MyGUI not initialised yet */
+
+    if (g_rgm_getsingleton && g_rgm_addlocation) {
+        void *rgm = g_rgm_getsingleton();
+        if (readable(rgm, 8)) {
+            unsigned char loc[32], ft[32], grp[32];
+            make_mstr(loc, "kenshifp"); make_mstr(ft, "FileSystem"); make_mstr(grp, "General");
+            g_rgm_addlocation(rgm, loc, ft, grp, 0, 1);
+        }
+    }
+
+    int cx = GetSystemMetrics(SM_CXSCREEN), cy = GetSystemMetrics(SM_CYSCREEN);
+    if (cx <= 0) cx = 1920;
+    if (cy <= 0) cy = 1080;
+    unsigned char type[32], skin[32], layer[32], name[32], tex[32];
+    make_mstr(type, "ImageBox"); make_mstr(skin, ""); make_mstr(layer, "Pointer");
+    make_mstr(name, "FPCrosshair"); make_mstr(tex, "crosshair.png");
+    void *w = g_gui_createwidget(gui, type, skin,
+                                 cx / 2 - CROSSHAIR_SIZE / 2, cy / 2 - CROSSHAIR_SIZE / 2,
+                                 CROSSHAIR_SIZE, CROSSHAIR_SIZE, 0 /*Align::Center*/, layer, name);
+    if (readable(w, 8)) {
+        g_imgbox_setimage(w, tex);
+        g_widget_setvisible(w, 0);
+        g_crosshair = w;
+        logline("crosshair widget created %p", w);
+    }
+}
+
+/* MyGUI PointerManager::setPointer hook: while FP is on, hide the default (arrow)
+ * cursor — we show our crosshair instead — but keep contextual pointers
+ * (sword/speech) visible. */
 static void hooked_setpointer(void *pm, const void *name)
 {
     g_pm_setpointer_orig(pm, name);
     if (!g_fp_mode || !g_pm_setvisible) return;
-    if (g_ui_open) { g_pm_setvisible(pm, 1); return; }   /* dialogue: keep cursor */
+    if (g_ui_open) { g_pm_setvisible(pm, 1); g_pointer_default = 0; return; }
     if (!g_pm_getdefault) return;
     char cur[128], def[128];
     read_mstring(name, cur, sizeof cur);
     read_mstring(g_pm_getdefault(pm), def, sizeof def);
     int is_default = (cur[0] != '\0' && strcmp(cur, def) == 0);
-    g_pm_setvisible(pm, is_default ? 0 : 1);   /* hide arrow, show contextual */
+    g_pm_setvisible(pm, is_default ? 0 : 1);   /* hide arrow (crosshair instead), show contextual */
+    g_pointer_default = is_default;
 }
 
 /* Force the MyGUI cursor visible/hidden (used on FP enter/exit). */
@@ -762,6 +846,15 @@ __declspec(dllexport) void dllStartPlugin(void)
             g_pm_setvisible  = (pm_setvisible_t)GetProcAddress(mygui, MYGUI_SETVISIBLE_SYM);
             g_pm_getdefault  = (pm_getdefault_t)GetProcAddress(mygui, MYGUI_GETDEFAULT_SYM);
             g_pm_getinstance = (pm_getinstance_t)GetProcAddress(mygui, MYGUI_GETINSTANCE_SYM);
+            g_gui_getinstance = (gui_getinstance_t)GetProcAddress(mygui, MYGUI_GUI_GETINSTANCE_SYM);
+            g_gui_createwidget = (gui_createwidget_t)GetProcAddress(mygui, MYGUI_CREATEWIDGET_SYM);
+            g_imgbox_setimage = (imgbox_setimage_t)GetProcAddress(mygui, MYGUI_SETIMAGETEX_SYM);
+            g_widget_setvisible = (widget_setvisible_t)GetProcAddress(mygui, MYGUI_WIDGET_SETVIS_SYM);
+            HMODULE ogremod = GetModuleHandleA("OgreMain_x64.dll");
+            if (ogremod) {
+                g_rgm_getsingleton = (rgm_getsingleton_t)GetProcAddress(ogremod, OGRE_RGM_GETSINGLETON_SYM);
+                g_rgm_addlocation  = (rgm_addlocation_t)GetProcAddress(ogremod, OGRE_RGM_ADDLOCATION_SYM);
+            }
             void *sp = GetProcAddress(mygui, MYGUI_SETPOINTER_SYM);
             MH_STATUS mh3 = sp ? MH_CreateHook(sp, (void *)hooked_setpointer,
                                                (void **)&g_pm_setpointer_orig)

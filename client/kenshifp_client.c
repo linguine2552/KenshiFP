@@ -89,13 +89,9 @@
 #define MV_DESIRED_SPEED    0xBC   /* float (keep == current so accel logic doesn't idle us) */
 #define MV_WALK_SPEED       0xC0   /* float */
 #define MV_FACEDIR_VTOFF    6      /* faceDirection = live vtable slot 6 (+0x30) */
-/* CharMovement::update(float) = RVA 0x65ffa0 (vtable slot 11). We MinHook it and,
- * right after the engine's update ran (before render), re-set the player char's
- * facing to the camera look direction — the only point where the override sticks
- * for rendering (the engine sets facing during update, in mainLoop, before our
- * per-frame hook). Body still moves via the order path (animates + ground-clamps
- * via Havok); only the rendered facing is overridden -> orient-to-control. */
-#define RVA_CHARMOVE_UPDATE 0x65ffa0u
+#define MV_MANUALMOVE_VTOFF 14     /* manualMovement(desiredMotion) = slot 14 (+0x70);
+                                    * engine-driven velocity move (combat-strafe path):
+                                    * ground-clamps + animates + NO auto-turn */
 /* CharMovement OVERRIDES the position setters at higher slots than the
  * AbstractMovementBase ones (+0x20/0x28 are the base-class members — calling
  * slot 5 did nothing). The real overrides (header +0xB8/0xC0/0xC8):
@@ -196,7 +192,7 @@ typedef void (*cam_set_fovy_t)(void *camera, const float *rad);
 typedef const float *(*cam_get_fovy_t)(void *camera);
 typedef void (*charmove_setdest_t)(void *mv, const Vec3 *dest, int pri, char shift);
 typedef void (*face_direction_t)(void *mv, const Vec3 *dir);
-typedef void (*charmove_update_t)(void *mv, float dt);
+typedef void (*manual_move_t)(void *mv, const Vec3 *desiredMotion);
 /* _setPositionAndTeleport(const Vec3& p, int floor): (this RCX, Vec3* RDX, floor R8) */
 typedef void (*set_pos_tele_t)(void *mv, const Vec3 *pos, int floor);
 typedef void (*node_set_dpos_t)(void *node, const Vec3 *v);   /* world _setDerivedPosition */
@@ -227,9 +223,7 @@ static cam_set_fovy_t g_cam_set_fovy;
 static cam_get_fovy_t g_cam_get_fovy;
 static int g_fov_saved;
 static float g_fov_default;
-static charmove_setdest_t g_charmove_setdest;  /* CharMovement::setDestination */
-static charmove_update_t g_charmove_update_orig;  /* MinHook trampoline */
-static void *g_player_mv;                       /* cached player CharMovement* */
+static charmove_setdest_t g_charmove_setdest;  /* CharMovement::setDestination (halt only) */
 static DWORD g_last_move_ms;
 static int g_was_moving;
 static float g_last_move_dir;      /* heading of last issued destination (radians) */
@@ -508,7 +502,6 @@ static void fp_movement(void *gw, float dt)
     void *mv = readable((void *)((uintptr_t)pc + CHAR_MOVEMENT), 8)
         ? *(void **)((uintptr_t)pc + CHAR_MOVEMENT) : NULL;
     if (!readable(mv, 8)) return;
-    g_player_mv = mv;              /* cache for the update-hook facing override */
 
     int w = (GetAsyncKeyState(VK_W) & 0x8000) != 0;
     int s = (GetAsyncKeyState(VK_S) & 0x8000) != 0;
@@ -552,21 +545,6 @@ static void fp_movement(void *gw, float dt)
     Vec3 tgt = { here.x + dx * dist, here.y, here.z + dz * dist };
     g_charmove_setdest(mv, &tgt, UPDATE_PRIORITY_HIGH, 0);
     g_was_moving = 1;
-}
-
-/* Trampoline on CharMovement::update. After the engine's update (which set the
- * facing during the frame), override the PLAYER character's facing to the camera
- * look direction — this is the point where it sticks for rendering. */
-static void hooked_charmove_update(void *mvthis, float dt)
-{
-    g_charmove_update_orig(mvthis, dt);
-    if (!g_fp_mode || mvthis != g_player_mv || !g_player_mv) return;
-    if (!in_module(*(void ***)mvthis)) return;
-    void **vt = *(void ***)mvthis;
-    if (!readable(&vt[MV_FACEDIR_VTOFF], 8) || !in_module(vt[MV_FACEDIR_VTOFF])) return;
-    face_direction_t face = (face_direction_t)vt[MV_FACEDIR_VTOFF];
-    Vec3 lookDir = { sinf(g_yaw), 0.0f, cosf(g_yaw) };
-    face(mvthis, &lookDir);
 }
 
 static void hooked_mainloop(void *gw, float time)
@@ -625,13 +603,6 @@ __declspec(dllexport) void dllStartPlugin(void)
         ok = (mh == MH_OK);
         logline(ok ? "per-frame hook installed (mainLoop_GPUSensitiveStuff)"
                    : "per-frame hook FAILED (MH_STATUS %d)", (int)mh);
-
-        void *upd = (void *)(g_base + RVA_CHARMOVE_UPDATE);
-        MH_STATUS mh2 = MH_CreateHook(upd, (void *)hooked_charmove_update,
-                                      (void **)&g_charmove_update_orig);
-        if (mh2 == MH_OK) mh2 = MH_EnableHook(upd);
-        logline(mh2 == MH_OK ? "CharMovement::update hook installed (facing override)"
-                             : "CharMovement::update hook FAILED (MH_STATUS %d)", (int)mh2);
     } else {
         logline("MH_Initialize failed (MH_STATUS %d)", (int)mh);
     }

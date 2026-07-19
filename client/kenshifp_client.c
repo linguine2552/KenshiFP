@@ -81,6 +81,9 @@
  * NOTE: KenshiCoop found player chars can ignore a bare CharMovement dest; if so
  * this won't move them and we'll switch to the Character-level order path. */
 #define CHAR_MOVEMENT      0x640   /* Character::movement (CharMovement*) */
+#define CHAR_ANIM          0x448   /* Character::animation (AnimationClass*) */
+#define ANIM_SKELETON      0xB8    /* AnimationClass::skeleton (Ogre::OldSkeletonInstance*) */
+#define GW_FRAMESPEED      0x700   /* GameWorld::frameSpeedMult (float); 1.0 = 1x */
 #define RVA_CHARMOVE_SETDEST 0x661270u   /* CharMovement::setDestination (raw move; no navmesh) */
 #define RVA_CHAR_SETDEST     0x5c84e0u   /* NOT setDestination: teleport+facing placement
                                           * (3rd arg = Ogre::Quaternion* facing). Unused. */
@@ -258,6 +261,10 @@
  * world position to place the eye = centerWorld + (head-feet) offset. */
 #define OGRE_SETDPOS_SYM  "?_setDerivedPosition@Node@Ogre@@QEAAXAEBVVector3@2@@Z"
 #define OGRE_GETDPOS_SYM  "?_getDerivedPosition@Node@Ogre@@QEBA?AVVector3@2@XZ"
+/* Ogre::OldSkeletonInstance::disableBone(std::string name, bool disable) --
+ * Kenshi's own decapitation call; disabling a bone collapses its mesh and
+ * PERSISTS across the per-frame animation update. Version-independent export. */
+#define OGRE_DISABLEBONE_SYM "?disableBone@OldSkeletonInstance@Ogre@@QEAAXV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@_N@Z"
 
 /* ---- head-bone tracking (real first-person feel: eye = head bone) ----
  * Character::getBoneWorldPosition(this, retVec3, std::string* name) — RVA
@@ -483,6 +490,10 @@ static node_set_ori_t g_node_set_ori;   /* Ogre::Node::setOrientation (local) */
 static node_set_dori_t g_node_set_dori; /* Ogre::Node::_setDerivedOrientation (world) */
 static node_set_dpos_t g_node_set_dpos; /* Ogre::Node::_setDerivedPosition (world) */
 static node_get_dpos_t g_node_get_dpos; /* Ogre::Node::_getDerivedPosition (world) */
+typedef void (*disable_bone_t)(void *skel, const void *name /*std::string*/, char disable);
+static disable_bone_t g_disable_bone;   /* OldSkeletonInstance::disableBone */
+static int g_head_hidden;               /* our head-hide state (>1x fast-forward) */
+static void *g_head_hidden_char;        /* the exact character whose head we hid */
 static get_bone_world_t g_get_bone_world;   /* Character::getBoneWorldPosition */
 static unsigned char g_head_bone[32];   /* MSVC std::string "Bip01 Head" (SSO) */
 static int g_ogre_ready;
@@ -920,16 +931,11 @@ static void fp_camera_override(void *gw)
             eyeW.x += sinf(g_yaw) * FP_EYE_FORWARD;
             eyeW.z += cosf(g_yaw) * FP_EYE_FORWARD;
 
-            /* Low-pass the eye X/Z while moving: per-frame Task_Move
-             * retargeting during mouse turns makes the body re-face constantly
-             * and the head bone swings laterally with each correction --
-             * welded raw, that reads as camera jitter. Y stays raw so the
-             * natural gait bob survives. */
-            if (g_was_moving && g_eye_sm_ok) {
-                eyeW.x = g_eye_sm.x + (eyeW.x - g_eye_sm.x) * 0.5f;
-                eyeW.z = g_eye_sm.z + (eyeW.z - g_eye_sm.z) * 0.5f;
-            }
-            g_eye_sm = eyeW; g_eye_sm_ok = 1;
+            /* Eye follows the head bone RAW (no horizontal smoothing) so the
+             * camera stays welded through the run animation's forward lean --
+             * a low-pass here made the camera lag the leaning head, most
+             * visible at high game speed. Input smoothness comes from
+             * DirectInput now, not from damping the eye path. */
 
             g_dbg_center_y = centerW.y; g_dbg_eye_y = eyeW.y;   /* for tuning */
             g_node_set_dpos(node, &eyeW);
@@ -1503,6 +1509,48 @@ static void fp_load_nearby_interiors(void *gw)
     }
 }
 
+/* Collapse (disable=1) or restore (0) a character's head bone via Kenshi's own
+ * decapitation call. VEH-guarded. Returns 1 on a completed call. */
+static int set_head_disabled(void *pc, int disable)
+{
+    if (!g_disable_bone || !pc) return 0;
+    void *anim = readable((void *)((uintptr_t)pc + CHAR_ANIM), 8)
+        ? *(void **)((uintptr_t)pc + CHAR_ANIM) : NULL;
+    if (!readable(anim, ANIM_SKELETON + 8)) return 0;
+    void *skel = *(void **)((uintptr_t)anim + ANIM_SKELETON);
+    if (!readable(skel, 8)) return 0;
+    if (setjmp(g_guard_jb)) {
+        g_disable_bone = NULL;
+        logline("disableBone FAULTED -- head-hide disabled for this session");
+        return 0;
+    }
+    unsigned char name[32];
+    make_mstr(name, "Bip01 Head");   /* std::string by value; SSO -> callee dtor is a no-op */
+    g_guard_armed = 1;
+    g_disable_bone(skel, name, disable ? 1 : 0);
+    g_guard_armed = 0;
+    return 1;
+}
+
+/* Hide the player's head while fast-forwarding (>1x game speed): at high speed
+ * the head-welded camera visibly lags the head mesh. Body + shadow stay; only
+ * the head vanishes, restored at 1x or on FP exit. Runs every frame so the
+ * exit/speed-drop restore always fires. */
+static void fp_head_visibility(void *gw)
+{
+    if (!g_disable_bone) return;
+    float speed = readable((void *)((uintptr_t)gw + GW_FRAMESPEED), 4)
+        ? *(float *)((uintptr_t)gw + GW_FRAMESPEED) : 1.0f;
+    void *pc = first_player_char(gw);
+    int want = g_fp_mode && pc && speed > 1.05f;
+    if (want && !g_head_hidden) {
+        if (set_head_disabled(pc, 1)) { g_head_hidden = 1; g_head_hidden_char = pc; }
+    } else if (!want && g_head_hidden) {
+        set_head_disabled(g_head_hidden_char ? g_head_hidden_char : pc, 0);
+        g_head_hidden = 0; g_head_hidden_char = NULL;
+    }
+}
+
 /* CameraClass::update hook: right after the game's follow camera runs, compute
  * and apply the FP camera FRESH (fp_camera_override), so every consumer later
  * in the same frame -- foliage paging, mesh LOD, shadow cascades, culling,
@@ -1545,6 +1593,7 @@ static void hooked_mainloop(void *gw, float time)
     if (gw && !g_cam_update_orig) fp_camera_override(gw);
     if (gw) fp_movement(gw, time); /* every frame: WASD -> custom motion drive */
     if (gw) fp_load_nearby_interiors(gw); /* ~1 Hz: preload nearby building interiors */
+    if (gw) fp_head_visibility(gw);       /* hide head while fast-forwarding (>1x) */
 
     DWORD now = GetTickCount();
     if (gw && (now - g_last_tick_ms) >= 1000) {   /* 1 Hz observation log */
@@ -1573,22 +1622,15 @@ static DWORD WINAPI hook_watchdog(void *unused)
         if (main_flow && !main_ok) { main_ok = 1; logline("watchdog: per-frame hook LIVE"); }
         if (cam_flow && !cam_ok)   { cam_ok = 1;  logline("watchdog: camera-update hook LIVE"); }
         if (main_flow) continue;                 /* healthy */
-        /* per-frame hook not firing. Report ONCE which hooks are alive (RE_Kenshi
-         * coexistence diagnostic), try a few re-arms, then stay quiet -- no point
-         * flooding the log every 2s forever. */
-        if (rearms < 6)
+        /* Per-frame hook not firing. DIAGNOSTIC ONLY -- do NOT re-arm: a
+         * non-firing hook never starts firing on re-install (wrong address or
+         * diverted call), and re-arming churned MinHook state for no gain.
+         * Report a few times, then stay quiet. */
+        if (rearms < 3) {
+            rearms++;
             logline("watchdog: mainloop SILENT (main hb=%ld cam hb=%ld) -- cam %s",
                     (long)hm, (long)hc, cam_flow ? "FIRING" : "silent");
-        if (rearms >= 5) continue;               /* re-arm is proven useless if it
-                                                  * never takes; stop the churn */
-        rearms++;
-        MH_DisableHook(g_mainloop_target);
-        MH_RemoveHook(g_mainloop_target);
-        g_mainloop_orig = NULL;
-        MH_STATUS s = MH_CreateHook(g_mainloop_target, (void *)hooked_mainloop,
-                                    (void **)&g_mainloop_orig);
-        if (s == MH_OK) s = MH_EnableHook(g_mainloop_target);
-        logline("watchdog: re-armed per-frame hook (attempt %d, status %d)", rearms, (int)s);
+        }
     }
 }
 
@@ -1631,8 +1673,12 @@ static LRESULT CALLBACK mouse_ll(int code, WPARAM wp, LPARAM lp)
  * KenshiLib.AddHook does create+enable in one call (SUCCESS==0). */
 static int install_hook(void *target, void *detour, void **original)
 {
-    if (g_klib_addhook)
-        return g_klib_addhook(target, detour, original) == 0;
+    /* Always MinHook. The KenshiLib AddHook "cooperative" path installed but
+     * the detours never fired for some RE_Kenshi users, and the watchdog's
+     * MinHook re-arm on a KenshiLib-installed hook mixed backends and crashed.
+     * Our source analysis shows MinHook does NOT conflict with RE_Kenshi
+     * (disjoint targets, module-private state), and correct 1.0.65 addresses
+     * over MinHook are the proven-working path. */
     if (MH_CreateHook(target, detour, original) != MH_OK) return 0;
     return MH_EnableHook(target) == MH_OK;
 }
@@ -1724,6 +1770,7 @@ __declspec(dllexport) void dllStartPlugin(void)
         g_node_set_dori = (node_set_dori_t)GetProcAddress(ogre, OGRE_SETDORI_SYM);
         g_node_set_dpos = (node_set_dpos_t)GetProcAddress(ogre, OGRE_SETDPOS_SYM);
         g_node_get_dpos = (node_get_dpos_t)GetProcAddress(ogre, OGRE_GETDPOS_SYM);
+        g_disable_bone  = (disable_bone_t)GetProcAddress(ogre, OGRE_DISABLEBONE_SYM);
         g_cam_set_fovy  = (cam_set_fovy_t)GetProcAddress(ogre, OGRE_SETFOVY_SYM);
         g_cam_get_fovy  = (cam_get_fovy_t)GetProcAddress(ogre, OGRE_GETFOVY_SYM);
         g_cam_set_nearclip = (cam_set_nearclip_t)GetProcAddress(ogre, OGRE_SETNEARCLIP_SYM);
@@ -1734,16 +1781,9 @@ __declspec(dllexport) void dllStartPlugin(void)
     logline(g_ogre_ready ? "Ogre node setters resolved (FP override armed)"
                          : "WARN: Ogre node setters NOT resolved (FP override disabled)");
 
-    /* Cooperative-hooking backend: prefer KenshiLib.AddHook when RE_Kenshi is
-     * present (its DLL is loaded), else MinHook. */
-    HMODULE klib = GetModuleHandleA("KenshiLib.dll");
-    if (klib) g_klib_addhook = (klib_addhook_t)GetProcAddress(klib, KLIB_ADDHOOK_SYM);
-    logline(g_klib_addhook ? "KenshiLib detected -- cooperative hooking (RE_Kenshi compat)"
-                           : "hooking via MinHook (no KenshiLib present)");
-
     MH_STATUS mh = g_wrong_build ? MH_ERROR_NOT_INITIALIZED : MH_Initialize();
     int ok = 0;
-    if (!g_wrong_build && (mh == MH_OK || mh == MH_ERROR_ALREADY_INITIALIZED || g_klib_addhook)) {
+    if (!g_wrong_build && (mh == MH_OK || mh == MH_ERROR_ALREADY_INITIALIZED)) {
         void *target = (void *)(g_base + RVA_MAINLOOP);
         g_mainloop_target = target;
         ok = install_hook(target, (void *)hooked_mainloop, (void **)&g_mainloop_orig);

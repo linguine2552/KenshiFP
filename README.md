@@ -64,16 +64,29 @@ To uninstall, remove that line (and optionally the files).
 A log (`KenshiFP.log`) is written next to the game exe — include it in any
 bug report.
 
+## Compatibility
+
+- **RE_Kenshi:** not currently compatible. When RE_Kenshi doesn't recognize
+  your Kenshi version, it relaunches the game from its own **bundled
+  executable** — a different build than Steam launched. KenshiFP is compiled
+  for Steam 1.0.68's exact function addresses, so on that swapped build its
+  hooks attach to the wrong code and nothing happens. KenshiFP now **detects
+  this and disables itself cleanly** (see `KenshiFP.log` for an
+  `UNSUPPORTED GAME BUILD` message) instead of misbehaving. If you run both,
+  KenshiFP will be inactive. A version-independent build (locating game code
+  by signature instead of hardcoded offsets) is planned to fix this.
+- Coexists fine with mods that don't replace the game executable.
+
 ## Known limitations
 
+- **Version-locked to Steam Kenshi 1.0.68.** On any other build, KenshiFP
+  detects the mismatch and disables itself with a log message rather than
+  running against wrong addresses.
 - Backpedaling (S) turns the character around rather than walking backward
   facing the camera (the engine's physics drives orientation during
   movement; a facing-locked backpedal is future work).
 - Grass billboards shimmer when rotating the view — an engine impostor
   artifact that eye-level viewing makes more visible.
-- Version-locked to Kenshi **1.0.68**. On any other build the mod will
-  misbehave; guards turn most mismatches into log lines rather than
-  crashes, but don't run it on other versions expecting features to work.
 - GOG builds are untested (addresses may match Steam's; try at your own
   risk and check the log).
 

@@ -288,3 +288,21 @@ mind+0x2c0. Cancel: FUN_1405074a0(queue) abort in-flight + clear queued;
 FUN_140507530(queue) clear + reset target hand. Replace-vs-queue global shift
 flag byte @0x2133449 (0=replace). Main thread only. CLIENT: try_move_to_pos()
 (VEH-guarded) is now the primary WASD drive; raw CharMovement setdest = fallback.
+
+### RE_Kenshi incompatibility ROOT CAUSE (2026-07-18, user Claviberg)
+RE_Kenshi 0.3.4 does NOT hook our functions and canNOT collide with our MinHook
+(module-private state, disjoint targets -- confirmed by source analysis). The
+real cause: RE_Kenshi's dllStartPlugin does a VERSION-GATED _P_OVERLAY process
+restart (dllmain.cpp:1971-1994) into its BUNDLED exe `./RE_Kenshi/kenshi_x64.exe`
+when KenshiLib doesn't recognise the installed version. So with RE_Kenshi on,
+the running process is a DIFFERENT (older, bundled) Kenshi build -> our hardcoded
+1.0.68 RVAs point at the wrong bytes. PROVEN by Claviberg's diagnostic:
+running exe = ...\Kenshi\RE_Kenshi\kenshi_x64.exe; bytes @0x788a00 = CC CC CC...
+(INT3 PADDING, not a function) vs real 1.0.68 = 48 8b c4 56 57 41 54 48.
+Real 1.0.68 signatures: mainLoop@0x788a00 = 48 8b c4 56 57 41 54 48;
+CameraClass::update@0x6b0f90 = 40 55 53 57 48 8b ec 48.
+FIX shipped: prologue-signature check at load; on mismatch, DISABLE cleanly with
+a clear log message (no dead hooks, no watchdog spam). True coexistence would
+need version-independent addressing (signature-scan every fn + globals) OR
+RE_Kenshi supporting 1.0.68 natively (no downgrade). RE_Kenshi's own per-frame
+anchor = MyGUI::Gui::eventFrameStart (additive delegate, no byte patching).

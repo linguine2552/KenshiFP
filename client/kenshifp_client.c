@@ -354,6 +354,19 @@ typedef Vec3 *(*get_bone_world_t)(void *character, Vec3 *ret, const void *name);
 static FILE *g_log;
 static uintptr_t g_base;
 static mainloop_t g_mainloop_orig;
+static void *g_mainloop_target;        /* saved for the re-arm watchdog */
+static volatile LONG g_heartbeat;      /* bumped every frame the hook fires */
+
+/* Cooperative hooking. RE_Kenshi's KenshiLib docs: "DO use KenshiLib's built-in
+ * function hooking system... DON'T use 3rd-party detour libraries as these can
+ * cause issues when multiple plugins hook using different libraries." Our
+ * MinHook detours silently never fire alongside RE_Kenshi. Fix: when KenshiLib
+ * is loaded (RE_Kenshi present), route our hooks through its exported AddHook
+ * (resolved at runtime -- no MSVC link needed); else use MinHook as before. */
+#define KLIB_ADDHOOK_SYM "?AddHook@KenshiLib@@YA?AW4HookStatus@1@PEAX0PEAPEAX@Z"
+typedef int (*klib_addhook_t)(void *target, void *detour, void **original); /* 0=SUCCESS */
+static klib_addhook_t g_klib_addhook;
+static int g_wrong_build;               /* set if the exe isn't Steam 1.0.68 */
 static follow_object_t g_follow_object;
 static stop_follow_t g_stop_following;
 static node_set_pos_t g_node_set_pos;   /* Ogre::Node::setPosition (local) */
@@ -366,6 +379,9 @@ static unsigned char g_head_bone[32];   /* MSVC std::string "Bip01 Head" (SSO) *
 static int g_ogre_ready;
 static DWORD g_last_tick_ms;
 static int g_fp_mode;              /* toggled by VK_TOGGLE_FP edge */
+static volatile LONG g_toggle_edge;    /* latched keydown from the LL kbd hook */
+static volatile LONG g_toggle_ll_down; /* LL-hook autorepeat filter */
+static HHOOK g_kbd_hook;
 static int g_toggle_was_down;
 static int g_prev_fp;             /* g_fp_mode from last frame (camera_lock edge) */
 static int g_ovr_prev;            /* was the FP node override active last frame */
@@ -401,6 +417,7 @@ static terrain_getheight_t g_terrain_getheight; /* Terrain::getHeight (Plugin_Te
 static terrain_intersect_t g_terrain_intersect; /* Terrain::intersect (ray -> ground point) */
 static int g_terrain_dead;                     /* set if the terrain query ever faults */
 static cam_update_t g_cam_update_orig;         /* CameraClass::update trampoline */
+static volatile LONG g_cam_heartbeat;          /* bumped every camera-update call */
 static Vec3 g_last_eye;                        /* FP eye from the previous frame */
 static Quat g_last_ori;                        /* FP look from the previous frame */
 static int  g_have_eye;                        /* re-assert mid-frame only when valid */
@@ -500,12 +517,25 @@ static int char_position(void *c, Vec3 *out)
     return 1;
 }
 
+static int ui_panels_open(void);   /* forward decl (defined after the VEH guard) */
+
 static void poll_input(void)
 {
+    /* Two detection paths, one toggle:
+     *  - g_toggle_edge: latched by the LL keyboard hook at the instant of the
+     *    physical keydown. On native Windows a bare Alt press can stall the
+     *    game's message loop (system-menu modal), so a per-frame poll misses
+     *    the whole press -- the hook doesn't.
+     *  - GetAsyncKeyState edge: belt-and-braces for setups without the hook. */
     int down = (GetAsyncKeyState(VK_TOGGLE_FP) & 0x8000) != 0;
-    if (down && !g_toggle_was_down) {
-        g_fp_mode = !g_fp_mode;
-        logline("[input] FP mode toggled -> %s", g_fp_mode ? "ON" : "OFF");
+    LONG edge = InterlockedExchange(&g_toggle_edge, 0);
+    if (edge || (down && !g_toggle_was_down)) {
+        /* AltGr guard: on many EU layouts Right Alt is AltGr (typing € @ etc);
+         * don't yank the player into FP while they type in an open panel. */
+        if (g_fp_mode || !ui_panels_open()) {
+            g_fp_mode = !g_fp_mode;
+            logline("[input] FP mode toggled -> %s", g_fp_mode ? "ON" : "OFF");
+        }
     }
     g_toggle_was_down = down;
 }
@@ -583,7 +613,6 @@ static void camera_lock(void *gw)
  * (read-only, no cursor recenter -> no fight with the engine's own cursor). */
 static void mygui_cursor(int visible);   /* forward decl (defined below) */
 static void ensure_crosshair(void);
-static int ui_panels_open(void);         /* forward decl (needs the VEH guard) */
 
 /* --- DirectInput mouse (FP look deltas) ---------------------------------
  * The one delta source that both FEELS right and COEXISTS with the game:
@@ -1374,6 +1403,7 @@ static void fp_load_nearby_interiors(void *gw)
  * idle the center stays vanilla for the floating-origin T calibration. */
 static void hooked_cam_update(void *cam, char controlEnabled)
 {
+    InterlockedIncrement(&g_cam_heartbeat);
     g_cam_update_orig(cam, controlEnabled);
     /* Fully inert unless FP is (or was just) engaged: at the main menu / load
      * screens this hook fires while the game is half-initialised, and running
@@ -1391,6 +1421,7 @@ static void hooked_cam_update(void *cam, char controlEnabled)
 
 static void hooked_mainloop(void *gw, float time)
 {
+    InterlockedIncrement(&g_heartbeat);   /* watchdog: proves the hook is live */
     g_gw_cache = gw;               /* CameraClass::update fires inside the frame */
     g_frame_dt = time;             /* stutter diag */
     g_mainloop_orig(gw, time);     /* run the game's frame first */
@@ -1411,6 +1442,67 @@ static void hooked_mainloop(void *gw, float time)
     }
 }
 
+/* Hook re-arm watchdog. Other mods that hook the game late (notably RE_Kenshi,
+ * whose KenshiLib installs many detours during game-data init) can leave our
+ * per-frame hook installed-but-not-firing. This thread watches the heartbeat:
+ * if it isn't advancing, it re-installs the per-frame hook so we land on top of
+ * whatever the other mod did. RE_Kenshi does NOT hook mainLoop itself, so
+ * remove+recreate here restores the true original bytes -- it won't disturb
+ * its hooks. Once the heartbeat flows, the watchdog goes quiet. */
+static DWORD WINAPI hook_watchdog(void *unused)
+{
+    (void)unused;
+    LONG last_main = 0, last_cam = 0;
+    int rearms = 0, main_ok = 0, cam_ok = 0;
+    for (;;) {
+        Sleep(2000);
+        LONG hm = g_heartbeat, hc = g_cam_heartbeat;
+        int main_flow = (hm != last_main), cam_flow = (hc != last_cam);
+        last_main = hm; last_cam = hc;
+        if (main_flow && !main_ok) { main_ok = 1; logline("watchdog: per-frame hook LIVE"); }
+        if (cam_flow && !cam_ok)   { cam_ok = 1;  logline("watchdog: camera-update hook LIVE"); }
+        if (main_flow) continue;                 /* healthy */
+        /* per-frame hook not firing. Report ONCE which hooks are alive (RE_Kenshi
+         * coexistence diagnostic), try a few re-arms, then stay quiet -- no point
+         * flooding the log every 2s forever. */
+        if (rearms < 6)
+            logline("watchdog: mainloop SILENT (main hb=%ld cam hb=%ld) -- cam %s",
+                    (long)hm, (long)hc, cam_flow ? "FIRING" : "silent");
+        if (rearms >= 5) continue;               /* re-arm is proven useless if it
+                                                  * never takes; stop the churn */
+        rearms++;
+        MH_DisableHook(g_mainloop_target);
+        MH_RemoveHook(g_mainloop_target);
+        g_mainloop_orig = NULL;
+        MH_STATUS s = MH_CreateHook(g_mainloop_target, (void *)hooked_mainloop,
+                                    (void **)&g_mainloop_orig);
+        if (s == MH_OK) s = MH_EnableHook(g_mainloop_target);
+        logline("watchdog: re-armed per-frame hook (attempt %d, status %d)", rearms, (int)s);
+    }
+}
+
+/* Low-level keyboard hook: latch the FP-toggle keydown at event time. On
+ * native Windows a bare Alt press can freeze the game loop in the system-menu
+ * modal until release, so frame-polling GetAsyncKeyState misses the entire
+ * press (first Windows user report); an LL hook still receives the event. */
+static LRESULT CALLBACK kbd_ll(int code, WPARAM wp, LPARAM lp)
+{
+    if (code == HC_ACTION) {
+        KBDLLHOOKSTRUCT *k = (KBDLLHOOKSTRUCT *)lp;
+        if (k->vkCode == VK_TOGGLE_FP) {
+            if (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) {
+                if (!g_toggle_ll_down) {           /* filter autorepeat */
+                    g_toggle_ll_down = 1;
+                    InterlockedExchange(&g_toggle_edge, 1);
+                }
+            } else if (wp == WM_KEYUP || wp == WM_SYSKEYUP) {
+                g_toggle_ll_down = 0;
+            }
+        }
+    }
+    return CallNextHookEx(NULL, code, wp, lp);
+}
+
 /* Low-level mouse hook: capture the wheel ourselves (the game clears its own
  * mWheel before our per-frame hook can read it). Look deltas come from the
  * DirectInput device instead (see ensure_dinput). */
@@ -1422,6 +1514,16 @@ static LRESULT CALLBACK mouse_ll(int code, WPARAM wp, LPARAM lp)
         InterlockedExchangeAdd(&g_wheel_accum, delta);
     }
     return CallNextHookEx(NULL, code, wp, lp);
+}
+
+/* Install one hook through the active backend. Returns 1 on success.
+ * KenshiLib.AddHook does create+enable in one call (SUCCESS==0). */
+static int install_hook(void *target, void *detour, void **original)
+{
+    if (g_klib_addhook)
+        return g_klib_addhook(target, detour, original) == 0;
+    if (MH_CreateHook(target, detour, original) != MH_OK) return 0;
+    return MH_EnableHook(target) == MH_OK;
 }
 
 __declspec(dllexport) void dllStartPlugin(void)
@@ -1453,6 +1555,9 @@ __declspec(dllexport) void dllStartPlugin(void)
     g_mouse_hook = SetWindowsHookExA(WH_MOUSE_LL, mouse_ll, g_hinst, 0);
     logline(g_mouse_hook ? "mouse wheel hook installed" : "mouse wheel hook FAILED (err %lu)",
             GetLastError());
+    g_kbd_hook = SetWindowsHookExA(WH_KEYBOARD_LL, kbd_ll, g_hinst, 0);
+    logline(g_kbd_hook ? "keyboard hook installed (FP toggle capture)"
+                       : "keyboard hook FAILED (err %lu) -- polling fallback", GetLastError());
 
     /* FP look deltas: DirectInput non-exclusive device, created lazily on the
      * first FP frame (the game window must exist). See ensure_dinput. */
@@ -1462,6 +1567,46 @@ __declspec(dllexport) void dllStartPlugin(void)
     *(size_t *)(g_head_bone + 0x10) = sizeof(HEAD_BONE_NAME) - 1;  /* size */
     *(size_t *)(g_head_bone + 0x18) = 15;                          /* capacity */
     logline("KenshiFP loaded (FP + head-bone + FOV + WASD); module base %p", (void *)g_base);
+
+    /* Version/identity diagnostic (RE_Kenshi can _P_OVERLAY-restart into a
+     * bundled exe for unrecognised versions -> our hardcoded RVAs would point
+     * into the wrong build). Log the running exe + the prologue bytes at our
+     * hook targets; compare against a known-good 1.0.68 run to catch a swap. */
+    {
+        wchar_t exw[MAX_PATH]; char exa[MAX_PATH] = {0};
+        if (GetModuleFileNameW(NULL, exw, MAX_PATH))
+            WideCharToMultiByte(CP_UTF8, 0, exw, -1, exa, MAX_PATH, NULL, NULL);
+        logline("running exe: %s", exa[0] ? exa : "(unknown)");
+        unsigned char *pm = (unsigned char *)(g_base + RVA_MAINLOOP);
+        unsigned char *pc = (unsigned char *)(g_base + RVA_CAM_UPDATE);
+        if (readable(pm, 8))
+            logline("bytes @mainloop 0x%x: %02x %02x %02x %02x %02x %02x %02x %02x",
+                    RVA_MAINLOOP, pm[0],pm[1],pm[2],pm[3],pm[4],pm[5],pm[6],pm[7]);
+        if (readable(pc, 8))
+            logline("bytes @camupd 0x%x: %02x %02x %02x %02x %02x %02x %02x %02x",
+                    RVA_CAM_UPDATE, pc[0],pc[1],pc[2],pc[3],pc[4],pc[5],pc[6],pc[7]);
+
+        /* Fail-fast on the wrong game build: our hardcoded RVAs are Steam
+         * 1.0.68 only. RE_Kenshi _P_OVERLAY-restarts unrecognised versions into
+         * its own bundled (older) exe, where 0x788a00 is padding -> our hooks
+         * attach to dead code and nothing works. Verify the mainLoop prologue
+         * signature; if it doesn't match, disable cleanly with a clear message
+         * instead of installing dead hooks + a watchdog that spams forever. */
+        static const unsigned char SIG_MAINLOOP[8] =
+            { 0x48,0x8b,0xc4,0x56,0x57,0x41,0x54,0x48 };
+        if (!readable(pm, 8) || memcmp(pm, SIG_MAINLOOP, 8) != 0) {
+            g_wrong_build = 1;
+            logline("*** UNSUPPORTED GAME BUILD -- KenshiFP is DISABLED. ***");
+            logline("*** Hook-target bytes do not match Steam Kenshi 1.0.68.");
+            logline("*** Running exe: %s", exa[0] ? exa : "(unknown)");
+            if (exa[0] && (strstr(exa, "RE_Kenshi") || strstr(exa, "re_kenshi")))
+                logline("*** Cause: RE_Kenshi relaunched the game from its bundled "
+                        "(older) build. KenshiFP + RE_Kenshi are not compatible on "
+                        "this Kenshi version.");
+            logline("*** Fix: run Steam Kenshi 1.0.68 without RE_Kenshi, or wait for "
+                    "a version-independent KenshiFP build.");
+        }
+    }
 
     /* Resolve Ogre node world-transform setters from OgreMain_x64.dll. */
     HMODULE ogre = GetModuleHandleA("OgreMain_x64.dll");
@@ -1481,24 +1626,32 @@ __declspec(dllexport) void dllStartPlugin(void)
     logline(g_ogre_ready ? "Ogre node setters resolved (FP override armed)"
                          : "WARN: Ogre node setters NOT resolved (FP override disabled)");
 
-    MH_STATUS mh = MH_Initialize();
+    /* Cooperative-hooking backend: prefer KenshiLib.AddHook when RE_Kenshi is
+     * present (its DLL is loaded), else MinHook. */
+    HMODULE klib = GetModuleHandleA("KenshiLib.dll");
+    if (klib) g_klib_addhook = (klib_addhook_t)GetProcAddress(klib, KLIB_ADDHOOK_SYM);
+    logline(g_klib_addhook ? "KenshiLib detected -- cooperative hooking (RE_Kenshi compat)"
+                           : "hooking via MinHook (no KenshiLib present)");
+
+    MH_STATUS mh = g_wrong_build ? MH_ERROR_NOT_INITIALIZED : MH_Initialize();
     int ok = 0;
-    if (mh == MH_OK || mh == MH_ERROR_ALREADY_INITIALIZED) {
+    if (!g_wrong_build && (mh == MH_OK || mh == MH_ERROR_ALREADY_INITIALIZED || g_klib_addhook)) {
         void *target = (void *)(g_base + RVA_MAINLOOP);
-        mh = MH_CreateHook(target, (void *)hooked_mainloop, (void **)&g_mainloop_orig);
-        if (mh == MH_OK) mh = MH_EnableHook(target);
-        ok = (mh == MH_OK);
+        g_mainloop_target = target;
+        ok = install_hook(target, (void *)hooked_mainloop, (void **)&g_mainloop_orig);
         logline(ok ? "per-frame hook installed (mainLoop_GPUSensitiveStuff)"
-                   : "per-frame hook FAILED (MH_STATUS %d)", (int)mh);
+                   : "per-frame hook FAILED");
+        /* re-arm watchdog: only meaningful on the MinHook path (KenshiLib
+         * cooperates, nothing to re-arm). Still logs the heartbeat diagnostic. */
+        if (ok) CloseHandle(CreateThread(NULL, 0, hook_watchdog, NULL, 0, NULL));
 
         /* CameraClass::update hook: mid-frame FP-eye re-assert (foliage/LOD fix). */
         {
             void *cu = (void *)(g_base + RVA_CAM_UPDATE);
-            MH_STATUS mh2 = MH_CreateHook(cu, (void *)hooked_cam_update,
-                                          (void **)&g_cam_update_orig);
-            if (mh2 == MH_OK) mh2 = MH_EnableHook(cu);
-            logline(mh2 == MH_OK ? "camera update hook installed (mid-frame eye)"
-                                 : "camera update hook FAILED (MH_STATUS %d)", (int)mh2);
+            int mh2ok = install_hook(cu, (void *)hooked_cam_update,
+                                     (void **)&g_cam_update_orig);
+            logline(mh2ok ? "camera update hook installed (mid-frame eye)"
+                          : "camera update hook FAILED");
         }
 
         /* MyGUI cursor: resolve + hook setPointer to hide the default arrow. */
@@ -1529,12 +1682,13 @@ __declspec(dllexport) void dllStartPlugin(void)
         } else {
             logline("MyGUIEngine_x64.dll not found — cursor hide disabled");
         }
-    } else {
+    } else if (!g_wrong_build) {
         logline("MH_Initialize failed (MH_STATUS %d)", (int)mh);
     }
 
-    logline(ok ? "KenshiFP active: F = first-person; mouse = look; WASD = move"
-               : "KenshiFP FAILED to install per-frame hook");
+    logline(ok ? "KenshiFP active: RIGHT ALT = first-person toggle; mouse = look; WASD = move; wheel = speed"
+               : (g_wrong_build ? "KenshiFP inactive (unsupported game build)"
+                                : "KenshiFP FAILED to install per-frame hook"));
 }
 
 __declspec(dllexport) void dllStopPlugin(void) { logline("dllStopPlugin"); }

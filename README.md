@@ -10,9 +10,11 @@ Built as a native code plugin — no game files are modified.
 
 *Click to watch the mod in action.*
 
-**Target: Steam Kenshi 1.0.68 x64** (the current build), Windows or
-Linux/Proton. Other game versions are not supported (the mod is built on
-version-specific reverse-engineered addresses).
+**Supports Steam Kenshi 1.0.68 and 1.0.65 (x64)**, Windows or Linux/Proton.
+The mod detects the game build at load and uses the matching addresses; on an
+unrecognized build it disables itself cleanly (logged) rather than misbehaving.
+**Compatible with [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/2063)**,
+which downgrades installs to 1.0.65 — KenshiFP runs on that build too.
 
 ## Features
 
@@ -66,20 +68,16 @@ bug report.
 
 ## Compatibility
 
-- **RE_Kenshi:** not currently compatible. When RE_Kenshi doesn't recognize
-  your Kenshi version, it relaunches the game from its own **bundled
-  executable** — a different build than Steam launched. KenshiFP is compiled
-  for Steam 1.0.68's exact function addresses, so on that swapped build its
-  hooks attach to the wrong code and nothing happens. KenshiFP now **detects
-  this and disables itself cleanly** (see `KenshiFP.log` for an
-  `UNSUPPORTED GAME BUILD` message) instead of misbehaving. If you run both,
-  KenshiFP will be inactive. A version-independent build (locating game code
-  by signature instead of hardcoded offsets) is planned to fix this.
-- Coexists fine with mods that don't replace the game executable.
+- **RE_Kenshi:** compatible. RE_Kenshi downgrades installs to Kenshi 1.0.65
+  (it relaunches the game from its own bundled executable). KenshiFP ships
+  address tables for both 1.0.68 and 1.0.65 and auto-selects the right one at
+  load, so it runs whether or not RE_Kenshi is present. Verified with both
+  mods loaded together.
+- Coexists fine with other mods that don't replace the game executable.
 
 ## Known limitations
 
-- **Version-locked to Steam Kenshi 1.0.68.** On any other build, KenshiFP
+- **Supports Steam 1.0.68 and 1.0.65 only.** On any other build, KenshiFP
   detects the mismatch and disables itself with a log message rather than
   running against wrong addresses.
 - Backpedaling (S) turns the character around rather than walking backward

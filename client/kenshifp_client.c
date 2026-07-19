@@ -270,6 +270,114 @@
  * dip. MEMBER-STRUCT-RETURN ABI: this=RCX, retbuf=RDX, args=R8 (per KenshiCoop;
  * same pattern as the working getPosition — NOT retbuf-first). */
 #define RVA_GET_BONE_WORLD 0x440360u
+
+/* ===== version-dependent address tables ===================================
+ * KenshiFP's game addresses are build-specific. Steam 1.0.68 is the base
+ * target; RE_Kenshi downgrades installs to Steam 1.0.65, so we ship both and
+ * pick at load by the mainLoop prologue signature. The RVA_* macros above hold
+ * the 1.0.68 values and seed T_1068; below they are redefined to read the
+ * active table (g_rva), so all use-sites switch automatically. */
+typedef struct {
+    uintptr_t MAINLOOP, CAM_INSTANCE, INPUT_CONTROLENABLED, INPUT_MWHEEL, SCENE_CTX,
+        FOLLOW_OBJECT, STOP_FOLLOW, CHARMOVE_SETDEST, CHAR_SETDEST, MOVE_TO_POS,
+        GUI_INV_COUNT, GUI_STATS_BEG, GUI_STATS_END, GUI_WINSTACK, GUI_DLGWND,
+        DLG_GETVIS, ESCMENU_PTR, ESC_GETVIS, OVERVIEW_PTR, OVW_GETVIS,
+        OPTIONS_PTR, OPT_GETVIS, PROSPECT_PTR, PRO_GETVIS, SAVELOAD_PTR,
+        MSGBOX_COUNT, PLAYER_IFACE, CTXMENU_VISIBLE, CAM_UPDATE, TERRAIN_PTR,
+        TOWNMGR_PTR, NEAREST_TOWN, INTERIOR_LOAD, GET_BONE_WORLD;
+} addr_table_t;
+
+static const addr_table_t T_1068 = {
+    RVA_MAINLOOP, RVA_CAM_INSTANCE, RVA_INPUT_CONTROLENABLED, RVA_INPUT_MWHEEL, RVA_SCENE_CTX,
+    RVA_FOLLOW_OBJECT, RVA_STOP_FOLLOW, RVA_CHARMOVE_SETDEST, RVA_CHAR_SETDEST, RVA_MOVE_TO_POS,
+    RVA_GUI_INV_COUNT, RVA_GUI_STATS_BEG, RVA_GUI_STATS_END, RVA_GUI_WINSTACK, RVA_GUI_DLGWND,
+    RVA_DLG_GETVIS, RVA_ESCMENU_PTR, RVA_ESC_GETVIS, RVA_OVERVIEW_PTR, RVA_OVW_GETVIS,
+    RVA_OPTIONS_PTR, RVA_OPT_GETVIS, RVA_PROSPECT_PTR, RVA_PRO_GETVIS, RVA_SAVELOAD_PTR,
+    RVA_MSGBOX_COUNT, RVA_PLAYER_IFACE, RVA_CTXMENU_VISIBLE, RVA_CAM_UPDATE, RVA_TERRAIN_PTR,
+    RVA_TOWNMGR_PTR, RVA_NEAREST_TOWN, RVA_INTERIOR_LOAD, RVA_GET_BONE_WORLD,
+};
+/* Steam 1.0.65 (RE_Kenshi's downgrade build). Signature-transplant mapped;
+ * 0 = TODO (Ghidra pass in progress) or unused-in-client. Same field order. */
+static const addr_table_t T_1065 = {
+    0x787e70, 0x21322c0, 0x21323f0, 0, 0x21322b8,
+    0x6aed00, 0x6aed40, 0x6607e0, 0, 0x5d1820,
+    0x2132810, 0x2132918, 0x2132920, 0x2132960, 0x2132770,
+    0 /*DLG_GETVIS*/, 0 /*ESCMENU_PTR*/, 0 /*ESC_GETVIS*/, 0x212e4e8, 0 /*OVW_GETVIS*/,
+    0 /*OPTIONS_PTR*/, 0 /*OPT_GETVIS*/, 0 /*PROSPECT_PTR*/, 0 /*PRO_GETVIS*/, 0x212dbc8,
+    0x1f28a20, 0x2133630, 0 /*CTXMENU_VISIBLE*/, 0x6b1540, 0x21322c8,
+    0x21330a0, 0x9279c0, 0x561ab0, 0x43ffc0,
+};
+static addr_table_t g_rva;   /* active table, selected at load by build signature */
+
+#undef RVA_MAINLOOP
+#undef RVA_CAM_INSTANCE
+#undef RVA_INPUT_CONTROLENABLED
+#undef RVA_INPUT_MWHEEL
+#undef RVA_SCENE_CTX
+#undef RVA_FOLLOW_OBJECT
+#undef RVA_STOP_FOLLOW
+#undef RVA_CHARMOVE_SETDEST
+#undef RVA_CHAR_SETDEST
+#undef RVA_MOVE_TO_POS
+#undef RVA_GUI_INV_COUNT
+#undef RVA_GUI_STATS_BEG
+#undef RVA_GUI_STATS_END
+#undef RVA_GUI_WINSTACK
+#undef RVA_GUI_DLGWND
+#undef RVA_DLG_GETVIS
+#undef RVA_ESCMENU_PTR
+#undef RVA_ESC_GETVIS
+#undef RVA_OVERVIEW_PTR
+#undef RVA_OVW_GETVIS
+#undef RVA_OPTIONS_PTR
+#undef RVA_OPT_GETVIS
+#undef RVA_PROSPECT_PTR
+#undef RVA_PRO_GETVIS
+#undef RVA_SAVELOAD_PTR
+#undef RVA_MSGBOX_COUNT
+#undef RVA_PLAYER_IFACE
+#undef RVA_CTXMENU_VISIBLE
+#undef RVA_CAM_UPDATE
+#undef RVA_TERRAIN_PTR
+#undef RVA_TOWNMGR_PTR
+#undef RVA_NEAREST_TOWN
+#undef RVA_INTERIOR_LOAD
+#undef RVA_GET_BONE_WORLD
+#define RVA_MAINLOOP            (g_rva.MAINLOOP)
+#define RVA_CAM_INSTANCE        (g_rva.CAM_INSTANCE)
+#define RVA_INPUT_CONTROLENABLED (g_rva.INPUT_CONTROLENABLED)
+#define RVA_INPUT_MWHEEL        (g_rva.INPUT_MWHEEL)
+#define RVA_SCENE_CTX           (g_rva.SCENE_CTX)
+#define RVA_FOLLOW_OBJECT       (g_rva.FOLLOW_OBJECT)
+#define RVA_STOP_FOLLOW         (g_rva.STOP_FOLLOW)
+#define RVA_CHARMOVE_SETDEST    (g_rva.CHARMOVE_SETDEST)
+#define RVA_CHAR_SETDEST        (g_rva.CHAR_SETDEST)
+#define RVA_MOVE_TO_POS         (g_rva.MOVE_TO_POS)
+#define RVA_GUI_INV_COUNT       (g_rva.GUI_INV_COUNT)
+#define RVA_GUI_STATS_BEG       (g_rva.GUI_STATS_BEG)
+#define RVA_GUI_STATS_END       (g_rva.GUI_STATS_END)
+#define RVA_GUI_WINSTACK        (g_rva.GUI_WINSTACK)
+#define RVA_GUI_DLGWND          (g_rva.GUI_DLGWND)
+#define RVA_DLG_GETVIS          (g_rva.DLG_GETVIS)
+#define RVA_ESCMENU_PTR         (g_rva.ESCMENU_PTR)
+#define RVA_ESC_GETVIS          (g_rva.ESC_GETVIS)
+#define RVA_OVERVIEW_PTR        (g_rva.OVERVIEW_PTR)
+#define RVA_OVW_GETVIS          (g_rva.OVW_GETVIS)
+#define RVA_OPTIONS_PTR         (g_rva.OPTIONS_PTR)
+#define RVA_OPT_GETVIS          (g_rva.OPT_GETVIS)
+#define RVA_PROSPECT_PTR        (g_rva.PROSPECT_PTR)
+#define RVA_PRO_GETVIS          (g_rva.PRO_GETVIS)
+#define RVA_SAVELOAD_PTR        (g_rva.SAVELOAD_PTR)
+#define RVA_MSGBOX_COUNT        (g_rva.MSGBOX_COUNT)
+#define RVA_PLAYER_IFACE        (g_rva.PLAYER_IFACE)
+#define RVA_CTXMENU_VISIBLE     (g_rva.CTXMENU_VISIBLE)
+#define RVA_CAM_UPDATE          (g_rva.CAM_UPDATE)
+#define RVA_TERRAIN_PTR         (g_rva.TERRAIN_PTR)
+#define RVA_TOWNMGR_PTR         (g_rva.TOWNMGR_PTR)
+#define RVA_NEAREST_TOWN        (g_rva.NEAREST_TOWN)
+#define RVA_INTERIOR_LOAD       (g_rva.INTERIOR_LOAD)
+#define RVA_GET_BONE_WORLD      (g_rva.GET_BONE_WORLD)
+/* ========================================================================= */
 #define HEAD_BONE_NAME    "Bip01 Head"
 /* World-space orientation setter. Used for the look direction so it's immune to
  * the parent `center` node's orientation — setting a *local* orientation made
@@ -366,7 +474,8 @@ static volatile LONG g_heartbeat;      /* bumped every frame the hook fires */
 #define KLIB_ADDHOOK_SYM "?AddHook@KenshiLib@@YA?AW4HookStatus@1@PEAX0PEAPEAX@Z"
 typedef int (*klib_addhook_t)(void *target, void *detour, void **original); /* 0=SUCCESS */
 static klib_addhook_t g_klib_addhook;
-static int g_wrong_build;               /* set if the exe isn't Steam 1.0.68 */
+static int g_wrong_build;               /* set if the exe is neither 1.0.68 nor 1.0.65 */
+static int g_build;                     /* 68 or 65 (the detected game build) */
 static follow_object_t g_follow_object;
 static stop_follow_t g_stop_following;
 static node_set_pos_t g_node_set_pos;   /* Ogre::Node::setPosition (local) */
@@ -951,7 +1060,7 @@ static int ui_panels_open(void)
     if (readable((void *)(B + RVA_MSGBOX_COUNT), 4)
         && *(unsigned *)(B + RVA_MSGBOX_COUNT)) mask |= 0x008;
     /* right-click context menu: the engine's own cached isVisible byte */
-    if (readable((void *)(B + RVA_CTXMENU_VISIBLE), 1)
+    if (RVA_CTXMENU_VISIBLE && readable((void *)(B + RVA_CTXMENU_VISIBLE), 1)
         && *(unsigned char *)(B + RVA_CTXMENU_VISIBLE)) mask |= 0x400;
     if (readable((void *)(B + RVA_SAVELOAD_PTR), 8)) {
         unsigned char *sv = *(unsigned char **)(B + RVA_SAVELOAD_PTR);
@@ -961,7 +1070,8 @@ static int ui_panels_open(void)
     }
 
     /* optional singletons: null-check pointer, then a one-line getVisible */
-    static const struct { unsigned ptr_rva, fn_rva; } chk[] = {
+    /* runtime-initialised (RVA_* now read the active version table) */
+    const struct { uintptr_t ptr_rva, fn_rva; } chk[] = {
         { RVA_GUI_DLGWND,   RVA_DLG_GETVIS },   /* 0x020 */
         { RVA_ESCMENU_PTR,  RVA_ESC_GETVIS },   /* 0x040 */
         { RVA_OVERVIEW_PTR, RVA_OVW_GETVIS },   /* 0x080 */
@@ -976,6 +1086,7 @@ static int ui_panels_open(void)
     g_guard_armed = 1;
     int i;
     for (i = 0; i < 5; i++) {
+        if (!chk[i].ptr_rva || !chk[i].fn_rva) continue;   /* unmapped on this build */
         if (!readable((void *)(B + chk[i].ptr_rva), 8)) continue;
         void *w = *(void **)(B + chk[i].ptr_rva);
         if (!readable(w, 0x60)) continue;
@@ -1530,6 +1641,21 @@ __declspec(dllexport) void dllStartPlugin(void)
 {
     g_log = fopen("KenshiFP.log", "w");
     g_base = (uintptr_t)GetModuleHandleA(NULL);
+
+    /* Select the address table by the mainLoop prologue signature. Steam 1.0.68
+     * is the base target; RE_Kenshi downgrades to Steam 1.0.65 (its bundled exe),
+     * so match both builds. Neither -> unsupported, disable. MUST run before any
+     * RVA_* use (they now read the active table g_rva). */
+    {
+        static const unsigned char SIG_MAINLOOP[8] =
+            { 0x48,0x8b,0xc4,0x56,0x57,0x41,0x54,0x48 };
+        unsigned char *p68 = (unsigned char *)(g_base + T_1068.MAINLOOP);
+        unsigned char *p65 = (unsigned char *)(g_base + T_1065.MAINLOOP);
+        if (readable(p68, 8) && memcmp(p68, SIG_MAINLOOP, 8) == 0) { g_rva = T_1068; g_build = 68; }
+        else if (readable(p65, 8) && memcmp(p65, SIG_MAINLOOP, 8) == 0) { g_rva = T_1065; g_build = 65; }
+        else g_wrong_build = 1;
+    }
+
     g_follow_object  = (follow_object_t)(g_base + RVA_FOLLOW_OBJECT);
     g_stop_following = (stop_follow_t)(g_base + RVA_STOP_FOLLOW);
     g_charmove_setdest = (charmove_setdest_t)(g_base + RVA_CHARMOVE_SETDEST);
@@ -1568,43 +1694,25 @@ __declspec(dllexport) void dllStartPlugin(void)
     *(size_t *)(g_head_bone + 0x18) = 15;                          /* capacity */
     logline("KenshiFP loaded (FP + head-bone + FOV + WASD); module base %p", (void *)g_base);
 
-    /* Version/identity diagnostic (RE_Kenshi can _P_OVERLAY-restart into a
-     * bundled exe for unrecognised versions -> our hardcoded RVAs would point
-     * into the wrong build). Log the running exe + the prologue bytes at our
-     * hook targets; compare against a known-good 1.0.68 run to catch a swap. */
+    /* Report the detected build (selection already happened above). */
     {
         wchar_t exw[MAX_PATH]; char exa[MAX_PATH] = {0};
         if (GetModuleFileNameW(NULL, exw, MAX_PATH))
             WideCharToMultiByte(CP_UTF8, 0, exw, -1, exa, MAX_PATH, NULL, NULL);
         logline("running exe: %s", exa[0] ? exa : "(unknown)");
-        unsigned char *pm = (unsigned char *)(g_base + RVA_MAINLOOP);
-        unsigned char *pc = (unsigned char *)(g_base + RVA_CAM_UPDATE);
-        if (readable(pm, 8))
-            logline("bytes @mainloop 0x%x: %02x %02x %02x %02x %02x %02x %02x %02x",
-                    RVA_MAINLOOP, pm[0],pm[1],pm[2],pm[3],pm[4],pm[5],pm[6],pm[7]);
-        if (readable(pc, 8))
-            logline("bytes @camupd 0x%x: %02x %02x %02x %02x %02x %02x %02x %02x",
-                    RVA_CAM_UPDATE, pc[0],pc[1],pc[2],pc[3],pc[4],pc[5],pc[6],pc[7]);
-
-        /* Fail-fast on the wrong game build: our hardcoded RVAs are Steam
-         * 1.0.68 only. RE_Kenshi _P_OVERLAY-restarts unrecognised versions into
-         * its own bundled (older) exe, where 0x788a00 is padding -> our hooks
-         * attach to dead code and nothing works. Verify the mainLoop prologue
-         * signature; if it doesn't match, disable cleanly with a clear message
-         * instead of installing dead hooks + a watchdog that spams forever. */
-        static const unsigned char SIG_MAINLOOP[8] =
-            { 0x48,0x8b,0xc4,0x56,0x57,0x41,0x54,0x48 };
-        if (!readable(pm, 8) || memcmp(pm, SIG_MAINLOOP, 8) != 0) {
-            g_wrong_build = 1;
+        if (g_wrong_build) {
+            unsigned char *pm = (unsigned char *)(g_base + T_1068.MAINLOOP);
+            if (readable(pm, 8))
+                logline("bytes @0x%x: %02x %02x %02x %02x %02x %02x %02x %02x",
+                        (unsigned)T_1068.MAINLOOP, pm[0],pm[1],pm[2],pm[3],pm[4],pm[5],pm[6],pm[7]);
             logline("*** UNSUPPORTED GAME BUILD -- KenshiFP is DISABLED. ***");
-            logline("*** Hook-target bytes do not match Steam Kenshi 1.0.68.");
-            logline("*** Running exe: %s", exa[0] ? exa : "(unknown)");
+            logline("*** Supported: Steam Kenshi 1.0.68 or 1.0.65 (x64).");
             if (exa[0] && (strstr(exa, "RE_Kenshi") || strstr(exa, "re_kenshi")))
-                logline("*** Cause: RE_Kenshi relaunched the game from its bundled "
-                        "(older) build. KenshiFP + RE_Kenshi are not compatible on "
-                        "this Kenshi version.");
-            logline("*** Fix: run Steam Kenshi 1.0.68 without RE_Kenshi, or wait for "
-                    "a version-independent KenshiFP build.");
+                logline("*** Running RE_Kenshi's bundled exe but its build signature "
+                        "was not recognised -- report this log.");
+        } else {
+            logline("game build detected: Steam 1.0.%d%s", g_build,
+                    g_build == 65 ? " (RE_Kenshi downgrade)" : "");
         }
     }
 

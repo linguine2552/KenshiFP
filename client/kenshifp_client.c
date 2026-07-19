@@ -302,9 +302,9 @@ static const addr_table_t T_1065 = {
     0x787e70, 0x21322c0, 0x21323f0, 0, 0x21322b8,
     0x6aed00, 0x6aed40, 0x6607e0, 0, 0x5d1820,
     0x2132810, 0x2132918, 0x2132920, 0x2132960, 0x2132770,
-    0 /*DLG_GETVIS*/, 0 /*ESCMENU_PTR*/, 0 /*ESC_GETVIS*/, 0x212e4e8, 0 /*OVW_GETVIS*/,
-    0 /*OPTIONS_PTR*/, 0 /*OPT_GETVIS*/, 0 /*PROSPECT_PTR*/, 0 /*PRO_GETVIS*/, 0x212dbc8,
-    0x1f28a20, 0x2133630, 0 /*CTXMENU_VISIBLE*/, 0x6b1540, 0x21322c8,
+    0x721390, 0x212e4a8, 0x912170, 0x212e4e8, 0x48b0e0,
+    0x212e080, 0x3e7100, 0x212da50, 0x48b4c0, 0x212dbc8,
+    0x1f28a20, 0x2133630, 0x2132280, 0x6b1540, 0x21322c8,
     0x21330a0, 0x9279c0, 0x561ab0, 0x43ffc0,
 };
 static addr_table_t g_rva;   /* active table, selected at load by build signature */

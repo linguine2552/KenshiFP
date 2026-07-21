@@ -1614,42 +1614,11 @@ static void fp_camera_override(void *gw)
                     g_vanilla_zoom = lp->z;
             }
         }
-        ensure_crosshair();
-        if (g_crosshair && g_widget_setvisible)
-            g_widget_setvisible(g_crosshair, (g_pointer_default && !ui_open) ? 1 : 0);
-        /* Destreza-style unconsciousness: the tunnel vignette rides the
-         * collapse blend, the screen goes FULL BLACK while out cold, and on
-         * regaining consciousness the black holds then smoothstep-fades over
-         * ~1.7s so vision "returns" gradually (wake-up fade). */
-        if (g_vignette && g_black_ov && g_widget_setvisible) {
-            static float wake; static int prev_out;
-            int out = g_is_down;
-            if (prev_out && !out) wake = 1.0f;      /* consciousness edge */
-            prev_out = out;
-            float dt = (g_frame_dt > 0.0f && g_frame_dt < 0.25f) ? g_frame_dt : 0.016f;
-            if (wake > 0.0f) { wake -= dt / 1.7f; if (wake < 0.0f) wake = 0.0f; }
-            float wk = wake * wake * (3.0f - 2.0f * wake);   /* smoothstep */
-            float black = out ? g_down_blend : 0.0f;
-            if (wk > black) black = wk;
-            float tun = g_down_blend * 1.3f; if (tun > 1.0f) tun = 1.0f;
-            if (!g_cfg_vignette) { black = 0.0f; tun = 0.0f; }
-            /* Stepped-texture fade: MyGUI's _setColour masks the alpha channel
-             * (RGB only), so real alpha animation uses 10 pre-baked opacity
-             * levels (blk0=9%% .. blk9=88%% -- NEVER fully black; the world and
-             * the game UI in the layers above stay faintly visible). */
-            int step = (int)(black * 10.0f);
-            if (step > 9) step = 9;
-            static int prev_step = -1;
-            if (black > 0.03f && step != prev_step && g_imgbox_setimage) {
-                unsigned char btex[32]; char nm[16];
-                snprintf(nm, sizeof nm, "blk%d.png", step);
-                make_mstr(btex, nm);
-                g_imgbox_setimage(g_black_ov, btex);
-                prev_step = step;
-            }
-            g_widget_setvisible(g_vignette, tun > 0.05f);
-            g_widget_setvisible(g_black_ov, black > 0.03f);
-        }
+        /* NB: all MyGUI widget work (crosshair/vignette/blackout create,
+         * setVisible, setImageTexture) happens POST-FRAME in fp_gui_update --
+         * NEVER here. This hook runs mid-frame (during the game's UI update),
+         * and touching widgets then corrupted MyGUI's lists and crashed the
+         * order/job/inventory ItemBoxes. */
 
         if (ui_open) {
             if (g_cursor_hidden) { while (ShowCursor(TRUE) < 0) { } g_cursor_hidden = 0; }
@@ -1920,9 +1889,7 @@ static void fp_camera_override(void *gw)
         while (ShowCursor(TRUE) < 0) { }
         g_cursor_hidden = 0; g_ui_prev = 0; g_ui_open = 0;
         mygui_cursor(1);                        /* FP exit: restore the game cursor */
-        if (g_crosshair && g_widget_setvisible) g_widget_setvisible(g_crosshair, 0);
-        if (g_vignette && g_widget_setvisible) g_widget_setvisible(g_vignette, 0);
-        if (g_black_ov && g_widget_setvisible) g_widget_setvisible(g_black_ov, 0);
+        /* widget hides handled post-frame by fp_gui_update (sees !g_fp_mode) */
         g_have_eye = 0;                         /* stop the mid-frame re-assert */
         g_eye_sm_ok = 0; g_lead_sm = 0.0f;      /* reset smoothing state */
         /* Restore FOV/near-clip but KEEP the cached defaults (g_*_saved stays
@@ -2442,20 +2409,12 @@ static void ensure_crosshair(void)
     }
 }
 
-/* Swap our crosshair texture (only on change -- setImageTexture reloads).
- * 0=white (default), 1=red (hostile), 2=green (ally). Filenames MUST stay
- * under 16 chars: make_mstr builds SSO-only MSVC strings ("crosshair_red.png"
- * silently truncated to "crosshair_red.p" -> texture-not-found -> invisible). */
-static void set_crosshair_tint(int tint)
-{
-    if (tint == g_crosshair_red) return;
-    g_crosshair_red = tint;
-    if (!g_crosshair || !g_imgbox_setimage) return;
-    unsigned char tex[32];
-    make_mstr(tex, tint == 1 ? "xhair_red.png"
-                 : tint == 2 ? "xhair_ylw.png" : "crosshair.png");  /* allies = yellow */
-    g_imgbox_setimage(g_crosshair, tex);
-}
+/* Desired crosshair tint (0 white / 1 red / 2 yellow), published by the
+ * setPointer hook and APPLIED post-frame in fp_gui_update -- calling MyGUI
+ * setImageTexture from inside the hook (which runs during the game's own UI
+ * processing) was a reentrancy hazard that could corrupt MyGUI's widget
+ * lists and crash the order/job/inventory ItemBoxes. */
+static volatile LONG g_crosshair_want;
 
 /* MyGUI PointerManager::setPointer hook: while FP is on, hide the default (arrow)
  * cursor — we show our crosshair instead — and keep contextual icon pointers
@@ -2485,8 +2444,9 @@ static void hooked_setpointer(void *pm, const void *name)
     int is_default = (cur[0] != '\0' && strcmp(cur, def) == 0);
     int tint = (strcmp(cur, "attk") == 0) ? 1
              : (strcmp(cur, "green") == 0) ? 2 : 0;
-    set_crosshair_tint(tint);
-    /* colored arrows: hide the vanilla cursor, our tinted crosshair stands in */
+    InterlockedExchange(&g_crosshair_want, tint);   /* applied post-frame */
+    /* colored arrows: hide the vanilla cursor, our tinted crosshair stands in.
+     * setVisible on the PointerManager is safe (not a widget-list op). */
     g_pm_setvisible(pm, (is_default || tint) ? 0 : 1);
     g_pointer_default = is_default || tint;
 }
@@ -2753,6 +2713,66 @@ static void ini_hot_reload(void)
     }
 }
 
+/* All MyGUI widget work, run POST-FRAME (from hooked_mainloop, after the
+ * game's frame + UI update completed) so we never touch MyGUI's widget lists
+ * mid-update. Reads only globals published during the frame. */
+static void fp_gui_update(void)
+{
+    if (!g_gui_getinstance) return;
+    if (!g_fp_mode) {                      /* FP off: hide everything once */
+        static int hidden;
+        if (!hidden && g_widget_setvisible) {
+            if (g_crosshair) g_widget_setvisible(g_crosshair, 0);
+            if (g_vignette)  g_widget_setvisible(g_vignette, 0);
+            if (g_black_ov)  g_widget_setvisible(g_black_ov, 0);
+            hidden = 1;
+        }
+        return;
+    }
+    ensure_crosshair();                    /* create (post-frame = safe) */
+
+    /* crosshair tint (deferred from the setPointer hook) + visibility */
+    if (g_crosshair && g_imgbox_setimage) {
+        int want = (int)g_crosshair_want;
+        if (want != g_crosshair_red) {
+            g_crosshair_red = want;
+            unsigned char tex[32];
+            make_mstr(tex, want == 1 ? "xhair_red.png"
+                        : want == 2 ? "xhair_ylw.png" : "crosshair.png");
+            g_imgbox_setimage(g_crosshair, tex);
+        }
+    }
+    if (g_crosshair && g_widget_setvisible)
+        g_widget_setvisible(g_crosshair, (g_pointer_default && !g_ui_open) ? 1 : 0);
+
+    /* Destreza-style unconsciousness: tunnel vignette + stepped blackout fade,
+     * with a 1.7s smoothstep wake-up fade on regaining consciousness. */
+    if (g_vignette && g_black_ov && g_widget_setvisible) {
+        static float wake; static int prev_out;
+        int out = g_is_down;
+        if (prev_out && !out) wake = 1.0f;
+        prev_out = out;
+        float dt = (g_frame_dt > 0.0f && g_frame_dt < 0.25f) ? g_frame_dt : 0.016f;
+        if (wake > 0.0f) { wake -= dt / 1.7f; if (wake < 0.0f) wake = 0.0f; }
+        float wk = wake * wake * (3.0f - 2.0f * wake);
+        float black = out ? g_down_blend : 0.0f;
+        if (wk > black) black = wk;
+        float tun = g_down_blend * 1.3f; if (tun > 1.0f) tun = 1.0f;
+        if (!g_cfg_vignette) { black = 0.0f; tun = 0.0f; }
+        int step = (int)(black * 10.0f); if (step > 9) step = 9;
+        static int prev_step = -1;
+        if (black > 0.03f && step != prev_step && g_imgbox_setimage) {
+            unsigned char btex[32]; char nm[16];
+            snprintf(nm, sizeof nm, "blk%d.png", step);
+            make_mstr(btex, nm);
+            g_imgbox_setimage(g_black_ov, btex);
+            prev_step = step;
+        }
+        g_widget_setvisible(g_vignette, tun > 0.05f);
+        g_widget_setvisible(g_black_ov, black > 0.03f);
+    }
+}
+
 static void hooked_mainloop(void *gw, float time)
 {
     InterlockedIncrement(&g_heartbeat);   /* watchdog: proves the hook is live */
@@ -2769,6 +2789,7 @@ static void hooked_mainloop(void *gw, float time)
     if (gw) fp_movement(gw, time); /* every frame: WASD -> custom motion drive */
     if (gw) fp_load_nearby_interiors(gw); /* ~1 Hz: preload nearby building interiors */
     if (gw) fp_head_visibility(gw);       /* hide head while fast-forwarding (>1x) */
+    fp_gui_update();                      /* post-frame: all MyGUI widget work */
 
     DWORD now = GetTickCount();
     if (KFP_DEBUG_LOG && gw && (now - g_last_tick_ms) >= 1000) {   /* 1 Hz observation log */

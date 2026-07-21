@@ -20,24 +20,36 @@ which downgrades installs to 1.0.65 — KenshiFP runs on that build too.
 
 - **True first-person camera** — attached to the head bone; tracks
   animations and ragdolls, roll-free, with FOV and near-clip tuned for FP.
-- **WASD movement with full game-parity** — drives the game's own
-  click-to-move order system: real pathfinding, slope climbing, walk/run
-  animations, and downed characters struggle back to their feet, exactly as
-  if you were right-clicking.
-- **Look-direction targeting** — holding W walks toward the terrain point
-  you're looking at (the same picking right-click uses).
+- **Engine-native WASD movement** — drives the game's own direction-based
+  locomotion: reliable **inside buildings**, on ramps and platforms, works
+  **during combat** (retreat/strafe/kite), real walk/jog/run gaits, and
+  downed characters still crawl and struggle back to their feet.
+- **Character switching** — first person follows your *selected* squad
+  member; camera-lock another character and FP swaps to them.
+- **Aim-lean** — with a weapon drawn, your character physically bends
+  through the spine as you look up/down (procedural spine IK).
+- **Ranged free-aim in combat** — the aim pose tracks your crosshair,
+  bolts fly where you aim (vanilla accuracy spread kept), and lock-on no
+  longer overrides your look.
+- **Ragdoll camera** — knocked out, the camera tumbles with your head
+  (roll/pitch/yaw) and recovers on get-up.
 - **Mouse-look via DirectInput** — raw-quality hardware deltas that coexist
   with the game's own input (no stolen registrations, no cursor-warp lag).
 - **Scroll wheel speed control** — from a slow walk to a full run.
 - **Turn in place** — your character's body follows the camera while idle.
-- **Crosshair** — replaces the hidden arrow cursor; the game's contextual
-  cursors (attack, talk) still appear when relevant.
+- **Colored crosshair** — replaces the arrow cursor; turns **red over
+  hostiles** and **yellow over allies**; the game's tool cursors (talk,
+  doors, loot) still appear when relevant.
 - **Smart cursor release** — the mouse frees automatically for dialogue,
   inventory, trade/looting, stats, map/factions, options, save/load,
   message boxes, and the right-click context menu; recaptures on close.
 - **Building interiors preload** as you approach from outside — no more
   empty doorways.
 - **Foliage fix** — grass no longer vanishes underfoot in first person.
+- **FPS cap** — optional `KenshiFP.ini` (`fps_cap=N`): precise frame
+  limiting without vsync.
+- **Framerate-independent mouse** — look input captured at ~1kHz on a
+  dedicated thread; identical feel at any fps.
 
 ## Controls
 

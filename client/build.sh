@@ -9,7 +9,7 @@ x86_64-w64-mingw32-gcc -O2 -shared -static-libgcc -o KenshiFP_x64.dll \
     kenshifp_client.c \
     "$MH"/src/hook.c "$MH"/src/buffer.c "$MH"/src/trampoline.c "$MH"/src/hde/hde64.c \
     -I "$MH"/include -I "$MH"/src \
-    -DMINHOOK_BUILD -lkernel32 -ldinput8 -ldxguid -lm
+    -DMINHOOK_BUILD -lkernel32 -ldinput8 -ldxguid -lwinmm -lm
 echo "built KenshiFP_x64.dll"
 
 # Deploy (uncomment; KENSHI = Steam install dir):

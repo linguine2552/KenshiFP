@@ -82,7 +82,12 @@
  * this won't move them and we'll switch to the Character-level order path. */
 #define CHAR_MOVEMENT      0x640   /* Character::movement (CharMovement*) */
 #define CHAR_ANIM          0x448   /* Character::animation (AnimationClass*) */
+#define CHAR_WEAPON_IN_HANDS 0x6D8 /* CharacterHuman::weaponInHands (Weapon*); non-null = drawn */
+#define CHAR_MOVEMENT     0x640    /* Character::movement (CharMovement*) */
+#define CHAR_RANGEDCOMBAT 0x2F0    /* Character::rangedCombat (RangedCombatClass*) */
+#define RC_COMBATMODE     0x36     /* RangedCombatClass::combatMode (bool) */
 #define ANIM_SKELETON      0xB8    /* AnimationClass::skeleton (Ogre::OldSkeletonInstance*) */
+#define ANIM_RAGDOLL_MASK  0x2f8   /* AnimationClass ragdoll-active-parts bitmask (u32); != 0 = down */
 #define GW_FRAMESPEED      0x700   /* GameWorld::frameSpeedMult (float); 1.0 = 1x */
 #define RVA_CHARMOVE_SETDEST 0x661270u   /* CharMovement::setDestination (raw move; no navmesh) */
 #define RVA_CHAR_SETDEST     0x5c84e0u   /* NOT setDestination: teleport+facing placement
@@ -195,6 +200,7 @@
 #define MOVE_TURN_EPS      0.12f   /* radians of heading change that forces a re-issue */
 #define EYE_DROP           (-1.5f) /* offset from the head bone Y (negative = raise); tune */
 #define FP_EYE_FORWARD     2.0f    /* move the eye forward (toward look) out of the head; tune */
+#define FP_MOVE_FORWARD    1.5f    /* EXTRA forward push while moving (blended in/out) */
 
 /* ---- FOV ----
  * Ogre::Frustum::setFOVy(const Radian&) [Camera inherits it]; Radian == {float}.
@@ -261,10 +267,28 @@
  * world position to place the eye = centerWorld + (head-feet) offset. */
 #define OGRE_SETDPOS_SYM  "?_setDerivedPosition@Node@Ogre@@QEAAXAEBVVector3@2@@Z"
 #define OGRE_GETDPOS_SYM  "?_getDerivedPosition@Node@Ogre@@QEBA?AVVector3@2@XZ"
+#define OGRE_GETPOS_SYM   "?getPosition@Node@Ogre@@QEBAAEBVVector3@2@XZ"
 /* Ogre::OldSkeletonInstance::disableBone(std::string name, bool disable) --
  * Kenshi's own decapitation call; disabling a bone collapses its mesh and
  * PERSISTS across the per-frame animation update. Version-independent export. */
 #define OGRE_DISABLEBONE_SYM "?disableBone@OldSkeletonInstance@Ogre@@QEAAXV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@_N@Z"
+/* Read the head bone's WORLD orientation, version-independently: skeleton
+ * (Character+0x448 anim, +0xB8 skel) -> getBone(name) -> OldBone* -> its
+ * derived (world) orientation. Both Ogre exports; getBone takes std::string&,
+ * _getDerivedOrientation returns const Quaternion& (safe ABI). */
+#define OGRE_GETBONE_SYM  "?getBone@Skeleton@Ogre@@UEBAPEAVOldBone@2@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z"
+#define OGRE_OLDNODE_GETDORI_SYM "?_getDerivedOrientation@OldNode@Ogre@@UEBAAEBVQuaternion@2@XZ"
+#define OGRE_OLDNODE_GETDPOS_SYM "?_getDerivedPosition@OldNode@Ogre@@UEBAAEBVVector3@2@XZ"
+#define OGRE_GETDPOS_UPD_SYM  "?_getDerivedPositionUpdated@Node@Ogre@@QEAA?AVVector3@2@XZ"
+/* Procedural bone control (additive aim/IK): read animated LOCAL pose, write it
+ * back with an offset, flag derived transforms dirty. All OldNode/OldBone. */
+#define OGRE_OLDNODE_GETORI_SYM  "?getOrientation@OldNode@Ogre@@UEBAAEBVQuaternion@2@XZ"
+#define OGRE_OLDNODE_SETORI_SYM  "?setOrientation@OldNode@Ogre@@UEAAXAEBVQuaternion@2@@Z"
+#define OGRE_OLDNODE_NEEDUPD_SYM "?needUpdate@OldNode@Ogre@@UEAAX_N@Z"
+#define OGRE_OLDBONE_SETMANUAL_SYM "?setManuallyControlled@OldBone@Ogre@@QEAAX_N@Z"
+#define OGRE_GETPARENTSCENENODE_SYM "?getParentSceneNode@MovableObject@Ogre@@QEBAPEAVSceneNode@2@XZ"
+#define OGRE_ENTITY_GETSKEL_SYM  "?getSkeleton@Entity@Ogre@@QEBAPEAVOldSkeletonInstance@2@XZ"
+#define OGRE_ENTITY_GETSKEL_SYM2 "?getSkeleton@Entity@Ogre@@QEBAPEAVSkeletonInstance@2@XZ"
 
 /* ---- head-bone tracking (real first-person feel: eye = head bone) ----
  * Character::getBoneWorldPosition(this, retVec3, std::string* name) — RVA
@@ -291,7 +315,9 @@ typedef struct {
         DLG_GETVIS, ESCMENU_PTR, ESC_GETVIS, OVERVIEW_PTR, OVW_GETVIS,
         OPTIONS_PTR, OPT_GETVIS, PROSPECT_PTR, PRO_GETVIS, SAVELOAD_PTR,
         MSGBOX_COUNT, PLAYER_IFACE, CTXMENU_VISIBLE, CAM_UPDATE, TERRAIN_PTR,
-        TOWNMGR_PTR, NEAREST_TOWN, INTERIOR_LOAD, GET_BONE_WORLD;
+        TOWNMGR_PTR, NEAREST_TOWN, INTERIOR_LOAD, GET_BONE_WORLD,
+        RANGED_ANIMUPD, GUN_SHOOT, FACE_DIR, GUN_RELOAD, SHEATHE, GUN_CREATEPHYS,
+        RC_GETGUN, CAM_MANUAL_SETOZ, SET_DIRECT_MOVE, CHARMOVE_UPDATE;
 } addr_table_t;
 
 static const addr_table_t T_1068 = {
@@ -302,6 +328,27 @@ static const addr_table_t T_1068 = {
     RVA_OPTIONS_PTR, RVA_OPT_GETVIS, RVA_PROSPECT_PTR, RVA_PRO_GETVIS, RVA_SAVELOAD_PTR,
     RVA_MSGBOX_COUNT, RVA_PLAYER_IFACE, RVA_CTXMENU_VISIBLE, RVA_CAM_UPDATE, RVA_TERRAIN_PTR,
     RVA_TOWNMGR_PTR, RVA_NEAREST_TOWN, RVA_INTERIOR_LOAD, RVA_GET_BONE_WORLD,
+    0x51e4e0,   /* RangedCombatClass::animationUpdate (verified: reads gun+0x28,
+                 * me+0x68 -> +0x448 anim, plays "reload 1 phase"; R8 = aimpos) */
+    0x43a730,   /* GunClass::shoot(me,target,stat,aimpos&): projectile dir =
+                 * getAimDir(aimpos) + skill randomDeviant (verified in decomp) */
+    0x665250,   /* CharMovement::faceDirection (derived): stores facing at
+                 * this+0xD0; lookatPosition funnels here via vtable+0x30 */
+    0x436fb0,   /* GunClass::reloadAmmo: refills ammo(+0x20) from clip(+0x1C),
+                 * handles bolt visibility (verified: unique 8b411c894120 body) */
+    0x5cc820,   /* CharacterHuman::sheatheWeapon (verified: "hands" slot + anim
+                 * at this+0x448); AI re-sheathes our manual draw through this */
+    0x436a50,   /* Character gun-visual setup: derives body-entity parent node +
+                 * material, calls gun(+0x440)->createPhysical, syncs visibility */
+    0x4345c0,   /* RangedCombatClass::getGun: me->getCurrentWeapon()->vt[0x2D8]
+                 * ->+0x240 (carried) or turret+0x440 (mounted) */
+    0x6ae8e0,   /* CameraClass::manuallySetOrientationAndZoom(quat&, zoom):
+                 * center(+0x58) ori + camera(+0x70) local (0,0,z) + manual flag */
+    0x333300,   /* CharMovement::setDirectMovement(Vector3& d, float limit):
+                 * setMovementMode(MOVE_DIRECTION) + desiredMotion + sqrt(limit).
+                 * Engine-native direction-driven locomotion (verified decomp) */
+    0x65ffa0,   /* CharMovement::update (via base-vtable+0x58 thunk; contains the
+                 * MOVE_DIRECTION consumer branch at +0x11c -- self-verifying) */
 };
 /* Steam 1.0.65 (RE_Kenshi's downgrade build). Signature-transplant mapped;
  * 0 = TODO (Ghidra pass in progress) or unused-in-client. Same field order. */
@@ -313,6 +360,16 @@ static const addr_table_t T_1065 = {
     0x212e080, 0x3e7100, 0x212da50, 0x48b4c0, 0x212dbc8,
     0x1f28a20, 0x2133630, 0x2132280, 0x6b1540, 0x21322c8,
     0x21330a0, 0x9279c0, 0x561ab0, 0x43ffc0,
+    0x51da50,   /* animationUpdate: sig-transplant, matches KenshiLib-0x310 delta */
+    0x43a390,   /* GunClass::shoot: sig-transplant (unique 32-byte prologue match) */
+    0x6647c0,   /* faceDirection: masked sig-transplant, = KenshiLib-0x310 exactly */
+    0x436c10,   /* reloadAmmo: unique body match at same +0x2b, identical prologue */
+    0x5cbd90,   /* sheatheWeapon: "hands" xref at +0x3e + identical prologue */
+    0x4366b0,   /* gun-visual setup: masked-sig pair match (same 0xe0 sibling gap) */
+    0x434220,   /* getGun: unique 24-byte sig (me+0x68 -> getCurrentWeapon call) */
+    0x6af0c0,   /* manuallySetOrientationAndZoom: byte-identical prologue, +0x7E0 */
+    0x3332c0,   /* setDirectMovement: unique 22-byte prologue match */
+    0x65f510,   /* CharMovement::update: unique 28-byte prologue match */
 };
 static addr_table_t g_rva;   /* active table, selected at load by build signature */
 
@@ -351,6 +408,16 @@ static addr_table_t g_rva;   /* active table, selected at load by build signatur
 #undef RVA_INTERIOR_LOAD
 #undef RVA_GET_BONE_WORLD
 #define RVA_MAINLOOP            (g_rva.MAINLOOP)
+#define RVA_RANGED_ANIMUPD      (g_rva.RANGED_ANIMUPD)
+#define RVA_GUN_SHOOT           (g_rva.GUN_SHOOT)
+#define RVA_FACE_DIR            (g_rva.FACE_DIR)
+#define RVA_GUN_RELOAD          (g_rva.GUN_RELOAD)
+#define RVA_SHEATHE             (g_rva.SHEATHE)
+#define RVA_GUN_CREATEPHYS      (g_rva.GUN_CREATEPHYS)
+#define RVA_RC_GETGUN           (g_rva.RC_GETGUN)
+#define RVA_CAM_MANUAL_SETOZ    (g_rva.CAM_MANUAL_SETOZ)
+#define RVA_SET_DIRECT_MOVE     (g_rva.SET_DIRECT_MOVE)
+#define RVA_CHARMOVE_UPDATE     (g_rva.CHARMOVE_UPDATE)
 #define RVA_CAM_INSTANCE        (g_rva.CAM_INSTANCE)
 #define RVA_INPUT_CONTROLENABLED (g_rva.INPUT_CONTROLENABLED)
 #define RVA_INPUT_MWHEEL        (g_rva.INPUT_MWHEEL)
@@ -399,6 +466,8 @@ static addr_table_t g_rva;   /* active table, selected at load by build signatur
 
 /* ---- player character / position (proven in KenshiMP) ---- */
 #define PI_PLAYERCHARS    0x2B0      /* PlayerInterface::playerCharacters (lektor<Character*>) */
+#define PI_SELECTED_CHAR  0xF0       /* PlayerInterface::selectedCharacter (hand) */
+#define HAND_IDS          0x8        /* hand: vftable(8) then 5 id dwords (+0x8..+0x18) */
 #define LEK_COUNT         0x8        /* lektor::count (u32) */
 #define LEK_STUFF         0x10       /* lektor::stuff (T*) */
 #define GETPOS_VTABLE_SLOT 8         /* Character::getPosition; ABI Vec3*(this RCX, out RDX) */
@@ -463,6 +532,7 @@ typedef void (*manual_move_t)(void *mv, const Vec3 *desiredMotion);
 typedef void (*set_pos_tele_t)(void *mv, const Vec3 *pos, int floor);
 typedef void (*node_set_dpos_t)(void *node, const Vec3 *v);   /* world _setDerivedPosition */
 typedef Vec3 *(*node_get_dpos_t)(void *node, Vec3 *ret);      /* world _getDerivedPosition (this=RCX,ret=RDX) */
+typedef const Vec3 *(*node_get_pos_t)(void *node);            /* LOCAL getPosition (const Vector3&) */
 /* member-struct-return: this=RCX, retbuf=RDX, name=R8 */
 typedef Vec3 *(*get_bone_world_t)(void *character, Vec3 *ret, const void *name);
 
@@ -490,8 +560,65 @@ static node_set_ori_t g_node_set_ori;   /* Ogre::Node::setOrientation (local) */
 static node_set_dori_t g_node_set_dori; /* Ogre::Node::_setDerivedOrientation (world) */
 static node_set_dpos_t g_node_set_dpos; /* Ogre::Node::_setDerivedPosition (world) */
 static node_get_dpos_t g_node_get_dpos; /* Ogre::Node::_getDerivedPosition (world) */
+static node_get_pos_t  g_node_get_pos;  /* Ogre::Node::getPosition (LOCAL) */
+static float g_vanilla_zoom = 40.0f;    /* camera-node local Z = vanilla zoom (saved on FP enter) */
 typedef void (*disable_bone_t)(void *skel, const void *name /*std::string*/, char disable);
 static disable_bone_t g_disable_bone;   /* OldSkeletonInstance::disableBone */
+typedef void *(*skel_getbone_t)(void *skel, const void *name);  /* -> OldBone* */
+typedef const Quat *(*oldnode_getdori_t)(void *node);           /* const Quaternion& */
+static skel_getbone_t g_skel_getbone;
+static oldnode_getdori_t g_oldnode_getdori;
+typedef const Vec3 *(*oldnode_getdpos_t)(void *node);   /* skeleton-space derived pos */
+static oldnode_getdpos_t g_oldnode_getdpos;
+typedef Vec3 *(*node_getdpos_upd_t)(void *node, Vec3 *ret);  /* FORCES transform recompute */
+static node_getdpos_upd_t g_node_getdpos_upd;
+typedef const Quat *(*oldnode_getori_t)(void *node);           /* const Quaternion& (LOCAL) */
+typedef void (*oldnode_setori_t)(void *node, const Quat *q);   /* setOrientation(LOCAL) */
+typedef void (*oldnode_needupd_t)(void *node, char force);     /* needUpdate(bool) */
+typedef void (*oldbone_setmanual_t)(void *bone, char manual);  /* OldBone::setManuallyControlled */
+static oldnode_getori_t   g_oldnode_getori;
+static oldnode_setori_t   g_oldnode_setori;
+static oldnode_needupd_t  g_oldnode_needupd;
+static oldbone_setmanual_t g_oldbone_setmanual;
+typedef void *(*get_parent_scenenode_t)(void *movable);
+static get_parent_scenenode_t g_get_parent_scenenode;
+typedef void *(*entity_getskel_t)(void *entity);
+static entity_getskel_t g_entity_getskel;
+static int g_anim_ent_off = -1;         /* AnimationClass offset of body Entity* (probed) */
+static unsigned char g_bone_spine1[32], g_bone_spine2[32], g_bone_neck[32];  /* SSO std::strings */
+static unsigned char g_bone_rootspine[32];      /* "Bip01 Spine": facing ref (not controlled) */
+static int g_spine_ready;                       /* spine-bend exports + names resolved */
+static int g_spine_manual;                      /* bones set manually-controlled (once) */
+static Quat g_spine_rest[3];                    /* captured reference pose the aim pivots around */
+static Vec3 g_fwd_local; static int g_have_fwd; /* body forward in root-local frame (calibrated) */
+/* --- ranged free-aim (RangedCombatClass::animationUpdate hook) --- */
+#define RC_AIMPOS 0x38                          /* RangedCombatClass::currentAimPos (Vector3) */
+#define RC_ME     0x68                          /* RangedCombatClass::me (Character*) */
+typedef void (*ranged_animupd_t)(void *rc, float ft, Vec3 *aimpos, void *target);
+static ranged_animupd_t g_ranged_animupd_orig;
+static void *g_player_pc;                       /* player char, cached each frame for hooks */
+#define RC_GUN     0x28                         /* RangedCombatClass::gun (GunClass*) */
+#define RC_STAT    0x30                         /* RangedCombatClass::currentStat */
+#define GUN_AMMO   0x20                         /* GunClass ammo count (shoot decrements it) */
+static void manual_fire_update(void *pcx);      /* defined with the hooks below */
+static int fp_aim_point(Vec3 *out);
+static void make_mstr(unsigned char *b32, const char *s);
+static int g_aim_mode;                          /* R-toggled: weapon raised, manual aim */
+/* TABLED: out-of-combat manual aim (R raise + LMB fire). The AI task layer owns
+ * the draw/aim pipeline too tightly for field-forcing; revisit in the KenshiLib
+ * plugin rewrite. In-combat free-aim (pose/projectile/facing hooks) stays ON. */
+#define KFP_MANUAL_AIM 0
+/* Verbose periodic diagnostics ([tick]/[foliage]/[spine]/[orient]/[ui]).
+ * 0 for release: load-time lines and FAULT/error paths always stay. */
+#define KFP_DEBUG_LOG 0
+#define VK_AIM_TOGGLE 0x52                      /* R */
+#define RC_STATE_OFF 0x00                       /* RangedCombatClass::state (SHOOTING=0) */
+static float g_head_above = 2.0f;               /* head Y over feet; small => truly prone/KO */
+static Quat g_qref; static int g_have_qref;   /* head orientation while upright */
+static float g_down_blend;                     /* 0=upright look .. 1=follow head (ragdoll) */
+static int   g_is_down;                         /* ragdolled this frame; freezes look input */
+static jmp_buf g_guard_jb;                     /* VEH crash-guard (used from get_head_quat on) */
+static volatile LONG g_guard_armed;
 static int g_head_hidden;               /* our head-hide state (>1x fast-forward) */
 static void *g_head_hidden_char;        /* the exact character whose head we hid */
 static get_bone_world_t g_get_bone_world;   /* Character::getBoneWorldPosition */
@@ -528,6 +655,7 @@ static rgm_addlocation_t g_rgm_addlocation;
 static rgm_creategroup_t g_rgm_creategroup;
 static rgm_initgroup_t g_rgm_initgroup;
 static void *g_crosshair;          /* the ImageBox widget */
+static int g_crosshair_red;        /* crosshair currently on the red (enemy) texture */
 static int g_pointer_default = 1;  /* current MyGUI pointer is the default (arrow) */
 static charmove_setdest_t g_charmove_setdest;  /* CharMovement::setDestination (raw move) */
 static char_setdest_t g_char_setdest;          /* teleport+facing placement (unused) */
@@ -553,6 +681,16 @@ static interior_load_t g_interior_load;        /* BuildingInterior lazy load + k
 static int g_interiors_dead;                   /* set if the interior preload ever faults */
 static DWORD g_last_move_ms;
 static int g_was_moving;
+static int g_was_direct;           /* current WASD hold uses engine direct drive */
+static int g_eye_from_head;        /* this frame's eye came from the head bone (not fallback) */
+/* Direct-drive intent, published by fp_movement and ENFORCED inside the
+ * CharMovement::update hook -- applying there (before the original runs) wins
+ * the race against combat AI locomotion, which otherwise resets the movement
+ * mode every update and freezes WASD during fights. */
+static void *g_dm_mv;              /* the player's CharMovement while driving */
+static Vec3  g_dm_dir;             /* desired world direction */
+static int   g_dm_speed;           /* MoveSpeed: 0 walk / 1 jog / 2 run */
+static volatile LONG g_dm_active;  /* WASD held, direct drive on */
 static float g_speed_scale = 0.6f; /* scrollwheel throttle: walk (low) .. run (high) */
 static Vec3 g_last_dest;           /* last issued move-order target (for the re-issue gate) */
 static int  g_have_dest;
@@ -607,6 +745,19 @@ static int readable(const void *p, size_t n)
 }
 
 /* First player character (index 0) or NULL. */
+static int char_valid(void *c)
+{
+    if (!readable(c, 0x60)) return 0;
+    /* Reject anything whose vtable isn't in the exe (menu false positives). */
+    void **vt = *(void ***)c;
+    return readable(vt, (GETPOS_VTABLE_SLOT + 1) * 8) && in_module(vt);
+}
+
+/* The character FP controls: the game's CURRENTLY SELECTED squad member
+ * (PlayerInterface::selectedCharacter hand, resolved by matching hand ids
+ * against the player-characters list), falling back to squad slot 0. Following
+ * the selection is what lets camera-locking another squad member swap FP to
+ * them -- v1 hardwired stuff[0] and fought every switch attempt. */
 static void *first_player_char(void *gw)
 {
     if (!readable(gw, GW_PLAYER + 8)) return NULL;
@@ -615,12 +766,22 @@ static void *first_player_char(void *gw)
     uint32_t count = *(uint32_t *)((uintptr_t)player + PI_PLAYERCHARS + LEK_COUNT);
     void **stuff   = *(void ***)((uintptr_t)player + PI_PLAYERCHARS + LEK_STUFF);
     if (count == 0 || count > 4096 || !readable(stuff, 8)) return NULL;
-    void *c = stuff[0];
-    if (!readable(c, 0x60)) return NULL;
-    /* Reject anything whose vtable isn't in the exe (menu false positives). */
-    void **vt = *(void ***)c;
-    if (!readable(vt, (GETPOS_VTABLE_SLOT + 1) * 8) || !in_module(vt)) return NULL;
-    return c;
+
+    if (readable((void *)((uintptr_t)player + PI_SELECTED_CHAR + HAND_IDS), 20)) {
+        uint32_t *sel = (uint32_t *)((uintptr_t)player + PI_SELECTED_CHAR + HAND_IDS);
+        if (sel[0] != 0xb) {                 /* type 0xb = null-hand (nobody) */
+            for (uint32_t i = 0; i < count && i < 256; i++) {
+                void *c = readable(&stuff[i], 8) ? stuff[i] : NULL;
+                if (!c || !readable((void *)((uintptr_t)c + CHAR_HANDLE + HAND_IDS), 20))
+                    continue;
+                uint32_t *h = (uint32_t *)((uintptr_t)c + CHAR_HANDLE + HAND_IDS);
+                if (h[0]==sel[0] && h[1]==sel[1] && h[2]==sel[2]
+                    && h[3]==sel[3] && h[4]==sel[4] && char_valid(c))
+                    return c;
+            }
+        }
+    }
+    return char_valid(stuff[0]) ? stuff[0] : NULL;   /* fallback: squad slot 0 */
 }
 
 /* Character::getPosition via live vtable slot 8 (proven ABI). */
@@ -734,6 +895,270 @@ static void camera_lock(void *gw)
 static void mygui_cursor(int visible);   /* forward decl (defined below) */
 static void ensure_crosshair(void);
 
+/* --- quaternion helpers (Ogre {w,x,y,z}) --- */
+static Quat quat_mul(Quat a, Quat b)
+{
+    Quat r;
+    r.w = a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z;
+    r.x = a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y;
+    r.y = a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x;
+    r.z = a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w;
+    return r;
+}
+static Quat quat_conj(Quat q) { Quat r = { q.w, -q.x, -q.y, -q.z }; return r; }
+static Quat quat_norm(Quat q)
+{
+    float n = sqrtf(q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z);
+    if (n < 1e-6f) { Quat id = {1,0,0,0}; return id; }
+    q.w/=n; q.x/=n; q.y/=n; q.z/=n; return q;
+}
+/* shortest-arc slerp from a to b by t in [0,1] */
+static Quat quat_slerp(Quat a, Quat b, float t)
+{
+    float d = a.w*b.w + a.x*b.x + a.y*b.y + a.z*b.z;
+    if (d < 0) { b.w=-b.w; b.x=-b.x; b.y=-b.y; b.z=-b.z; d=-d; }
+    if (d > 0.9995f) {   /* nearly identical -> lerp */
+        Quat r = { a.w+(b.w-a.w)*t, a.x+(b.x-a.x)*t, a.y+(b.y-a.y)*t, a.z+(b.z-a.z)*t };
+        return quat_norm(r);
+    }
+    float th = acosf(d), s = sinf(th);
+    float wa = sinf((1-t)*th)/s, wb = sinf(t*th)/s;
+    Quat r = { wa*a.w+wb*b.w, wa*a.x+wb*b.x, wa*a.y+wb*b.y, wa*a.z+wb*b.z };
+    return r;
+}
+
+/* Head bone WORLD orientation (version-independent, via Ogre exports).
+ * VEH-guarded. Returns 1 + the quaternion on success. */
+static int get_head_quat(void *pc, Quat *out)
+{
+    if (!g_skel_getbone || !g_oldnode_getdori || !pc) return 0;
+    void *anim = readable((void *)((uintptr_t)pc + CHAR_ANIM), 8)
+        ? *(void **)((uintptr_t)pc + CHAR_ANIM) : NULL;
+    if (!readable(anim, ANIM_SKELETON + 8)) return 0;
+    void *skel = *(void **)((uintptr_t)anim + ANIM_SKELETON);
+    if (!readable(skel, 8)) return 0;
+    if (setjmp(g_guard_jb)) { g_skel_getbone = NULL; logline("head-orient read FAULTED -- disabled"); return 0; }
+    g_guard_armed = 1;
+    void *bone = g_skel_getbone(skel, g_head_bone);   /* "Bip01 Head" std::string */
+    const Quat *q = readable(bone, 8) ? g_oldnode_getdori(bone) : NULL;
+    g_guard_armed = 0;
+    if (!readable((void *)q, 16)) return 0;
+    *out = *q;
+    return 1;
+}
+
+/* --- Procedural aim-pitch through the spine/neck (PoC) --------------------
+ * Additive: each frame read the bone's ANIMATED local orientation, post-
+ * multiply a fractional pitch about a local axis, write it back, and flag the
+ * derived transforms dirty so skinning + the head-welded camera pick it up.
+ * No setManuallyControlled -> we layer on the live walk/run animation.
+ * The local pitch axis + gain + sign are tuned in-game (Biped bones permuted).
+ * VEH-guarded; pitch>0 = looking down. */
+#define SPINE_BEND_GAIN 0.5f      /* total lean as a fraction of look-pitch */
+#define SPINE_ROLL_UP   0.30f     /* roll gain, looking up   (pitch<0) */
+#define SPINE_ROLL_DOWN 0.30f     /* roll gain, looking down (pitch>0) */
+#define SPINE_ROLL_BIAS 0.0f      /* |pitch| roll, SAME direction both ways */
+
+/* Rotate a vector by a quaternion (v' = q * v * conj(q)), efficient form. */
+static Vec3 quat_rotvec(Quat q, Vec3 v)
+{
+    Vec3 u = { q.x, q.y, q.z };
+    Vec3 t = { 2.0f*(u.y*v.z - u.z*v.y), 2.0f*(u.z*v.x - u.x*v.z), 2.0f*(u.x*v.y - u.y*v.x) };
+    Vec3 r = { v.x + q.w*t.x + (u.y*t.z - u.z*t.y),
+               v.y + q.w*t.y + (u.z*t.x - u.x*t.z),
+               v.z + q.w*t.z + (u.x*t.y - u.y*t.x) };
+    return r;
+}
+
+static void bend_spine(void *pc, float pitch)
+{
+    if (!g_spine_ready || !g_skel_getbone || !pc) return;
+    void *anim = readable((void *)((uintptr_t)pc + CHAR_ANIM), 8)
+        ? *(void **)((uintptr_t)pc + CHAR_ANIM) : NULL;
+    if (!readable(anim, ANIM_SKELETON + 8)) return;
+    void *skel = *(void **)((uintptr_t)anim + ANIM_SKELETON);
+    if (!readable(skel, 8)) return;
+
+    float total = pitch * SPINE_BEND_GAIN;    /* look down (pitch>0) -> bend forward */
+    /* Bend only spine1+spine2; the neck and head animate naturally on top of the
+     * lean. Manually controlling the neck warped the neck/head junction (our
+     * neck rotation fighting whatever drives the head). */
+    struct { unsigned char *nm; float w; const char *tag; } chain[] = {
+        { g_bone_spine1, 0.5f, "spine1" },
+        { g_bone_spine2, 0.5f, "spine2" },
+    };
+    const int NB = (int)(sizeof(chain) / sizeof(chain[0]));
+    if (setjmp(g_guard_jb)) { g_spine_ready = 0; logline("spine-bend FAULTED -- disabled"); return; }
+    g_guard_armed = 1;
+    static int dbg;
+    int logit = KFP_DEBUG_LOG && ((++dbg) % 120) == 0;
+
+    void *bones[4];
+    for (int i = 0; i < NB; i++) {
+        bones[i] = g_skel_getbone(skel, chain[i].nm);
+        if (!readable(bones[i], 8)) { g_guard_armed = 0; return; }
+    }
+
+    /* One-time: capture each bone's current (animated) local pose as the aim
+     * reference, then mark the bones manually-controlled so the animation stops
+     * resetting them each frame -- otherwise our writes are wiped before the
+     * render (only our own head-position read saw them). */
+    if (!g_spine_manual) {
+        if (!g_oldbone_setmanual) { g_guard_armed = 0; return; }
+        for (int i = 0; i < NB; i++) {
+            const Quat *lq = g_oldnode_getori(bones[i]);
+            g_spine_rest[i] = readable((void *)lq, 16) ? *lq : (Quat){ 1, 0, 0, 0 };
+            g_oldbone_setmanual(bones[i], 1);
+        }
+        g_spine_manual = 1;
+        logline("[spine] bones set manuallyControlled; rest poses captured");
+    }
+
+    /* WORLD pitch axis = character's LATERAL (left-right) axis. Deriving it from
+     * g_yaw alone isn't rotation-agnostic: the body's TRUE facing (set by the
+     * game when you turn in place) doesn't track g_yaw through a 180, so the bend
+     * inverted when facing behind. Instead: calibrate the lateral direction once
+     * in the root spine's LOCAL frame (from g_yaw, valid while idle-facing), then
+     * each frame rotate it by the root's CURRENT world orientation -- so it
+     * follows the real body facing through any turn. Root spine isn't one of our
+     * controlled bones, so its derived reflects the animation's true facing. */
+    Vec3 world_axis, fwd_w;
+    void *rootb = g_skel_getbone(skel, g_bone_rootspine);
+    const Quat *rdq = readable(rootb, 8) ? g_oldnode_getdori(rootb) : NULL;
+    if (readable((void *)rdq, 16) && g_have_fwd) {
+        /* g_fwd_local is calibrated by calibrate_spine_fwd() while the weapon is
+         * SHEATHED and the body idle/level -- the only time "body faces g_yaw"
+         * actually holds. NEVER calibrate here: with a weapon drawn the combat
+         * stance blades the body sideways, and a skewed axis turns pitch into
+         * roll (the session-dependent weapon-roll ghost we chased with gains). */
+        Vec3 fw = quat_rotvec(*rdq, g_fwd_local);          /* body forward -> world, tracks facing */
+        float hl = sqrtf(fw.x*fw.x + fw.z*fw.z);
+        if (hl < 1e-4f) hl = 1e-4f;
+        fw.x /= hl; fw.z /= hl;                             /* flatten to horizontal, normalize */
+        fwd_w = (Vec3){ fw.x, 0.0f, fw.z };                /* forward axis for roll correction */
+        /* lateral = up x forward: guaranteed perpendicular to forward AND
+         * horizontal -> pitch about it is pure, no roll (any calibration error
+         * becomes an imperceptible yaw offset instead of visible weapon roll). */
+        world_axis = (Vec3){ fw.z, 0.0f, -fw.x };
+    } else {
+        world_axis = (Vec3){ cosf(g_yaw), 0.0f, -sinf(g_yaw) };  /* fallback */
+        fwd_w      = (Vec3){ sinf(g_yaw), 0.0f, cosf(g_yaw) };
+    }
+
+    /* Rebuild each bone's REST-pose world orientation from the root's live derived
+     * and the captured rest locals (NOT the bent derived), and project the axis
+     * through that. Reading the bent derived fed the bend back into the axis and
+     * leaked pitch into roll; the rest chain is feedback-free -> pure pitch. */
+    Quat rest_der = readable((void *)rdq, 16) ? *rdq : (Quat){ 1, 0, 0, 0 };  /* root, live facing */
+    for (int i = 0; i < NB; i++) {
+        rest_der = quat_norm(quat_mul(rest_der, g_spine_rest[i])); /* bone i rest world orient */
+        Vec3 Al = quat_rotvec(quat_conj(rest_der), world_axis);   /* world axis -> rest frame */
+        float a = total * chain[i].w;
+        float c = cosf(a * 0.5f), s = sinf(a * 0.5f);
+        Quat dpitch = { c, Al.x*s, Al.y*s, Al.z*s };
+        /* Roll correction about the forward axis, proportional to this bone's
+         * pitch, to cancel the CW/CCW weapon twist the arm rig adds. */
+        Vec3 Fl = quat_rotvec(quat_conj(rest_der), fwd_w);
+        float rollg = (pitch < 0.0f ? SPINE_ROLL_UP : SPINE_ROLL_DOWN);
+        float ar = rollg * a + SPINE_ROLL_BIAS * fabsf(a);   /* linear (flips) + bias (same both ways) */
+        float cr = cosf(ar * 0.5f), sr = sinf(ar * 0.5f);
+        Quat droll = { cr, Fl.x*sr, Fl.y*sr, Fl.z*sr };
+        Quat d  = quat_norm(quat_mul(dpitch, droll));
+        Quat nq = quat_norm(quat_mul(g_spine_rest[i], d)); /* rest * (pitch + roll correct) */
+        g_oldnode_setori(bones[i], &nq);
+        g_oldnode_needupd(bones[i], 1);
+        if (logit)
+            logline("[spine] %s a=%.2f rollg=%.2f Al=(%.2f,%.2f,%.2f) set=(%.3f,%.3f,%.3f,%.3f)",
+                    chain[i].tag, a, rollg, Al.x, Al.y, Al.z, nq.w, nq.x, nq.y, nq.z);
+    }
+    g_guard_armed = 0;
+}
+
+/* Calibrate the body-forward axis in root-spine local frame. Call ONLY when
+ * "body faces g_yaw" holds: weapon sheathed, idle, looking level (orient-to-
+ * control has squared the body to the camera). The result is a skeleton
+ * constant, so it persists across draw/sheathe and only refreshes when the
+ * conditions are met again. */
+static void calibrate_spine_fwd(void *pc)
+{
+    if (!g_spine_ready || !g_skel_getbone || !pc) return;
+    void *anim = readable((void *)((uintptr_t)pc + CHAR_ANIM), 8)
+        ? *(void **)((uintptr_t)pc + CHAR_ANIM) : NULL;
+    if (!readable(anim, ANIM_SKELETON + 8)) return;
+    void *skel = *(void **)((uintptr_t)anim + ANIM_SKELETON);
+    if (!readable(skel, 8)) return;
+    if (setjmp(g_guard_jb)) { g_guard_armed = 0; return; }
+    g_guard_armed = 1;
+    void *rootb = g_skel_getbone(skel, g_bone_rootspine);
+    const Quat *rdq = readable(rootb, 8) ? g_oldnode_getdori(rootb) : NULL;
+    if (readable((void *)rdq, 16)) {
+        g_fwd_local = quat_rotvec(quat_conj(*rdq),
+                                  (Vec3){ sinf(g_yaw), 0.0f, cosf(g_yaw) });
+        if (!g_have_fwd) logline("[spine] fwd axis calibrated (sheathed+idle+level)");
+        g_have_fwd = 1;
+    }
+    g_guard_armed = 0;
+}
+
+/* Hand the spine/neck back to the animation. Called when we leave active FP
+ * (free cam, FP off) -- otherwise the frozen manual pose flails as the body
+ * turns. Re-entering FP re-captures rest poses via bend_spine; the calibrated
+ * forward axis persists (it's a skeleton constant, not per-stance state). */
+static void release_spine(void *pc)
+{
+    if (!g_spine_manual) return;
+    g_spine_manual = 0;
+    if (!g_oldbone_setmanual || !g_skel_getbone || !pc) return;
+    void *anim = readable((void *)((uintptr_t)pc + CHAR_ANIM), 8)
+        ? *(void **)((uintptr_t)pc + CHAR_ANIM) : NULL;
+    if (!readable(anim, ANIM_SKELETON + 8)) return;
+    void *skel = *(void **)((uintptr_t)anim + ANIM_SKELETON);
+    if (!readable(skel, 8)) return;
+    unsigned char *names[3] = { g_bone_spine1, g_bone_spine2, g_bone_neck };
+    if (setjmp(g_guard_jb)) { g_guard_armed = 0; return; }
+    g_guard_armed = 1;
+    for (int i = 0; i < 3; i++) {
+        void *b = g_skel_getbone(skel, names[i]);
+        if (readable(b, 8)) g_oldbone_setmanual(b, 0);
+    }
+    g_guard_armed = 0;
+    logline("[spine] manual control released");
+}
+
+/* Find the character's body Ogre::Entity on the AnimationClass by PROBING its
+ * members: the right pointer is the one whose Entity::getSkeleton() equals the
+ * skeleton we already know (anim+0xB8). Self-validating -- no vtable-slot or
+ * offset guessing. Probed once, then cached. Each candidate call VEH-guarded.
+ * NOTE: clobbers g_guard_jb; call OUTSIDE any other guarded region. */
+static void *find_body_entity(void *animc)
+{
+    if (!g_entity_getskel || !readable(animc, ANIM_SKELETON + 8)) return NULL;
+    void *skel = *(void **)((uintptr_t)animc + ANIM_SKELETON);
+    if (!skel) return NULL;
+    if (g_anim_ent_off == -2) return NULL;   /* probe already failed for good */
+    if (g_anim_ent_off >= 0)
+        return readable((void *)((uintptr_t)animc + g_anim_ent_off), 8)
+            ? *(void **)((uintptr_t)animc + g_anim_ent_off) : NULL;
+    for (int off = 0; off < 0x300; off += 8) {
+        if (!readable((void *)((uintptr_t)animc + off), 8)) break;
+        void *p = *(void **)((uintptr_t)animc + off);
+        if (!readable(p, 0x100)) continue;
+        void *sk;
+        if (setjmp(g_guard_jb)) { g_guard_armed = 0; continue; }
+        g_guard_armed = 1;
+        sk = g_entity_getskel(p);
+        g_guard_armed = 0;
+        if (sk == skel) {
+            g_anim_ent_off = off;
+            logline("[aim] body Entity found at anim+0x%x -> %p", off, p);
+            return p;
+        }
+    }
+    logline("[aim] body Entity probe FAILED (getskel=%p)", (void *)g_entity_getskel);
+    g_anim_ent_off = -2;   /* don't re-probe every frame */
+    return NULL;
+}
+
 /* --- DirectInput mouse (FP look deltas) ---------------------------------
  * The one delta source that both FEELS right and COEXISTS with the game:
  *  - RegisterRawInputDevices stole Wine-dinput's registration -> right-click
@@ -749,6 +1174,9 @@ static const GUID g_guid_sysmouse =
 static const GUID g_iid_idi8a =
     {0xBF798030,0x483A,0x4DA2,{0xAA,0x99,0x5D,0x64,0xED,0x36,0x97,0x00}};
 typedef HRESULT (WINAPI *di8create_t)(HINSTANCE, DWORD, REFIID, LPVOID *, LPUNKNOWN);
+
+static DWORD WINAPI di_poll_thread(void *unused);   /* defined below */
+static int g_di_thread_on;
 
 static void ensure_dinput(void)
 {
@@ -773,10 +1201,17 @@ static void ensure_dinput(void)
     if (SUCCEEDED(g_di_mouse->lpVtbl->Acquire(g_di_mouse))) {
         g_di_ready = 1;
         logline("DirectInput mouse acquired (non-exclusive background)");
+        if (!g_di_thread_on) {
+            g_di_thread_on = 1;
+            CloseHandle(CreateThread(NULL, 0, di_poll_thread, NULL, 0, NULL));
+            logline("mouse poll thread started (~1kHz, framerate-independent look)");
+        }
     }
 }
 
-/* Relative deltas since the previous call (mouse axes default to relative). */
+/* Relative deltas since the previous call (mouse axes default to relative).
+ * Called ONLY from the poll thread once it starts (single GetDeviceState
+ * consumer -- concurrent calls would split deltas unpredictably). */
 static int di_get_deltas(LONG *dx, LONG *dy)
 {
     if (!g_di_ready) return 0;
@@ -789,6 +1224,55 @@ static int di_get_deltas(LONG *dx, LONG *dy)
     return 1;
 }
 
+/* Frame-rate-independent look capture: a dedicated ~1kHz thread owns the
+ * DirectInput reads and accumulates counts; each frame consumes the total.
+ * Per-frame GetDeviceState sampled the mouse at the FRAME rate, and at high
+ * fps that aliases against the mouse's own report rate (beat patterns of
+ * 0/2-count frames = visible wobble; felt fine only at the frame rates we
+ * developed at). Constant-rate capture decouples feel from fps entirely. */
+static volatile LONG g_acc_dx, g_acc_dy;
+static DWORD WINAPI di_poll_thread(void *unused)
+{
+    (void)unused;
+    timeBeginPeriod(1);              /* 1ms Sleep granularity for this loop */
+    for (;;) {
+        LONG dx, dy;
+        if (di_get_deltas(&dx, &dy)) {
+            if (dx) InterlockedAdd(&g_acc_dx, dx);
+            if (dy) InterlockedAdd(&g_acc_dy, dy);
+        }
+        Sleep(1);
+    }
+    return 0;
+}
+/* Consume (and zero) the accumulated deltas. */
+static void di_take_acc(LONG *dx, LONG *dy)
+{
+    *dx = InterlockedExchange(&g_acc_dx, 0);
+    *dy = InterlockedExchange(&g_acc_dy, 0);
+}
+
+/* Hand the camera back to the vanilla system CONTINUOUSLY: seat the center
+ * node on our current FP look direction and the camera node at (0,0,zoom),
+ * via the game's own manuallySetOrientationAndZoom -- so the RTS camera (or
+ * the map fly-out) resumes facing exactly where the player was looking,
+ * with a legit zoom state (no endless zoom-out, no view cut). */
+static void vanilla_cam_handoff(void *cam, void *camnode, float zoom)
+{
+    float qy = cosf(g_yaw * 0.5f),   sqy = sinf(g_yaw * 0.5f);
+    float qp = cosf(g_pitch * 0.5f), sqp = sinf(g_pitch * 0.5f);
+    Quat q = { qy * qp, qy * sqp, sqy * qp, -sqy * sqp };
+    /* vanilla keeps the camera node's LOCAL orientation at identity (only the
+     * center rotates); our per-frame derived-ori writes dirtied it, and
+     * manuallySetOrientationAndZoom doesn't reset it -- do that here. */
+    Quat ident = { 1.0f, 0.0f, 0.0f, 0.0f };
+    if (readable(camnode, 8)) g_node_set_ori(camnode, &ident);
+    if (setjmp(g_guard_jb)) { g_guard_armed = 0; return; }
+    g_guard_armed = 1;
+    ((void (*)(void *, const Quat *, float))(g_base + RVA_CAM_MANUAL_SETOZ))(cam, &q, zoom);
+    g_guard_armed = 0;
+}
+
 static void fp_camera_override(void *gw)
 {
     if (!g_ogre_ready) return;
@@ -799,6 +1283,256 @@ static void fp_camera_override(void *gw)
 
     /* Only drive the override while FP is on AND not in free-cam mode. */
     int active = g_fp_mode && !*(unsigned char *)((uintptr_t)cam + CC_FREECAM);
+
+    {   /* [map-bug diag] log every state flip that can knock us out of FP */
+        static int pa = -1, pf = -1, po = -1, pm = -1;
+        int fc = *(unsigned char *)((uintptr_t)cam + CC_FREECAM);
+        int ov = (g_ui_mask & UIMASK_OVERVIEW) ? 1 : 0;
+        if (KFP_DEBUG_LOG && (active != pa || fc != pf || ov != po || g_fp_mode != pm)) {
+            logline("[cam] fp=%d freecam=%d overview=%d active=%d mask=0x%03x",
+                    g_fp_mode, fc, ov, active, g_ui_mask);
+            pa = active; pf = fc; po = ov; pm = g_fp_mode;
+        }
+    }
+
+    /* Drive the aim-lean whenever FP is ON -- including free cam, so it stays
+     * visible for third-person inspection while you orbit (the rotation-agnostic
+     * axis keeps it body-relative). Release when FP is off or while ragdolled,
+     * handing the spine back to the animation. Runs before the eye block below
+     * so the FP eye still rides the bend. */
+    {
+        void *pcx = first_player_char(gw);
+        /* Character swap (selected a different squad member): release the old
+         * character's driven bones and reset all per-character calibrations so
+         * FP re-seats cleanly on the new body. */
+        static void *pc_prev;
+        if (pcx != pc_prev) {
+            if (pc_prev && g_spine_manual) release_spine(pc_prev);
+            g_have_qref = 0; g_down_blend = 0.0f; g_is_down = 0;  /* ragdoll ref */
+            g_have_fwd = 0;                                       /* spine fwd axis */
+            /* NOTE: g_have_t/g_tx/g_tz are NOT reset -- T is the floating-origin
+             * translation (ogre vs game coords), scene-global and identical for
+             * every character. Resetting it on swap opened an uncalibrated
+             * window where the center-snap fallback fed back on itself and the
+             * camera glided away while holding WASD (even paused). */
+            pc_prev = pcx;
+        }
+        g_player_pc = pcx;              /* cached for the ranged free-aim hook */
+        /* Only lean when a weapon is drawn (in hands) -- the aim-lean is for
+         * aiming, and looked odd during normal unarmed/sheathed movement. */
+        void *wih = (pcx && readable((void *)((uintptr_t)pcx + CHAR_WEAPON_IN_HANDS), 8))
+            ? *(void **)((uintptr_t)pcx + CHAR_WEAPON_IN_HANDS) : NULL;
+        int weapon_drawn = (wih != NULL);
+        static int prev_drawn = -1;
+        if (KFP_DEBUG_LOG && weapon_drawn != prev_drawn) {
+            logline("[spine] weaponInHands=%p drawn=%d", wih, weapon_drawn);
+            prev_drawn = weapon_drawn;
+        }
+        if (g_fp_mode && !g_is_down && weapon_drawn) bend_spine(pcx, g_pitch);
+        else if (g_spine_manual)                     release_spine(pcx);
+        /* Calibrate the forward axis only when the body reliably faces the
+         * camera: sheathed (no bladed combat stance), idle, looking level. */
+        if (g_fp_mode && !g_is_down && !weapon_drawn && !g_was_moving
+            && g_pitch > -0.10f && g_pitch < 0.10f)
+            calibrate_spine_fwd(pcx);
+
+        if (KFP_MANUAL_AIM)
+            manual_fire_update(pcx);    /* LMB -> GunClass::shoot at crosshair */
+
+        /* R toggles manual aim: raise the ranged weapon with no target needed.
+         * While on, force the ranged state machine into aiming every frame
+         * (combat updates keep trying to end it without a target); this also
+         * lights up the pose/facing overrides, so the weapon tracks the
+         * crosshair. Cleared on sheathe / FP off. */
+        if (KFP_MANUAL_AIM) {
+            static int r_prev;
+            static int draw_grace;              /* frames to wait for the draw anim */
+            int r = (GetAsyncKeyState(VK_AIM_TOGGLE) & 0x8000) != 0;
+            if (r && !r_prev && !weapon_drawn && !g_ui_open && pcx) {
+                /* Out of combat the weapon is holstered (weaponInHands NULL) and
+                 * the game only draws it in combat -- so R draws it ourselves:
+                 * vtable+0x3C8 getThePreferredWeapon, vtable+0x3D8 drawWeapon
+                 * (Item*, std::string by-value = ptr to 32B SSO temp). */
+                typedef void *(*get_pref_t)(void *pc);
+                typedef char (*draw_weap_t)(void *pc, void *item, void *sso_str);
+                if (setjmp(g_guard_jb)) { g_guard_armed = 0; logline("[aim] drawWeapon FAULTED"); }
+                else {
+                    g_guard_armed = 1;
+                    void **vt = readable(pcx, 8) ? *(void ***)pcx : NULL;
+                    if (readable((void *)((uintptr_t)vt + 0x3D8), 8)) {
+                        void *w = ((get_pref_t)vt[0x3C8 / 8])(pcx);
+                        if (w) {
+                            unsigned char empty[32]; make_mstr(empty, "");
+                            ((draw_weap_t)vt[0x3D8 / 8])(pcx, w, empty);
+                            g_aim_mode = 1; draw_grace = 90;
+                            logline("[aim] drew weapon %p; aim RAISED", w);
+                        } else logline("[aim] no preferred weapon to draw");
+                    }
+                    g_guard_armed = 0;
+                }
+            } else if (r && !r_prev && weapon_drawn && !g_ui_open) {
+                g_aim_mode = !g_aim_mode;
+                void *rcd = readable((void *)((uintptr_t)pcx + CHAR_RANGEDCOMBAT), 8)
+                    ? *(void **)((uintptr_t)pcx + CHAR_RANGEDCOMBAT) : NULL;
+                void *gund = (rcd && readable((void *)((uintptr_t)rcd + RC_GUN), 8))
+                    ? *(void **)((uintptr_t)rcd + RC_GUN) : NULL;
+                int st = (rcd && readable(rcd, 4)) ? *(int *)rcd : -1;
+                int cm = (rcd && readable((void *)((uintptr_t)rcd + RC_COMBATMODE), 1))
+                    ? *(unsigned char *)((uintptr_t)rcd + RC_COMBATMODE) : -1;
+                int am = (gund && readable((void *)((uintptr_t)gund + GUN_AMMO), 4))
+                    ? *(int *)((uintptr_t)gund + GUN_AMMO) : -1;
+                int physflag = (gund && readable((void *)((uintptr_t)gund + 0x60), 2))
+                    ? *(unsigned char *)((uintptr_t)gund + 0x60)
+                      | (*(unsigned char *)((uintptr_t)gund + 0x61) << 8) : -1;
+                logline("[aim] manual aim %s | rc=%p gun=%p state=%d combatMode=%d ammo=%d phys/vis=0x%x gpsn=%p",
+                        g_aim_mode ? "RAISED" : "lowered", rcd, gund, st, cm, am,
+                        physflag, (void *)g_get_parent_scenenode);
+            }
+            r_prev = r;
+            if (draw_grace > 0) draw_grace--;   /* the draw anim needs frames */
+            else if (!weapon_drawn) g_aim_mode = 0;
+            if (!g_fp_mode) g_aim_mode = 0;
+            static int aim_prev;
+            if (aim_prev && !g_aim_mode && pcx) {   /* lower: hide gun + stop aim anim */
+                void *rc2 = readable((void *)((uintptr_t)pcx + CHAR_RANGEDCOMBAT), 8)
+                    ? *(void **)((uintptr_t)pcx + CHAR_RANGEDCOMBAT) : NULL;
+                void *g2 = (rc2 && readable((void *)((uintptr_t)rc2 + RC_GUN), 8))
+                    ? *(void **)((uintptr_t)rc2 + RC_GUN) : NULL;
+                if (setjmp(g_guard_jb)) { g_guard_armed = 0; }
+                else {
+                    g_guard_armed = 1;
+                    if (g2 && readable(g2, 0x10)) {
+                        void **gvt = *(void ***)g2;
+                        if (readable((void *)((uintptr_t)gvt + 0x10), 8))
+                            ((void (*)(void *, char))gvt[1])(g2, 0);
+                    }
+                    /* animationUpdate's target==NULL branch STOPS the aim anim --
+                     * the exact cleanup vanilla runs on combat end. Without it the
+                     * driven anim keeps its weight and the pose sticks (hug). */
+                    if (rc2 && g_ranged_animupd_orig) {
+                        Vec3 z = { 0, 0, 0 };
+                        g_ranged_animupd_orig(rc2, 0.016f, &z, NULL);
+                        logline("[aim] aim anim stopped (lowered)");
+                    }
+                    g_guard_armed = 0;
+                }
+                if (readable((void *)((uintptr_t)rc2 + RC_COMBATMODE), 1))
+                    *(unsigned char *)((uintptr_t)rc2 + RC_COMBATMODE) = 0;  /* let AI end combat */
+            }
+            aim_prev = g_aim_mode;
+            if (g_aim_mode && pcx) {
+                void *rc = readable((void *)((uintptr_t)pcx + CHAR_RANGEDCOMBAT), 8)
+                    ? *(void **)((uintptr_t)pcx + CHAR_RANGEDCOMBAT) : NULL;
+                void *gun = (rc && readable((void *)((uintptr_t)rc + RC_GUN), 8))
+                    ? *(void **)((uintptr_t)rc + RC_GUN) : NULL;
+                if (readable((void *)((uintptr_t)rc + RC_COMBATMODE), 1)) {
+                    *(unsigned char *)((uintptr_t)rc + RC_COMBATMODE) = 1;
+                    if (readable((void *)((uintptr_t)rc + RC_STATE_OFF), 4))
+                        *(int *)((uintptr_t)rc + RC_STATE_OFF) = 3;   /* WAITING = held aim */
+                }
+                /* The AI task layer is the ONLY caller of updateT->animationUpdate
+                 * (verified: 0x438c70 is the sole caller, invoked from AI task
+                 * objects), so with no combat task we drive the pose ourselves.
+                 * Also reload directly when empty (instant for now). */
+                /* Probe/fetch the body entity BEFORE the guarded region below
+                 * (the probe uses g_guard_jb itself). */
+                void *animx = readable((void *)((uintptr_t)pcx + CHAR_ANIM), 8)
+                    ? *(void **)((uintptr_t)pcx + CHAR_ANIM) : NULL;
+                void *body_ent = animx ? find_body_entity(animx) : NULL;
+                Vec3 aim;
+                if (rc && g_ranged_animupd_orig && fp_aim_point(&aim)) {
+                    if (setjmp(g_guard_jb)) { g_guard_armed = 0; g_aim_mode = 0;
+                        logline("[aim] pose drive FAULTED -- aim mode off"); }
+                    else {
+                        g_guard_armed = 1;
+                        /* Out of combat rc->gun is NULL (setup nulls the cache;
+                         * only combat repopulates it) -- fetch it the game's way
+                         * and prime the cache so animationUpdate can use it. */
+                        if (!gun) {
+                            gun = ((void *(*)(void *))(g_base + RVA_RC_GETGUN))(rc);
+                            if (gun && readable((void *)((uintptr_t)rc + RC_GUN), 8)) {
+                                *(void **)((uintptr_t)rc + RC_GUN) = gun;
+                                logline("[aim] gun fetched via getGun: %p", gun);
+                            }
+                        }
+                        if (gun && readable((void *)((uintptr_t)gun + GUN_AMMO), 4)
+                            && *(int *)((uintptr_t)gun + GUN_AMMO) <= 0) {
+                            typedef void (*gun_reload_t)(void *gun);
+                            ((gun_reload_t)(g_base + RVA_GUN_RELOAD))(gun);
+                            logline("[aim] reloaded");
+                        }
+                        /* The wielded crossbow visual is the GUN's own mesh (the
+                         * item stays on the back). GunClassPersonal shares the
+                         * createPhysical(parentNode, material) impl the turret
+                         * wrapper showed us: parent = body entity's scene node.
+                         * Body entity = anim->vt[+0x20]() (the same getter draw/
+                         * sheathe use); parent via Ogre getParentSceneNode. */
+                        if (gun && g_get_parent_scenenode
+                            && readable((void *)((uintptr_t)gun + 0x60), 1)
+                            && !*(unsigned char *)((uintptr_t)gun + 0x60)) {
+                            void *parent = body_ent ? g_get_parent_scenenode(body_ent) : NULL;
+                            if (parent && readable(parent, 0x40) && readable(gun, 0x20)) {
+                                void **gvt0 = *(void ***)gun;
+                                unsigned char mat[32]; make_mstr(mat, "");
+                                logline("[aim] createPhysical attempt: gun=%p parent=%p", gun, parent);
+                                ((char (*)(void *, void *, void *))gvt0[3])(gun, parent, mat);
+                                logline("[aim] createPhysical -> flag=%d",
+                                        (int)*(unsigned char *)((uintptr_t)gun + 0x60));
+                            } else {
+                                logline("[aim] createPhysical skipped: ent=%p parent=%p", body_ent, parent);
+                            }
+                        }
+                        if (gun && readable(gun, 0x118)) {
+                            void **gvt = *(void ***)gun;
+                            typedef void (*gun_setvis_t)(void *g, char on);
+                            typedef void (*gun_update_t)(void *g, const Vec3 *fallback);
+                            /* setVisible's SHOW branch is gated on +0x110 == 0
+                             * (decomp-verified); clear it while manually aiming. */
+                            if (*(unsigned char *)((uintptr_t)gun + 0x110)) {
+                                *(unsigned char *)((uintptr_t)gun + 0x110) = 0;
+                                logline("[aim] cleared gun+0x110 hide flag");
+                            }
+                            static int visdbg;
+                            if ((++visdbg % 300) == 1)
+                                logline("[aim] gun meshes: drawn=%p undrawn=%p bolts=%d",
+                                        *(void **)((uintptr_t)gun + 0x100),
+                                        *(void **)((uintptr_t)gun + 0x108),
+                                        *(int *)((uintptr_t)gun + 0xA8));
+                            if (readable((void *)((uintptr_t)gvt + 0x10), 8)) {
+                                ((gun_setvis_t)gvt[1])(gun, 1);      /* vt+0x08 setVisible */
+                                ((gun_update_t)gvt[2])(gun, &aim);   /* vt+0x10 update */
+                            }
+                        }
+                        /* target must be NON-NULL: the null branch STOPS the aim
+                         * anim (arms drop); non-null plays the aim-hold anim,
+                         * drives lookatPosition(aimpos) and readyToShoot. It is
+                         * only null-checked here, never dereferenced -- pass
+                         * the player object as a safe stand-in. */
+                        g_ranged_animupd_orig(rc, 0.016f, &aim, pcx);
+                        g_guard_armed = 0;
+                    }
+                }
+            }
+        }
+
+        /* Ranged lock-on breaker: with an explicit right-click target the
+         * facing is driven by a path that bypasses faceDirection, so while in
+         * FP ranged combat force the facing member (CharMovement+0xD0,
+         * verified via getFacingDirection) to the look direction each frame. */
+        if (g_fp_mode && pcx) {
+            void *rc = readable((void *)((uintptr_t)pcx + CHAR_RANGEDCOMBAT), 8)
+                ? *(void **)((uintptr_t)pcx + CHAR_RANGEDCOMBAT) : NULL;
+            if (readable((void *)((uintptr_t)rc + RC_COMBATMODE), 1)
+                && *(unsigned char *)((uintptr_t)rc + RC_COMBATMODE)
+                && readable((void *)((uintptr_t)pcx + CHAR_MOVEMENT), 8)) {
+                void *mv = *(void **)((uintptr_t)pcx + CHAR_MOVEMENT);
+                if (readable((void *)((uintptr_t)mv + 0xD0), 12)) {
+                    Vec3 *fdir = (Vec3 *)((uintptr_t)mv + 0xD0);
+                    fdir->x = sinf(g_yaw); fdir->y = 0.0f; fdir->z = cosf(g_yaw);
+                }
+            }
+        }
+    }
 
     if (active) {
         /* [foliage diag] sample the camera node's derived position as the game left
@@ -830,7 +1564,19 @@ static void fp_camera_override(void *gw)
         else panel_frames = 0;
         int ui_open = (control == 0) || (panels_now && panel_frames >= 8);
         g_ui_open = ui_open;                    /* read by the setPointer hook */
-        if (!g_ovr_prev) { mygui_cursor(0); g_pointer_default = 1; }  /* FP enter */
+        if (!g_ovr_prev) {                                            /* FP enter */
+            mygui_cursor(0); g_pointer_default = 1;
+            /* Save the vanilla zoom: the camera node's LOCAL position is
+             * (0,0,zoom) under the rotating center node (verified in
+             * manuallySetOrientationAndZoom). Our FP writes trash the local
+             * position, and vanilla never resets it -- restoring this exact
+             * value on exit is what prevents the unending zoom-out. */
+            if (g_node_get_pos) {
+                const Vec3 *lp = g_node_get_pos(node);
+                if (readable((void *)lp, 12) && lp->z > 2.0f && lp->z < 2000.0f)
+                    g_vanilla_zoom = lp->z;
+            }
+        }
         ensure_crosshair();
         if (g_crosshair && g_widget_setvisible)
             g_widget_setvisible(g_crosshair, (g_pointer_default && !ui_open) ? 1 : 0);
@@ -843,21 +1589,33 @@ static void fp_camera_override(void *gw)
             if (!g_cursor_hidden) { while (ShowCursor(FALSE) >= 0) { } g_cursor_hidden = 1; }
             ensure_dinput();
             if (!g_ovr_prev) {
-                g_yaw = 0.0f; g_pitch = 0.0f;   /* FP enter: zero the look */
-                LONG jx, jy; di_get_deltas(&jx, &jy);   /* drain pre-FP motion */
+                /* FP enter (incl. returning from free cam). Don't reset while
+                 * ragdolled -- keep the frozen look and head reference so the
+                 * follow resumes. g_qref self-recalibrates every upright frame,
+                 * so no explicit clear is needed. */
+                if (!g_is_down) { g_yaw = 0.0f; g_pitch = 0.0f; }
+                LONG jx, jy; di_take_acc(&jx, &jy);     /* drain pre-FP motion */
             } else if (!g_ui_prev) {            /* skip the delta on the frame a dialogue closes */
                 /* DirectInput relative deltas (see ensure_dinput comment);
                  * cursor-warp deltas only as fallback. */
                 LONG rdx, rdy;
-                if (!di_get_deltas(&rdx, &rdy)) {
-                    rdx = cur.x - cx; rdy = cur.y - cy;
+                if (g_di_ready) {
+                    di_take_acc(&rdx, &rdy);   /* poll thread accumulates at ~1kHz */
+                } else {
+                    rdx = cur.x - cx; rdy = cur.y - cy;   /* warp fallback */
                 }
-                g_yaw   -= (float)rdx * LOOK_SENS;   /* mouse right -> look right */
-                g_pitch += (float)rdy * LOOK_SENS;   /* mouse down  -> look down  */
-                if (g_pitch >  1.4f) g_pitch =  1.4f;
-                if (g_pitch < -1.4f) g_pitch = -1.4f;
+                /* Freeze look input while ragdolled: the camera follows the head,
+                 * and world-axis yaw/pitch would map to the wrong axes on the
+                 * rolled view (mouse-up -> roll etc.). Still drain the deltas so
+                 * they don't accumulate and jump the view on get-up. */
+                if (!g_is_down) {
+                    g_yaw   -= (float)rdx * LOOK_SENS;   /* mouse right -> look right */
+                    g_pitch += (float)rdy * LOOK_SENS;   /* mouse down  -> look down  */
+                    if (g_pitch >  1.4f) g_pitch =  1.4f;
+                    if (g_pitch < -1.4f) g_pitch = -1.4f;
+                }
             } else {
-                LONG jx, jy; di_get_deltas(&jx, &jy);   /* dialogue frame: discard */
+                LONG jx, jy; di_take_acc(&jx, &jy);     /* dialogue frame: discard */
             }
             SetCursorPos(cx, cy);  /* recenter so the cursor never drifts to edges */
         }
@@ -870,6 +1628,12 @@ static void fp_camera_override(void *gw)
          * item panels keep the normal 3D view, so the override continues for
          * them and the FP framing is preserved.) */
         if (ui_open && (g_ui_mask & UIMASK_OVERVIEW)) {
+            if (g_have_eye) {
+                /* Hand off ONCE as the map takes over, facing our FP look
+                 * direction at minimal zoom -- continuous view (no cut out of
+                 * first person) AND a legit zoom state (no endless zoom-out). */
+                vanilla_cam_handoff(cam, node, 2.0f);
+            }
             g_have_eye = 0;            /* no mid-frame re-asserts either */
             g_ovr_prev = active;
             return;
@@ -882,19 +1646,23 @@ static void fp_camera_override(void *gw)
          * free (below). */
         void *center = *(void **)((uintptr_t)cam + CC_CENTER);
         Vec3 centerW;
-        if (readable(center, 8) && g_node_get_dpos(center, &centerW)) {
+        if (readable(center, 8)
+            && (g_node_getdpos_upd ? g_node_getdpos_upd(center, &centerW)   /* FORCED fresh */
+                                   : g_node_get_dpos(center, &centerW))) {
             /* The `center` node bobs/smooths with the vanilla camera, so it is a
              * bad vertical anchor. Take X/Z from it (Ogre space; X/Z are rebased
              * by the floating origin so we must stay in Ogre space + add the head
              * lean), but take Y straight from the head bone (Y is NOT rebased and
              * is stable) -> the eye is welded to head height, no bob. */
             Vec3 eyeW = { centerW.x, centerW.y + EYE_HEIGHT - EYE_DROP, centerW.z };  /* fallback */
+            g_eye_from_head = 0;
             if (g_get_bone_world) {
                 void *pc = first_player_char(gw);
                 Vec3 feet, head;
                 if (pc && char_position(pc, &feet)) {
                     g_get_bone_world(pc, &head, g_head_bone);
                     Vec3 h = { head.x - feet.x, head.y - feet.y, head.z - feet.z };
+                    g_head_above = h.y;   /* head height over feet; small => actually prone */
                     if (h.x*h.x + h.y*h.y + h.z*h.z > 0.25f) {
                         eyeW.y = head.y - EYE_DROP;   /* head-bone Y directly (Y not rebased) */
                         /* head/feet are GAME coords, center is OGRE; they differ by
@@ -923,13 +1691,43 @@ static void fp_camera_override(void *gw)
                             eyeW.x = centerW.x + h.x; eyeW.z = centerW.z + h.z;
                         }
                         g_dbg_head_x = head.x; g_dbg_center_x = centerW.x;
+                        g_eye_from_head = 1;
+                    }
+                    /* [weld diag] temporary: 6 CONSECUTIVE frames every ~5s --
+                     * shows whether the head bone animates per frame (bob/lean)
+                     * or goes quasi-static under MOVE_DIRECTION. */
+                    static int wd;
+                    if (KFP_DEBUG_LOG && ((++wd) % 15) == 0) {
+                        int kw = (GetAsyncKeyState(VK_W) & 0x8000) != 0;
+                        int ka = (GetAsyncKeyState(VK_A) & 0x8000) != 0;
+                        int ks = (GetAsyncKeyState(VK_S) & 0x8000) != 0;
+                        int kd = (GetAsyncKeyState(VK_D) & 0x8000) != 0;
+                        logline("[weld2] k=%d%d%d%d move=%d dir=%d eyeY=%.2f headY=%.2f feetY=%.2f centerY=%.2f tx=%.1f",
+                                kw, ka, ks, kd, g_was_moving, g_was_direct,
+                                eyeW.y, head.y, feet.y, centerW.y, g_tx);
                     }
                 }
             }
+            /* [weld diag] why did the head branch fail while moving? */
+            if (KFP_DEBUG_LOG && !g_eye_from_head && g_was_moving) {
+                static int fl;
+                if ((++fl % 30) == 1) {
+                    void *pcd = first_player_char(gw);
+                    Vec3 fd = {0,0,0}; int cpok = pcd && char_position(pcd, &fd);
+                    logline("[weld] FALLBACK while moving: pc=%p charpos=%d gbw=%p feet=(%.1f,%.1f,%.1f)",
+                            pcd, cpok, (void *)g_get_bone_world, fd.x, fd.y, fd.z);
+                }
+            }
+
             /* Push the eye forward (horizontal look dir) so it sits at the face,
              * not inside the head mesh. */
-            eyeW.x += sinf(g_yaw) * FP_EYE_FORWARD;
-            eyeW.z += cosf(g_yaw) * FP_EYE_FORWARD;
+            /* Extra forward push while moving, eased in/out (~0.25s) so the
+             * start/stop transition slides instead of popping. */
+            static float mfwd;
+            mfwd += ((g_was_moving ? FP_MOVE_FORWARD : 0.0f) - mfwd) * 0.12f;
+            float fpush = FP_EYE_FORWARD + mfwd;
+            eyeW.x += sinf(g_yaw) * fpush;
+            eyeW.z += cosf(g_yaw) * fpush;
 
             /* Eye follows the head bone RAW (no horizontal smoothing) so the
              * camera stays welded through the run animation's forward lean --
@@ -944,7 +1742,7 @@ static void fp_camera_override(void *gw)
             /* [foliage diag] how far is the game's per-frame camera position (used
              * by grass paging) from our FP eye? A large gap => grass pages around
              * the wrong point => pop-in under the feet. */
-            if (have_pre) {
+            if (KFP_DEBUG_LOG && have_pre) {
                 static int fcnt;
                 if (((++fcnt) % 120) == 0) {
                     float ddx = cam_pre.x - eyeW.x, ddy = cam_pre.y - eyeW.y, ddz = cam_pre.z - eyeW.z;
@@ -960,6 +1758,64 @@ static void fp_camera_override(void *gw)
         float qy = cosf(g_yaw * 0.5f),   sqy = sinf(g_yaw * 0.5f);
         float qp = cosf(g_pitch * 0.5f), sqp = sinf(g_pitch * 0.5f);
         Quat q = { qy * qp, qy * sqp, sqy * qp, -sqy * sqp };
+
+        /* Ragdoll orientation follow: while knocked down, tumble the view with
+         * the head. We track the head's world orientation as the "upright"
+         * reference WHILE NOT down, and freeze it when down -- so delta =
+         * head_now * conj(upright) is the pure world-space rotation the head has
+         * undergone from standing (bone-axis convention cancels). Apply that to
+         * the look direction, blended in/out so knockdown and get-up are smooth. */
+        {
+            void *pc2 = first_player_char(gw);
+            void *anim = (pc2 && readable((void *)((uintptr_t)pc2 + CHAR_ANIM), 8))
+                ? *(void **)((uintptr_t)pc2 + CHAR_ANIM) : NULL;
+            int is_down = readable((void *)((uintptr_t)anim + ANIM_RAGDOLL_MASK + 4), 4)
+                          && *(unsigned int *)((uintptr_t)anim + ANIM_RAGDOLL_MASK) != 0;
+            Quat qh;
+            if (pc2 && get_head_quat(pc2, &qh)) {
+                /* Discriminate knocked-out (head heavily rolled -> follow + freeze
+                 * look) from crawling-crippled (head near-upright, still conscious
+                 * -> keep normal look). Tilt = angle between head-now and upright. */
+                float tiltdeg = 0.0f;
+                if (g_have_qref) {
+                    Quat d = quat_norm(quat_mul(qh, quat_conj(g_qref)));
+                    float w = d.w; if (w < 0) w = -w; if (w > 1) w = 1;
+                    tiltdeg = 2.0f * acosf(w) * 57.29578f;
+                }
+                /* Require the head to actually be low (body prone), not just the
+                 * ragdoll-parts mask + head tilt -- a critically injured but
+                 * UPRIGHT character sets the mask and can slump the head past the
+                 * tilt threshold while still standing (head stays ~1.6m up). */
+                int truly_down = is_down && g_have_qref && tiltdeg > 55.0f
+                                 && g_head_above < 0.9f;
+                g_is_down = truly_down;   /* next frame's look-input freeze reads this */
+                static int prev_down = -1;
+                if (KFP_DEBUG_LOG && ((int)truly_down != prev_down || (is_down && !truly_down))) {
+                    logline("[orient] is_down=%d truly=%d tilt=%.0f headY=%.2f",
+                            is_down, truly_down, tiltdeg, g_head_above);
+                    prev_down = truly_down;
+                }
+                /* Freeze the upright reference on the raw ragdoll signal (not on
+                 * truly_down) so tilt measures from the pre-down pose and can
+                 * actually accumulate as the head rolls -- otherwise it collapses
+                 * to the per-frame delta (~0) and never crosses the threshold. */
+                if (!is_down) { g_qref = qh; g_have_qref = 1; }
+                float target = truly_down ? 1.0f : 0.0f;
+                g_down_blend += (target - g_down_blend) * 0.15f; /* ~0.3s ease */
+                if (g_down_blend > 0.002f && g_have_qref) {
+                    Quat delta = quat_norm(quat_mul(qh, quat_conj(g_qref)));
+                    Quat ragq = quat_norm(quat_mul(delta, q));   /* head tumble applied to view */
+                    /* Head bone's local axes are permuted from camera-frame: seat with
+                     * a 90-right yaw then a 90-up pitch, applied in the view's frame. */
+                    static const Quat YAW90R  = { 0.70710678f, 0.0f, -0.70710678f, 0.0f }; /* -90 Y */
+                    static const Quat PITCH90U = { 0.70710678f, -0.70710678f, 0.0f, 0.0f }; /* -90 X */
+                    ragq = quat_norm(quat_mul(ragq, quat_mul(YAW90R, PITCH90U)));
+                    q = quat_slerp(q, ragq, g_down_blend);
+                }
+            } else {
+                g_down_blend = 0.0f;
+            }
+        }
         g_node_set_dori(node, &q);
         g_last_ori = q; g_have_eye = 1;    /* mid-frame re-assert now armed */
 
@@ -1006,8 +1862,10 @@ static void fp_camera_override(void *gw)
             g_cam_set_fovy(ogre_cam, &g_fov_default);
         if (g_nearclip_saved && g_cam_set_nearclip && readable(ogre_cam, 8))
             g_cam_set_nearclip(ogre_cam, g_nearclip_default);
-        Quat ident = { 1.0f, 0.0f, 0.0f, 0.0f };
-        g_node_set_ori(node, &ident);
+        /* Seat the vanilla camera at our look direction + the saved zoom via
+         * the game's own API. Fixes the endless zoom-out (garbage local pos
+         * was left as the zoom) and keeps view continuity on exit. */
+        vanilla_cam_handoff(cam, node, g_vanilla_zoom);
     }
     g_ovr_prev = active;
 }
@@ -1020,9 +1878,8 @@ static void fp_camera_override(void *gw)
  * faults (or raises an MSVC C++ exception, 0xE06D7363 -- what KenshiCoop's SEH
  * catches around this very call), the vectored handler longjmps back here.
  * mingw-x64 setjmp passes a NULL frame, so longjmp restores registers without
- * unwinding -- safe across foreign (game) frames. */
-static jmp_buf g_guard_jb;
-static volatile LONG g_guard_armed;
+ * unwinding -- safe across foreign (game) frames. (Declarations hoisted above
+ * get_head_quat, which also uses the guard.) */
 
 static LONG CALLBACK veh_guard(EXCEPTION_POINTERS *ep)
 {
@@ -1101,7 +1958,7 @@ static int ui_panels_open(void)
     g_guard_armed = 0;
 
     static int last_mask = -1;
-    if (mask != last_mask) {           /* diag: which check flips the gate */
+    if (KFP_DEBUG_LOG && mask != last_mask) {  /* diag: which check flips the gate */
         last_mask = mask;
         logline("[ui] panel mask=0x%03x", mask);
     }
@@ -1197,9 +2054,28 @@ static int terrain_ray(const Vec3 *origin, const Vec3 *dir, Vec3 *out)
     return 1;
 }
 
+/* --- direct-drive locomotion (indoor-reliable movement) --------------------
+ * The engine has a NATIVE direction-driven mode (MOVE_DIRECTION): feed
+ * CharMovement::setDirectMovement(dir, limit) a direction each frame and the
+ * game's own locomotion moves the character -- collision, floors, ramps,
+ * platforms all handled by the engine. No destination point, no pathfinder,
+ * no terrain ray: this is what makes movement reliable INSIDE buildings,
+ * where the click-order + terrain-ray scheme picked unreachable/underground
+ * targets. (Approach learned from smokefoolius/Kenshi-Direct-Control.)
+ * Prone/downed characters keep the order path: crawling and the get-up flow
+ * need the click-order system, and MOVE_DIRECTION is standing-only. */
+#define MV_SPEEDORDERS    0x20     /* CharMovement::speedOrders (MoveSpeed) */
+#define MV_MOVEMODE       0x378    /* MovementMode: 0 normal, 1 combat, 2 direction */
+#define MV_DESIREDMOTION  0x38C    /* Vector3, consumed when mode==2 */
+#define MV_HALT_SLOT      (0x98/8) /* vtable: halt() -- cancels current orders */
+#define MV_SETSPEED_SLOT  (0xA8/8) /* vtable: setDesiredSpeed(MoveSpeed) */
+
 static void fp_movement(void *gw, float dt)
 {
-    if (!g_fp_mode || !g_charmove_setdest) return;
+    if (!g_fp_mode || !g_charmove_setdest) {
+        InterlockedExchange(&g_dm_active, 0);   /* FP off mid-hold: stand down */
+        return;
+    }
     void *pc = first_player_char(gw);
     if (!pc) return;
     void *mv = readable((void *)((uintptr_t)pc + CHAR_MOVEMENT), 8)
@@ -1228,13 +2104,25 @@ static void fp_movement(void *gw, float dt)
      * WASD while typing/clicking in panels. */
     if (g_ui_open || keys == 0 || (mf == 0.0f && mr == 0.0f)) {
         if (g_was_moving) {         /* release: halt at current position */
-            Vec3 here;
-            /* Halt ONLY if our walk task still owns the character. If an
-             * NPC-forced task (dialogue, grab, arrest) took over, issuing a
-             * halt would CLEAR their queue mid-mutation -> crash. */
-            if (char_task_is_move(pc) && char_position(pc, &here)) {
-                if (!try_move_to_pos(pc, &here))   /* order to current pos = stop */
-                    g_charmove_setdest(mv, &here, UPDATE_PRIORITY_HIGH, 0);
+            if (g_was_direct) {
+                /* direct drive: instant stop -- zero the motion, return the
+                 * mode to normal so vanilla ordering owns the character again */
+                InterlockedExchange(&g_dm_active, 0);
+                if (readable((void *)((uintptr_t)mv + MV_DESIREDMOTION), 12)) {
+                    Vec3 *dm = (Vec3 *)((uintptr_t)mv + MV_DESIREDMOTION);
+                    dm->x = dm->y = dm->z = 0.0f;
+                    *(int *)((uintptr_t)mv + MV_MOVEMODE) = 0;   /* MOVE_NORMAL */
+                }
+                g_was_direct = 0;
+            } else {
+                Vec3 here;
+                /* Halt ONLY if our walk task still owns the character. If an
+                 * NPC-forced task (dialogue, grab, arrest) took over, issuing a
+                 * halt would CLEAR their queue mid-mutation -> crash. */
+                if (char_task_is_move(pc) && char_position(pc, &here)) {
+                    if (!try_move_to_pos(pc, &here))   /* order to current pos = stop */
+                        g_charmove_setdest(mv, &here, UPDATE_PRIORITY_HIGH, 0);
+                }
             }
             g_was_moving = 0;
             g_have_dest = 0;
@@ -1264,6 +2152,44 @@ static void fp_movement(void *gw, float dt)
     float len = sqrtf(dx * dx + dz * dz);
     if (len < 0.001f) return;
     dx = -dx / len; dz = -dz / len;
+
+    /* STANDING: engine-native direct drive -- reliable on floors, platforms,
+     * ramps, and everywhere the terrain-ray/click-order scheme wasn't.
+     * Prone/downed (head low) falls through to the order path below, which
+     * still owns crawling and the get-up flow. */
+    if (g_head_above >= 0.9f) {
+        void **mvvt = *(void ***)mv;
+        if (in_module(mvvt)) {
+            if (setjmp(g_guard_jb)) { g_guard_armed = 0; return; }
+            g_guard_armed = 1;
+            if (!g_was_direct)   /* entering direct drive: cancel click orders */
+                ((void (*)(void *))mvvt[MV_HALT_SLOT])(mv);
+            int spd = g_speed_scale < 0.4f ? 0 : g_speed_scale < 0.8f ? 1 : 2;
+            /* Publish the intent; the CharMovement::update hook enforces it
+             * per-update (beats combat AI), and we also apply once here so
+             * movement works even if that hook failed to install. */
+            g_dm_dir.x = dx; g_dm_dir.y = 0.0f; g_dm_dir.z = dz;
+            g_dm_speed = spd; g_dm_mv = mv;
+            InterlockedExchange(&g_dm_active, 1);
+            if (readable((void *)((uintptr_t)mv + MV_SPEEDORDERS), 4))
+                *(int *)((uintptr_t)mv + MV_SPEEDORDERS) = spd;   /* WALK/JOG/RUN */
+            ((void (*)(void *, int))mvvt[MV_SETSPEED_SLOT])(mv, spd);
+            ((void (*)(void *, const Vec3 *, float))(g_base + RVA_SET_DIRECT_MOVE))(mv, &g_dm_dir, 99.0f);
+            g_guard_armed = 0;
+            g_was_direct = 1;
+            g_was_moving = 1;
+            return;
+        }
+    }
+    if (g_was_direct) {   /* fell/crippled mid-hold: return mode to normal */
+        InterlockedExchange(&g_dm_active, 0);
+        if (readable((void *)((uintptr_t)mv + MV_DESIREDMOTION), 12)) {
+            Vec3 *dm = (Vec3 *)((uintptr_t)mv + MV_DESIREDMOTION);
+            dm->x = dm->y = dm->z = 0.0f;
+            *(int *)((uintptr_t)mv + MV_MOVEMODE) = 0;
+        }
+        g_was_direct = 0;
+    }
 
     /* Speed from the scrollwheel throttle (down = walk, up = run). */
     float dist = MOVE_NEAR + g_speed_scale * (MOVE_FAR - MOVE_NEAR);
@@ -1412,13 +2338,31 @@ static void ensure_crosshair(void)
         g_imgbox_setimage(w, tex);
         g_widget_setvisible(w, 0);
         g_crosshair = w;
+        g_crosshair_red = 0;   /* fresh widget starts on the white texture */
         logline("crosshair widget created %p", w);
     }
 }
 
+/* Swap our crosshair texture (only on change -- setImageTexture reloads).
+ * 0=white (default), 1=red (hostile), 2=green (ally). Filenames MUST stay
+ * under 16 chars: make_mstr builds SSO-only MSVC strings ("crosshair_red.png"
+ * silently truncated to "crosshair_red.p" -> texture-not-found -> invisible). */
+static void set_crosshair_tint(int tint)
+{
+    if (tint == g_crosshair_red) return;
+    g_crosshair_red = tint;
+    if (!g_crosshair || !g_imgbox_setimage) return;
+    unsigned char tex[32];
+    make_mstr(tex, tint == 1 ? "xhair_red.png"
+                 : tint == 2 ? "xhair_ylw.png" : "crosshair.png");  /* allies = yellow */
+    g_imgbox_setimage(g_crosshair, tex);
+}
+
 /* MyGUI PointerManager::setPointer hook: while FP is on, hide the default (arrow)
- * cursor — we show our crosshair instead — but keep contextual pointers
- * (sword/speech) visible. */
+ * cursor — we show our crosshair instead — and keep contextual icon pointers
+ * (speech/door/loot/...) visible. The vanilla COLORED-ARROW pointers are
+ * special-cased: "attk" (red, hostile) and "green" (ally) are suppressed and
+ * our crosshair takes their color instead. */
 static void hooked_setpointer(void *pm, const void *name)
 {
     g_pm_setpointer_orig(pm, name);
@@ -1428,9 +2372,24 @@ static void hooked_setpointer(void *pm, const void *name)
     char cur[128], def[128];
     read_mstring(name, cur, sizeof cur);
     read_mstring(g_pm_getdefault(pm), def, sizeof def);
+    /* one-shot state map: record each pointer name the first time it appears
+     * (cheap, bounded) -- authoritative record of which states the game uses */
+    if (KFP_DEBUG_LOG) {
+        static char seen[16][24]; static int nseen;
+        int i, hit = 0;
+        for (i = 0; i < nseen; i++) if (strcmp(seen[i], cur) == 0) { hit = 1; break; }
+        if (!hit && nseen < 16 && cur[0]) {
+            snprintf(seen[nseen], sizeof seen[0], "%s", cur); nseen++;
+            logline("[ptr] first seen: \"%s\"", cur);
+        }
+    }
     int is_default = (cur[0] != '\0' && strcmp(cur, def) == 0);
-    g_pm_setvisible(pm, is_default ? 0 : 1);   /* hide arrow (crosshair instead), show contextual */
-    g_pointer_default = is_default;
+    int tint = (strcmp(cur, "attk") == 0) ? 1
+             : (strcmp(cur, "green") == 0) ? 2 : 0;
+    set_crosshair_tint(tint);
+    /* colored arrows: hide the vanilla cursor, our tinted crosshair stands in */
+    g_pm_setvisible(pm, (is_default || tint) ? 0 : 1);
+    g_pointer_default = is_default || tint;
 }
 
 /* Force the MyGUI cursor visible/hidden (used on FP enter/exit). */
@@ -1572,10 +2531,71 @@ static void hooked_cam_update(void *cam, char controlEnabled)
     if (!g_fp_mode || !g_have_eye) return;
     if (!readable(cam, CC_FREECAM + 1)) return;
     if (*(unsigned char *)((uintptr_t)cam + CC_FREECAM)) return;   /* free-cam: hands off */
-    if (g_was_moving && g_node_set_dpos) {
+    /* Snap ONLY when this frame's eye was anchored to the head bone: a
+     * fallback eye derives FROM the center (center.y + EYE_HEIGHT), so
+     * snapping center=eye ratchets the camera straight UP every fallback
+     * frame (visible even paused). Any head-read hiccup while moving would
+     * otherwise launch the camera. */
+    if (g_was_moving && g_have_t && g_eye_from_head && g_node_set_dpos) {
         void *center = *(void **)((uintptr_t)cam + CC_CENTER);
-        if (readable(center, 8)) g_node_set_dpos(center, &g_last_eye);
+        if (readable(center, 8)) {
+            g_node_set_dpos(center, &g_last_eye);
+            /* CRITICAL ordering: the camera node is a CHILD of the center.
+             * _setDerivedPosition converts derived->local against the parent's
+             * CACHED derived transform, and after the snap the center's cache
+             * is STALE until the scene-graph update -- so a plain re-assert
+             * still bakes the wrong local offset and the camera rides up by
+             * the center displacement (~6u, "camera rises while holding WASD").
+             * Force the center's derived recompute FIRST (the game's own
+             * manual-camera code does exactly this), then re-seat the camera. */
+            Vec3 tmp;
+            if (g_node_getdpos_upd) g_node_getdpos_upd(center, &tmp);
+            void *node = *(void **)((uintptr_t)cam + CC_NODE);
+            if (readable(node, 8)) {
+                g_node_set_dpos(node, &g_last_eye);
+                g_node_set_dori(node, &g_last_ori);
+            }
+        }
     }
+}
+
+/* --- optional FPS cap (KenshiFP.ini: fps_cap=N) --------------------------
+ * Kenshi has no framerate limiter besides vsync, and vsync's frame pacing adds
+ * jitter/latency in FP (also uncapped menus run 1000+ fps = coil whine). We own
+ * the frame loop, so cap here: hybrid Sleep/spin against QueryPerformanceCounter
+ * for accuracy that plain Sleep can't give. 0 (or no ini) = off. */
+static int g_fps_cap;                        /* frames/sec; 0 = disabled */
+static void fps_cap_wait(void)
+{
+    static LARGE_INTEGER freq, next;
+    static int inited;
+    if (g_fps_cap <= 0) return;
+    if (!inited) { QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&next); inited = 1; }
+    LONGLONG period = freq.QuadPart / g_fps_cap;
+    next.QuadPart += period;
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    if (next.QuadPart < now.QuadPart) { next = now; return; }   /* running behind: no wait */
+    /* sleep the bulk (leave ~2ms), spin the remainder for precision */
+    while (next.QuadPart - now.QuadPart > (freq.QuadPart / 500)) {
+        Sleep(1);
+        QueryPerformanceCounter(&now);
+    }
+    while (now.QuadPart < next.QuadPart) { YieldProcessor(); QueryPerformanceCounter(&now); }
+}
+
+static void load_ini(void)
+{
+    FILE *f = fopen("KenshiFP.ini", "r");   /* CWD = game dir, same as KenshiFP.log */
+    if (!f) return;
+    char line[128];
+    while (fgets(line, sizeof line, f)) {
+        int v;
+        if (sscanf(line, " fps_cap = %d", &v) == 1 || sscanf(line, " fps_cap=%d", &v) == 1) {
+            if (v >= 15 && v <= 1000) g_fps_cap = v;
+        }
+    }
+    fclose(f);
+    if (g_fps_cap) { timeBeginPeriod(1); logline("fps cap enabled: %d (KenshiFP.ini)", g_fps_cap); }
 }
 
 static void hooked_mainloop(void *gw, float time)
@@ -1596,10 +2616,12 @@ static void hooked_mainloop(void *gw, float time)
     if (gw) fp_head_visibility(gw);       /* hide head while fast-forwarding (>1x) */
 
     DWORD now = GetTickCount();
-    if (gw && (now - g_last_tick_ms) >= 1000) {   /* 1 Hz observation log */
+    if (KFP_DEBUG_LOG && gw && (now - g_last_tick_ms) >= 1000) {   /* 1 Hz observation log */
         g_last_tick_ms = now;
         fp_tick(gw);
     }
+
+    fps_cap_wait();               /* optional user-configured frame limiter */
 }
 
 /* Hook re-arm watchdog. Other mods that hook the game late (notably RE_Kenshi,
@@ -1671,6 +2693,166 @@ static LRESULT CALLBACK mouse_ll(int code, WPARAM wp, LPARAM lp)
 
 /* Install one hook through the active backend. Returns 1 on success.
  * KenshiLib.AddHook does create+enable in one call (SUCCESS==0). */
+/* The FP aim point: 80m along the camera look direction from the head, in game
+ * coords. Shared by the ranged free-aim hooks. Returns 0 if unavailable. */
+static int fp_aim_point(Vec3 *out)
+{
+    if (!g_player_pc || !g_get_bone_world) return 0;
+    Vec3 head;
+    g_get_bone_world(g_player_pc, &head, g_head_bone);       /* game coords */
+    float cp = cosf(g_pitch);
+    out->x = head.x + sinf(g_yaw) * cp * 80.0f;
+    out->y = head.y - sinf(g_pitch)     * 80.0f;
+    out->z = head.z + cosf(g_yaw) * cp * 80.0f;
+    return 1;
+}
+
+/* Ranged free-aim: RangedCombatClass::animationUpdate(this, frameTime, aimpos&,
+ * target) is fed the auto-target's position each frame; for the PLAYER in FP
+ * mode we substitute the point the camera is looking at, so the arm pose
+ * follows the crosshair. Non-player characters pass through. */
+static void hooked_ranged_animupd(void *rc, float ft, Vec3 *aimpos, void *target)
+{
+    Vec3 aim;
+    if (g_fp_mode && rc
+        && readable((void *)((uintptr_t)rc + RC_ME), 8)
+        && *(void **)((uintptr_t)rc + RC_ME) == g_player_pc
+        && readable(aimpos, sizeof(Vec3))
+        && fp_aim_point(&aim)) {
+        *aimpos = aim;
+        if (readable((void *)((uintptr_t)rc + RC_AIMPOS), sizeof(Vec3)))
+            *(Vec3 *)((uintptr_t)rc + RC_AIMPOS) = aim;
+        static int logged;
+        if (!logged) { logged = 1; logline("[freeaim] pose override LIVE"); }
+        if (g_aim_mode) {                     /* R-aim diagnostics: is this even called? */
+            static int cnt;
+            if ((++cnt % 120) == 1) logline("[aim] animationUpdate running (call %d)", cnt);
+        }
+    }
+    g_ranged_animupd_orig(rc, ft, aimpos, target);
+}
+
+/* GunClass::shoot(this, me, target, stat, aimpos&) -- the projectile spawn.
+ * Direction = getAimDir(aimpos) + skill-based randomDeviant, so overriding
+ * aimpos here makes the bolt fly at the crosshair while target attribution
+ * and the accuracy spread stay vanilla. */
+typedef void (*gun_shoot_t)(void *gun, void *me, void *target, int stat, const Vec3 *aimpos);
+static gun_shoot_t g_gun_shoot_orig;
+static void hooked_gun_shoot(void *gun, void *me, void *target, int stat, const Vec3 *aimpos)
+{
+    Vec3 aim;
+    if (g_fp_mode && me && me == g_player_pc && fp_aim_point(&aim)) {
+        aimpos = &aim;
+        static int logged;
+        if (!logged) { logged = 1; logline("[freeaim] projectile override LIVE"); }
+    }
+    g_gun_shoot_orig(gun, me, target, stat, aimpos);
+}
+
+/* CharMovement::faceDirection hook: while the player is in RANGED combat mode
+ * in FP, the combat AI's auto-face (toward its target, during aim/reload) is
+ * redirected to the camera look direction -- the body tracks the crosshair and
+ * orient-to-control stays in charge. Melee and everyone else pass through. */
+typedef void (*face_dir_t)(void *mv, const Vec3 *dir);
+static face_dir_t g_face_dir_orig;
+static void hooked_face_direction(void *mv, const Vec3 *dir)
+{
+    if (g_fp_mode && g_player_pc
+        && readable((void *)((uintptr_t)g_player_pc + CHAR_MOVEMENT), 8)
+        && *(void **)((uintptr_t)g_player_pc + CHAR_MOVEMENT) == mv) {
+        void *rc = readable((void *)((uintptr_t)g_player_pc + CHAR_RANGEDCOMBAT), 8)
+            ? *(void **)((uintptr_t)g_player_pc + CHAR_RANGEDCOMBAT) : NULL;
+        if (readable((void *)((uintptr_t)rc + RC_COMBATMODE), 1)
+            && *(unsigned char *)((uintptr_t)rc + RC_COMBATMODE)) {
+            Vec3 look = { sinf(g_yaw), 0.0f, cosf(g_yaw) };
+            static int logged;
+            if (!logged) { logged = 1; logline("[freeaim] facing override LIVE"); }
+            g_face_dir_orig(mv, &look);
+            return;
+        }
+    }
+    g_face_dir_orig(mv, dir);
+}
+
+/* Manual ranged trigger: on a left-click edge (FP, cursor captured, weapon
+ * drawn, gun loaded) call GunClass::shoot directly at the crosshair point.
+ * target=NULL is explicitly handled by shoot (verified in decomp); ammo,
+ * visibility, and tracer bookkeeping all run inside the game's own code. */
+static void manual_fire_update(void *pcx)
+{
+    static int lmb_prev;
+    int lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    int edge = lmb && !lmb_prev;
+    lmb_prev = lmb;
+    if (!edge || !g_fp_mode || g_ui_open || !pcx || !g_gun_shoot_orig) return;
+    void *wih = readable((void *)((uintptr_t)pcx + CHAR_WEAPON_IN_HANDS), 8)
+        ? *(void **)((uintptr_t)pcx + CHAR_WEAPON_IN_HANDS) : NULL;
+    if (!wih) return;                            /* nothing drawn */
+    void *rc = readable((void *)((uintptr_t)pcx + CHAR_RANGEDCOMBAT), 8)
+        ? *(void **)((uintptr_t)pcx + CHAR_RANGEDCOMBAT) : NULL;
+    void *gun = (rc && readable((void *)((uintptr_t)rc + RC_GUN), 8))
+        ? *(void **)((uintptr_t)rc + RC_GUN) : NULL;
+    if (!gun || !readable((void *)((uintptr_t)gun + GUN_AMMO), 4)) return;
+    int ammo = *(int *)((uintptr_t)gun + GUN_AMMO);
+    if (ammo <= 0) { logline("[fire] click: gun empty/reloading (ammo=%d)", ammo); return; }
+    int stat = readable((void *)((uintptr_t)rc + RC_STAT), 4)
+        ? *(int *)((uintptr_t)rc + RC_STAT) : 0;
+    Vec3 aim;
+    if (!fp_aim_point(&aim)) return;
+    if (setjmp(g_guard_jb)) { g_guard_armed = 0; logline("[fire] shoot FAULTED"); return; }
+    g_guard_armed = 1;
+    g_gun_shoot_orig(gun, pcx, NULL, stat, &aim);
+    g_guard_armed = 0;
+    logline("[fire] manual shot (ammo %d -> %d)", ammo, ammo - 1);
+}
+
+/* sheatheWeapon suppressor: while manual aim (R) is on, the idle AI re-sheathes
+ * our drawn weapon within ~20ms (the draw/sheathe flicker). Swallow the call
+ * for the player during aim mode; everyone else (and normal play) unaffected. */
+typedef void (*sheathe_t)(void *pc);
+static sheathe_t g_sheathe_orig;
+static void hooked_sheathe(void *pc)
+{
+    if (g_aim_mode && pc && pc == g_player_pc) {
+        static int cnt;
+        if ((++cnt % 60) == 1) logline("[aim] suppressed AI sheathe (x%d)", cnt);
+        return;
+    }
+    g_sheathe_orig(pc);
+}
+
+/* CharMovement::update hook: re-assert the player's direct-drive intent
+ * IMMEDIATELY BEFORE the engine consumes movement state -- combat AI (and the
+ * order system) rewrite movementMode inside/around this update, and applying
+ * here means our write is always the last one standing. WASD therefore works
+ * in combat: the fight's locomotion suggestions lose the race every frame. */
+typedef void (*charmove_update_t)(void *mv, float t);
+static charmove_update_t g_charmove_update_orig;
+#define MV_CHARACTER 0x3A8              /* CharMovement::character (backref) */
+#define CHAR_VISNEAR 0x1A8              /* Character::isVisibleAndNear */
+#define CHAR_ONSCREEN 0x1A9             /* Character::isOnScreen */
+static void hooked_charmove_update(void *mv, float t)
+{
+    if (g_dm_active && mv == g_dm_mv) {
+        if (readable((void *)((uintptr_t)mv + MV_SPEEDORDERS), 4))
+            *(int *)((uintptr_t)mv + MV_SPEEDORDERS) = g_dm_speed;
+        ((void (*)(void *, const Vec3 *, float))(g_base + RVA_SET_DIRECT_MOVE))(mv, &g_dm_dir, 99.0f);
+    }
+    /* FP camera weld depends on a LIVE skeleton, but Kenshi culls animation
+     * for characters it deems off-screen -- and in FP the camera sits inside
+     * the head, so looking level/up culls your own body and freezes the head
+     * bone (camera detaches). Force the visibility flags for the FP character
+     * right before its update, every frame. */
+    if (g_fp_mode && g_player_pc
+        && readable((void *)((uintptr_t)mv + MV_CHARACTER), 8)
+        && *(void **)((uintptr_t)mv + MV_CHARACTER) == g_player_pc
+        && readable((void *)((uintptr_t)g_player_pc + CHAR_VISNEAR), 2)) {
+        *(unsigned char *)((uintptr_t)g_player_pc + CHAR_VISNEAR)  = 1;
+        *(unsigned char *)((uintptr_t)g_player_pc + CHAR_ONSCREEN) = 1;
+    }
+    g_charmove_update_orig(mv, t);
+}
+
 static int install_hook(void *target, void *detour, void **original)
 {
     /* Always MinHook. The KenshiLib AddHook "cooperative" path installed but
@@ -1738,7 +2920,12 @@ __declspec(dllexport) void dllStartPlugin(void)
     memcpy(g_head_bone, HEAD_BONE_NAME, sizeof(HEAD_BONE_NAME) - 1);
     *(size_t *)(g_head_bone + 0x10) = sizeof(HEAD_BONE_NAME) - 1;  /* size */
     *(size_t *)(g_head_bone + 0x18) = 15;                          /* capacity */
-    logline("KenshiFP loaded (FP + head-bone + FOV + WASD); module base %p", (void *)g_base);
+    /* Spine/neck chain for procedural aim-pitch (Biped naming, all SSO). */
+    make_mstr(g_bone_spine1, "Bip01 Spine1");
+    make_mstr(g_bone_spine2, "Bip01 Spine2");
+    make_mstr(g_bone_neck,   "Bip01 Neck");
+    make_mstr(g_bone_rootspine, "Bip01 Spine");   /* readiness computed after Ogre resolves */
+    logline("KenshiFP v0.3.0 loaded (FP + head-bone + FOV + WASD); module base %p", (void *)g_base);
 
     /* Report the detected build (selection already happened above). */
     {
@@ -1770,13 +2957,31 @@ __declspec(dllexport) void dllStartPlugin(void)
         g_node_set_dori = (node_set_dori_t)GetProcAddress(ogre, OGRE_SETDORI_SYM);
         g_node_set_dpos = (node_set_dpos_t)GetProcAddress(ogre, OGRE_SETDPOS_SYM);
         g_node_get_dpos = (node_get_dpos_t)GetProcAddress(ogre, OGRE_GETDPOS_SYM);
+        g_node_get_pos  = (node_get_pos_t)GetProcAddress(ogre, OGRE_GETPOS_SYM);
         g_disable_bone  = (disable_bone_t)GetProcAddress(ogre, OGRE_DISABLEBONE_SYM);
+        g_skel_getbone  = (skel_getbone_t)GetProcAddress(ogre, OGRE_GETBONE_SYM);
+        g_oldnode_getdori = (oldnode_getdori_t)GetProcAddress(ogre, OGRE_OLDNODE_GETDORI_SYM);
+        g_oldnode_getdpos = (oldnode_getdpos_t)GetProcAddress(ogre, OGRE_OLDNODE_GETDPOS_SYM);
+        g_node_getdpos_upd = (node_getdpos_upd_t)GetProcAddress(ogre, OGRE_GETDPOS_UPD_SYM);
+        g_oldnode_getori  = (oldnode_getori_t)GetProcAddress(ogre, OGRE_OLDNODE_GETORI_SYM);
+        g_oldnode_setori  = (oldnode_setori_t)GetProcAddress(ogre, OGRE_OLDNODE_SETORI_SYM);
+        g_oldnode_needupd = (oldnode_needupd_t)GetProcAddress(ogre, OGRE_OLDNODE_NEEDUPD_SYM);
+        g_oldbone_setmanual = (oldbone_setmanual_t)GetProcAddress(ogre, OGRE_OLDBONE_SETMANUAL_SYM);
+        g_get_parent_scenenode = (get_parent_scenenode_t)GetProcAddress(ogre, OGRE_GETPARENTSCENENODE_SYM);
+        g_entity_getskel = (entity_getskel_t)GetProcAddress(ogre, OGRE_ENTITY_GETSKEL_SYM);
+        if (!g_entity_getskel)
+            g_entity_getskel = (entity_getskel_t)GetProcAddress(ogre, OGRE_ENTITY_GETSKEL_SYM2);
         g_cam_set_fovy  = (cam_set_fovy_t)GetProcAddress(ogre, OGRE_SETFOVY_SYM);
         g_cam_get_fovy  = (cam_get_fovy_t)GetProcAddress(ogre, OGRE_GETFOVY_SYM);
         g_cam_set_nearclip = (cam_set_nearclip_t)GetProcAddress(ogre, OGRE_SETNEARCLIP_SYM);
         g_cam_get_nearclip = (cam_get_nearclip_t)GetProcAddress(ogre, OGRE_GETNEARCLIP_SYM);
         g_ogre_ready = (g_node_set_dori && g_node_set_dpos && g_node_get_dpos);
+        g_spine_ready = (g_oldnode_getori && g_oldnode_setori &&
+                         g_oldnode_needupd && g_skel_getbone) ? 1 : 0;
         logline("Ogre FOV setters: set=%p get=%p", (void *)g_cam_set_fovy, (void *)g_cam_get_fovy);
+        logline("spine-bend: getori=%p setori=%p needupd=%p -> %s",
+                (void *)g_oldnode_getori, (void *)g_oldnode_setori,
+                (void *)g_oldnode_needupd, g_spine_ready ? "ARMED" : "unavailable");
     }
     logline(g_ogre_ready ? "Ogre node setters resolved (FP override armed)"
                          : "WARN: Ogre node setters NOT resolved (FP override disabled)");
@@ -1800,6 +3005,35 @@ __declspec(dllexport) void dllStartPlugin(void)
                                      (void **)&g_cam_update_orig);
             logline(mh2ok ? "camera update hook installed (mid-frame eye)"
                           : "camera update hook FAILED");
+        }
+
+        /* Ranged free-aim hook (aim where the FP camera looks). */
+        {
+            void *ra = (void *)(g_base + RVA_RANGED_ANIMUPD);
+            int raok = install_hook(ra, (void *)hooked_ranged_animupd,
+                                    (void **)&g_ranged_animupd_orig);
+            logline(raok ? "ranged free-aim hook installed (animationUpdate)"
+                         : "ranged free-aim hook FAILED");
+            void *gs = (void *)(g_base + RVA_GUN_SHOOT);
+            int gsok = install_hook(gs, (void *)hooked_gun_shoot,
+                                    (void **)&g_gun_shoot_orig);
+            logline(gsok ? "projectile aim hook installed (GunClass::shoot)"
+                         : "projectile aim hook FAILED");
+            void *fd = (void *)(g_base + RVA_FACE_DIR);
+            int fdok = install_hook(fd, (void *)hooked_face_direction,
+                                    (void **)&g_face_dir_orig);
+            logline(fdok ? "facing hook installed (CharMovement::faceDirection)"
+                         : "facing hook FAILED");
+            void *sh = (void *)(g_base + RVA_SHEATHE);
+            int shok = install_hook(sh, (void *)hooked_sheathe,
+                                    (void **)&g_sheathe_orig);
+            logline(shok ? "sheathe suppressor installed (manual aim hold)"
+                         : "sheathe suppressor FAILED");
+            void *cu2 = (void *)(g_base + RVA_CHARMOVE_UPDATE);
+            int cuok = install_hook(cu2, (void *)hooked_charmove_update,
+                                    (void **)&g_charmove_update_orig);
+            logline(cuok ? "movement update hook installed (WASD wins combat race)"
+                         : "movement update hook FAILED");
         }
 
         /* MyGUI cursor: resolve + hook setPointer to hide the default arrow. */
@@ -1834,6 +3068,7 @@ __declspec(dllexport) void dllStartPlugin(void)
         logline("MH_Initialize failed (MH_STATUS %d)", (int)mh);
     }
 
+    load_ini();                    /* optional KenshiFP.ini (fps_cap=N, ...) */
     logline(ok ? "KenshiFP active: RIGHT ALT = first-person toggle; mouse = look; WASD = move; wheel = speed"
                : (g_wrong_build ? "KenshiFP inactive (unsupported game build)"
                                 : "KenshiFP FAILED to install per-frame hook"));

@@ -1632,11 +1632,23 @@ static void fp_camera_override(void *gw)
             float black = out ? g_down_blend : 0.0f;
             if (wk > black) black = wk;
             float tun = g_down_blend * 1.3f; if (tun > 1.0f) tun = 1.0f;
-            if (!g_cfg_vignette || ui_open) { black = 0.0f; tun = 0.0f; }
-            widget_alpha(g_vignette, tun);
-            widget_alpha(g_black_ov, black);
-            g_widget_setvisible(g_vignette, tun > 0.02f);
-            g_widget_setvisible(g_black_ov, black > 0.02f);
+            if (!g_cfg_vignette) { black = 0.0f; tun = 0.0f; }
+            /* Stepped-texture fade: MyGUI's _setColour masks the alpha channel
+             * (RGB only), so real alpha animation uses 10 pre-baked opacity
+             * levels (blk0=9%% .. blk9=88%% -- NEVER fully black; the world and
+             * the game UI in the layers above stay faintly visible). */
+            int step = (int)(black * 10.0f);
+            if (step > 9) step = 9;
+            static int prev_step = -1;
+            if (black > 0.03f && step != prev_step && g_imgbox_setimage) {
+                unsigned char btex[32]; char nm[16];
+                snprintf(nm, sizeof nm, "blk%d.png", step);
+                make_mstr(btex, nm);
+                g_imgbox_setimage(g_black_ov, btex);
+                prev_step = step;
+            }
+            g_widget_setvisible(g_vignette, tun > 0.05f);
+            g_widget_setvisible(g_black_ov, black > 0.03f);
         }
 
         if (ui_open) {
@@ -2390,7 +2402,7 @@ static void ensure_crosshair(void)
      * crosshair within the same layer. Shown while knocked out. */
     if (!g_vignette) {
         unsigned char vt[32], vs[32], vl[32], vn[32], vtex[32];
-        make_mstr(vt, "ImageBox"); make_mstr(vs, "ImageBox"); make_mstr(vl, "Pointer");
+        make_mstr(vt, "ImageBox"); make_mstr(vs, "ImageBox"); make_mstr(vl, "Wallpaper");
         make_mstr(vn, "FPVignette"); make_mstr(vtex, "vignette.png");
         void *vw = g_gui_createwidget(gui, vt, vs, 0, 0, cx, cy,
                                       0 /*Align::Default*/, vl, vn);
@@ -2402,8 +2414,8 @@ static void ensure_crosshair(void)
     }
     if (!g_black_ov) {
         unsigned char bt[32], bs[32], bl[32], bn[32], btex[32];
-        make_mstr(bt, "ImageBox"); make_mstr(bs, "ImageBox"); make_mstr(bl, "Pointer");
-        make_mstr(bn, "FPBlackout"); make_mstr(btex, "black.png");
+        make_mstr(bt, "ImageBox"); make_mstr(bs, "ImageBox"); make_mstr(bl, "Wallpaper");
+        make_mstr(bn, "FPBlackout"); make_mstr(btex, "blk0.png");
         void *bw = g_gui_createwidget(gui, bt, bs, 0, 0, cx, cy,
                                       0, bl, bn);
         if (readable(bw, 8)) {

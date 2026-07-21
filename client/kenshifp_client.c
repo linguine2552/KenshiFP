@@ -375,6 +375,12 @@ static const addr_table_t T_1065 = {
 };
 static addr_table_t g_rva;   /* active table, selected at load by build signature */
 
+#ifdef KFP_RE_PLUGIN
+/* RE_Kenshi build: resolve g_rva by runtime signature scan (version-independent,
+ * covers GOG + any build) instead of the hard-coded T_1068/T_1065 tables. */
+#include "../re_plugin/rva_sigs.h"
+#endif
+
 #undef RVA_MAINLOOP
 #undef RVA_CAM_INSTANCE
 #undef RVA_INPUT_CONTROLENABLED
@@ -3051,6 +3057,21 @@ __declspec(dllexport) void dllStartPlugin(void)
      * is the base target; RE_Kenshi downgrades to Steam 1.0.65 (its bundled exe),
      * so match both builds. Neither -> unsupported, disable. MUST run before any
      * RVA_* use (they now read the active table g_rva). */
+#ifdef KFP_RE_PLUGIN
+    /* Version-independent: resolve every address by scanning the live binary. */
+    {
+        int r = kfp_resolve_all(g_base);
+        int total = (int)(sizeof(KFP_RTAB) / sizeof(KFP_RTAB[0]));
+        logline("RE plugin: resolved %d/%d addresses by signature (base %p)",
+                r, total, (void *)g_base);
+        g_build = 0;                       /* not a fixed build */
+        if (!g_rva.MAINLOOP || !g_rva.CAM_INSTANCE || !g_rva.CAM_UPDATE) {
+            g_wrong_build = 1;             /* core resolution failed -> disable */
+            logline("*** core address resolution FAILED (mainloop=%p cam=%p camupd=%p)",
+                    (void *)g_rva.MAINLOOP, (void *)g_rva.CAM_INSTANCE, (void *)g_rva.CAM_UPDATE);
+        }
+    }
+#else
     {
         static const unsigned char SIG_MAINLOOP[8] =
             { 0x48,0x8b,0xc4,0x56,0x57,0x41,0x54,0x48 };
@@ -3060,6 +3081,7 @@ __declspec(dllexport) void dllStartPlugin(void)
         else if (readable(p65, 8) && memcmp(p65, SIG_MAINLOOP, 8) == 0) { g_rva = T_1065; g_build = 65; }
         else g_wrong_build = 1;
     }
+#endif
 
     g_follow_object  = (follow_object_t)(g_base + RVA_FOLLOW_OBJECT);
     g_stop_following = (stop_follow_t)(g_base + RVA_STOP_FOLLOW);
@@ -3254,6 +3276,14 @@ __declspec(dllexport) void dllStartPlugin(void)
 }
 
 __declspec(dllexport) void dllStopPlugin(void) { logline("dllStopPlugin"); }
+
+#ifdef KFP_RE_PLUGIN
+/* RE_Kenshi entry point. It LoadLibrary's this DLL and calls startPlugin()
+ * (exported as ?startPlugin@@YAXXZ via plugin.def). Same init as the Ogre
+ * dllStartPlugin, but g_rva is resolved by signature (see the KFP_RE_PLUGIN
+ * branch above). */
+void startPlugin(void) { dllStartPlugin(); }
+#endif
 
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved)
 {

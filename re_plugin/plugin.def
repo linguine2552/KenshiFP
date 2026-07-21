@@ -1,0 +1,3 @@
+LIBRARY KenshiFP
+EXPORTS
+    ?startPlugin@@YAXXZ = startPlugin

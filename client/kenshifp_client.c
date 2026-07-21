@@ -92,10 +92,9 @@
 #define RVA_CHARMOVE_SETDEST 0x661270u   /* CharMovement::setDestination (raw move; no navmesh) */
 #define RVA_CHAR_SETDEST     0x5c84e0u   /* NOT setDestination: teleport+facing placement
                                           * (3rd arg = Ogre::Quaternion* facing). Unused. */
-#define RVA_MOVE_TO_POS      0x5d22b0u   /* Character::moveToPosition (vtable +0x318): the REAL
-                                          * right-click walk path. Issues/live-updates a
-                                          * Task_Move(0x1d) -- pathfinds, animates, and per-frame
-                                          * calls ARE the game's drag-move ("hold right-click"). */
+/* NB: the player move order (playerMoveOrderDefault) is called via the Character
+ * VTABLE slot +0x318 (see try_move_to_pos) -- NOT a hard-coded RVA -- so there is
+ * deliberately no RVA_MOVE_TO_POS. (The old 0x5d22b0 was never that function.) */
 #define CHAR_TASKHOLDER      0x648       /* Character+0x648 -> task holder */
 #define TASK_CUR             0x68        /* holder+0x68 = current task */
 #define TASK_DESC            0x70        /* task+0x70 = descriptor */
@@ -106,11 +105,9 @@
 #define CHAR_PRONE_STATE     0xE0        /* _currentProneState (ProneState 0..4) */
 #define CHAR_WANTS_GETUP     0xEC        /* playerWantsMeToGetUp (bool) -- the game's OWN get-up req */
 #define CHAR_IN_SOMETHING    0x2F8       /* inSomething (UseStuffState: 0 nothing/1 bed/2 prison) */
-#define CHAR_GETTING_UP      0x278       /* isCurrentlyGettingUp (bool) */
 #define CHAR_VT_PLAYERMOVE   (0x318/8)   /* vtable: playerMoveOrderDefault(Building*,RootObject*,Vector3&) */
-#define PS_NORMAL 0
-#define PS_PLAYING_DEAD 3
-#define PS_KO 4                          /* truly out -- cannot get up until recovered */
+#define PS_NORMAL 0                      /* ProneState: 0 normal, 2 crippled, 3 playing-dead */
+#define PS_KO 4                          /* ...4 = KO, truly out (cannot get up until recovered) */
 /* --- UI-panel-open detection (decompile-verified 1.0.68). ForgottenGUI is a
  * static INSTANCE at 0x21337b0; other window singletons are static pointers.
  * Everything below is a pure read or a tiny getVisible (widget flag read). --- */
@@ -322,7 +319,7 @@
  * active table (g_rva), so all use-sites switch automatically. */
 typedef struct {
     uintptr_t MAINLOOP, CAM_INSTANCE, INPUT_CONTROLENABLED, INPUT_MWHEEL, SCENE_CTX,
-        FOLLOW_OBJECT, STOP_FOLLOW, CHARMOVE_SETDEST, CHAR_SETDEST, MOVE_TO_POS,
+        FOLLOW_OBJECT, STOP_FOLLOW, CHARMOVE_SETDEST, CHAR_SETDEST,
         GUI_INV_COUNT, GUI_STATS_BEG, GUI_STATS_END, GUI_WINSTACK, GUI_DLGWND,
         DLG_GETVIS, ESCMENU_PTR, ESC_GETVIS, OVERVIEW_PTR, OVW_GETVIS,
         OPTIONS_PTR, OPT_GETVIS, PROSPECT_PTR, PRO_GETVIS, SAVELOAD_PTR,
@@ -334,7 +331,7 @@ typedef struct {
 
 static const addr_table_t T_1068 = {
     RVA_MAINLOOP, RVA_CAM_INSTANCE, RVA_INPUT_CONTROLENABLED, RVA_INPUT_MWHEEL, RVA_SCENE_CTX,
-    RVA_FOLLOW_OBJECT, RVA_STOP_FOLLOW, RVA_CHARMOVE_SETDEST, RVA_CHAR_SETDEST, RVA_MOVE_TO_POS,
+    RVA_FOLLOW_OBJECT, RVA_STOP_FOLLOW, RVA_CHARMOVE_SETDEST, RVA_CHAR_SETDEST,
     RVA_GUI_INV_COUNT, RVA_GUI_STATS_BEG, RVA_GUI_STATS_END, RVA_GUI_WINSTACK, RVA_GUI_DLGWND,
     RVA_DLG_GETVIS, RVA_ESCMENU_PTR, RVA_ESC_GETVIS, RVA_OVERVIEW_PTR, RVA_OVW_GETVIS,
     RVA_OPTIONS_PTR, RVA_OPT_GETVIS, RVA_PROSPECT_PTR, RVA_PRO_GETVIS, RVA_SAVELOAD_PTR,
@@ -366,7 +363,7 @@ static const addr_table_t T_1068 = {
  * 0 = TODO (Ghidra pass in progress) or unused-in-client. Same field order. */
 static const addr_table_t T_1065 = {
     0x787e70, 0x21322c0, 0x21323f0, 0, 0x21322b8,
-    0x6aed00, 0x6aed40, 0x6607e0, 0, 0x5d1820,
+    0x6aed00, 0x6aed40, 0x6607e0, 0,
     0x2132810, 0x2132918, 0x2132920, 0x2132960, 0x2132770,
     0x721390, 0x212e4a8, 0x912170, 0x212e4e8, 0x48b0e0,
     0x212e080, 0x3e7100, 0x212da50, 0x48b4c0, 0x212dbc8,
@@ -400,7 +397,6 @@ static addr_table_t g_rva;   /* active table, selected at load by build signatur
 #undef RVA_STOP_FOLLOW
 #undef RVA_CHARMOVE_SETDEST
 #undef RVA_CHAR_SETDEST
-#undef RVA_MOVE_TO_POS
 #undef RVA_GUI_INV_COUNT
 #undef RVA_GUI_STATS_BEG
 #undef RVA_GUI_STATS_END
@@ -444,7 +440,6 @@ static addr_table_t g_rva;   /* active table, selected at load by build signatur
 #define RVA_STOP_FOLLOW         (g_rva.STOP_FOLLOW)
 #define RVA_CHARMOVE_SETDEST    (g_rva.CHARMOVE_SETDEST)
 #define RVA_CHAR_SETDEST        (g_rva.CHAR_SETDEST)
-#define RVA_MOVE_TO_POS         (g_rva.MOVE_TO_POS)
 #define RVA_GUI_INV_COUNT       (g_rva.GUI_INV_COUNT)
 #define RVA_GUI_STATS_BEG       (g_rva.GUI_STATS_BEG)
 #define RVA_GUI_STATS_END       (g_rva.GUI_STATS_END)
@@ -545,7 +540,6 @@ typedef void (*rgm_creategroup_t)(void *rgm, const void *group, char inGlobalPoo
 typedef void (*rgm_initgroup_t)(void *rgm, const void *group);
 typedef void (*charmove_setdest_t)(void *mv, const Vec3 *dest, int pri, char shift);
 typedef void (*char_setdest_t)(void *self, const Vec3 *pos, const void *facingQuat);
-typedef void (*move_to_pos_t)(void *ch, void *clickedObj, void *targetObj, const Vec3 *pos);
 
 /* Terrain::getHeight / intersect result (Plugin_Terrain_x64.dll). Retbuf ABI:
  * this=RCX, TerrainHit* ret=RDX, arg=R8. Pure const query, main-thread safe. */
@@ -714,8 +708,7 @@ static int g_crosshair_red;        /* crosshair currently on the red (enemy) tex
 static int g_pointer_default = 1;  /* current MyGUI pointer is the default (arrow) */
 static charmove_setdest_t g_charmove_setdest;  /* CharMovement::setDestination (raw move) */
 static char_setdest_t g_char_setdest;          /* teleport+facing placement (unused) */
-static move_to_pos_t g_move_to_pos;            /* Character::moveToPosition (walk order) */
-static int g_movetopos_dead;                   /* set if moveToPosition ever faults */
+static int g_movetopos_dead;                   /* set if playerMoveOrderDefault ever faults */
 static terrain_getheight_t g_terrain_getheight; /* Terrain::getHeight (Plugin_Terrain dll) */
 static terrain_intersect_t g_terrain_intersect; /* Terrain::intersect (ray -> ground point) */
 static int g_terrain_dead;                     /* set if the terrain query ever faults */
@@ -3354,7 +3347,6 @@ __declspec(dllexport) void dllStartPlugin(void)
     g_stop_following = (stop_follow_t)(g_base + RVA_STOP_FOLLOW);
     g_charmove_setdest = (charmove_setdest_t)(g_base + RVA_CHARMOVE_SETDEST);
     g_char_setdest     = (char_setdest_t)(g_base + RVA_CHAR_SETDEST);
-    g_move_to_pos      = (move_to_pos_t)(g_base + RVA_MOVE_TO_POS);
     g_nearest_town     = (nearest_town_t)(g_base + RVA_NEAREST_TOWN);
     g_interior_load    = (interior_load_t)(g_base + RVA_INTERIOR_LOAD);
     AddVectoredExceptionHandler(1, veh_guard);   /* crash guard for game-fn calls */

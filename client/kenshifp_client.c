@@ -101,6 +101,16 @@
 #define TASK_DESC            0x70        /* task+0x70 = descriptor */
 #define TASKDESC_TYPE        0x44        /* descriptor+0x44 = order type id */
 #define TASK_MOVE_ID         0x1d        /* Task_Move (player walk order) */
+/* Authoritative from KenshiLib Character.h (member/vtable offsets are layout-
+ * stable across point releases, unlike RVAs). */
+#define CHAR_PRONE_STATE     0xE0        /* _currentProneState (ProneState 0..4) */
+#define CHAR_WANTS_GETUP     0xEC        /* playerWantsMeToGetUp (bool) -- the game's OWN get-up req */
+#define CHAR_IN_SOMETHING    0x2F8       /* inSomething (UseStuffState: 0 nothing/1 bed/2 prison) */
+#define CHAR_GETTING_UP      0x278       /* isCurrentlyGettingUp (bool) */
+#define CHAR_VT_PLAYERMOVE   (0x318/8)   /* vtable: playerMoveOrderDefault(Building*,RootObject*,Vector3&) */
+#define PS_NORMAL 0
+#define PS_PLAYING_DEAD 3
+#define PS_KO 4                          /* truly out -- cannot get up until recovered */
 /* --- UI-panel-open detection (decompile-verified 1.0.68). ForgottenGUI is a
  * static INSTANCE at 0x21337b0; other window singletons are static pointers.
  * Everything below is a pure read or a tiny getVisible (widget flag read). --- */
@@ -495,7 +505,8 @@ static float g_cfg_fov      = 70.0f;   /* fov: vertical degrees in FP */
 static float g_cfg_nearclip = 1.0f;    /* near_clip: world units */
 static float g_cfg_sens     = 1.0f;    /* sensitivity: mouse multiplier */
 static float g_cfg_eye_fwd  = 2.0f;    /* eye_forward: eye ahead of head bone */
-static float g_cfg_move_fwd = 1.5f;    /* move_forward: extra push while moving */
+static float g_cfg_move_fwd = 1.5f;    /* move_forward: extra push at full-run speed */
+static float g_cfg_move_ref = 60.0f;   /* move_speed_ref: feet units/sec that counts as "full run" */
 static float g_cfg_lean     = 0.5f;    /* aim_lean_amount: spine bend gain */
 #define VK_TOGGLE_FP      (g_cfg_key_fp)
 #define VK_W (g_cfg_key_w)
@@ -690,6 +701,7 @@ static gui_subsetcolour_t g_gui_subsetcolour;
  * accepts an RGBA colour multiply -- alpha included. VEH-unsafe-free (pure
  * pointer walks + one virtual-free exported call). */
 static int readable(const void *p, size_t n);
+static int char_prone_state(void *pc);   /* fwd: used by the down-state detect before its def */
 static void widget_alpha(void *w, float a)
 {
     if (!w || !g_gui_getsubmain || !g_gui_subsetcolour) return;
@@ -725,6 +737,7 @@ static int g_interiors_dead;                   /* set if the interior preload ev
 static DWORD g_last_move_ms;
 static int g_was_moving;
 static int g_was_direct;           /* current WASD hold uses engine direct drive */
+static int g_stuck_frames;         /* direct-driving but body not translating (seated/bed/pinned) */
 static int g_eye_from_head;        /* this frame's eye came from the head bone (not fallback) */
 /* Direct-drive intent, published by fp_movement and ENFORCED inside the
  * CharMovement::update hook -- applying there (before the original runs) wins
@@ -749,10 +762,15 @@ static float g_dbg_head_x, g_dbg_center_x;  /* frame check: head vs center X */
 static int g_cursor_hidden;        /* our ShowCursor state */
 static int g_ui_prev;              /* dialogue/menu open last frame (edge) */
 static int g_ui_open;              /* dialogue/menu open THIS frame (read by the setPointer hook) */
+static int g_ui_moveblock;         /* HARD block (control disabled: dialogue/cutscene); halts WASD */
 static int g_dbg_control;          /* controlEnabled read, for verification */
 static float g_tx, g_tz;           /* game->Ogre translation, calibrated when still */
 static int g_have_t;
-static float g_last_feet_x, g_last_feet_z;
+static float g_prevraw_tx, g_prevraw_tz;  /* prev-frame raw (centerW-feet), for rebase detect */
+static int   g_have_prevraw;              /* g_prevraw_* is valid (continuous FP) */
+static float g_last_feet_x, g_last_feet_z;  /* prev-frame feet (horizontal), for speed calc */
+static int   g_have_last_feet;              /* g_last_feet_* is valid */
+static float g_move_speed;                  /* smoothed horizontal feet speed, units/sec */
 
 /* True if p points inside the loaded kenshi_x64.exe image (where real vtables
  * and functions live). Used to reject false-positive "objects" before calling
@@ -843,6 +861,25 @@ static int char_position(void *c, Vec3 *out)
 
 static int ui_panels_open(void);   /* forward decl (defined after the VEH guard) */
 
+/* Clear the game InputHandler's stuck keyboard-modifier flags. The instance's
+ * controlEnabled sits at InputHandler+0xD0 (== RVA_INPUT_CONTROLENABLED, already
+ * resolved), and ctrl/shift/alt are the next three bytes (+0xD8/+0xD9/+0xDA).
+ * Right Alt is AltGr on many layouts: the OS expands it to Left-Ctrl + Right-Alt,
+ * and if that phantom Ctrl's key-UP is missed during an FP toggle, InputHandler
+ * ::ctrl latches on -- and since move/order commands test CTRL_MASK, EVERYTHING
+ * then reads as Ctrl-held = sneak. Clearing the flags un-sticks it. */
+static void clear_input_mods(void)
+{
+    uintptr_t ce = g_base + RVA_INPUT_CONTROLENABLED;   /* InputHandler + 0xD0 */
+    if (readable((void *)(ce + 0xA), 1)) {
+        *(unsigned char *)(ce + 8) = 0;    /* ctrl  (+0xD8) */
+        *(unsigned char *)(ce + 9) = 0;    /* shift (+0xD9) */
+        *(unsigned char *)(ce + 0xA) = 0;  /* alt   (+0xDA) */
+    }
+}
+
+static int g_clearmod_frames;      /* countdown: keep clearing stuck mods after a toggle */
+
 static void poll_input(void)
 {
     /* Two detection paths, one toggle:
@@ -860,8 +897,38 @@ static void poll_input(void)
             g_fp_mode = !g_fp_mode;
             logline("[input] FP mode toggled -> %s", g_fp_mode ? "ON" : "OFF");
         }
+        /* Toggling with Right Alt (AltGr) can leave InputHandler::ctrl stuck ->
+         * everything reads as sneak. Scrub the phantom modifiers for a short
+         * window (the missed key-up may lag the toggle by a few frames). */
+        g_clearmod_frames = 20;
+    }
+    if (g_clearmod_frames > 0 && !(GetAsyncKeyState(VK_TOGGLE_FP) & 0x8000)) {
+        g_clearmod_frames--;
+        clear_input_mods();
     }
     g_toggle_was_down = down;
+
+    /* [sneak diag] Dump the game input state so we can SEE what "sneak" is:
+     * InputHandler modifier/pan bytes (base 0x2133370: +0xD0 controlEnabled,
+     * +0xD4 gameMode, +0xD8 ctrl, +0xD9 shift, +0xDA alt, +0xDB..DE arrows) and
+     * the selected character's stealthMode (Character+0xD4). Throttled; any
+     * physical key held is noted so we can correlate. */
+    if (KFP_DEBUG_LOG) {
+        static int sd;
+        if ((++sd % 30) == 0) {
+            unsigned char *ih = (unsigned char *)(g_base + RVA_INPUT_CONTROLENABLED - 0xD0); /* InputHandler base */
+            int anykey = 0;
+            for (int vk = 0x08; vk <= 0xFE; vk++)
+                if ((GetAsyncKeyState(vk) & 0x8000) && vk != VK_TOGGLE_FP) { anykey = vk; break; }
+            int stealth = -1;
+            if (g_player_pc && readable((void *)((uintptr_t)g_player_pc + 0xD4), 1))
+                stealth = *(unsigned char *)((uintptr_t)g_player_pc + 0xD4);
+            if (readable(ih, 0xE0))
+                logline("[sneak] fp=%d ctrlEn=%d gameMode=%d ctrl=%d shift=%d alt=%d arrows=%d%d%d%d stealthMode=%d heldVK=0x%02X",
+                        g_fp_mode, ih[0xD0], ih[0xD4], ih[0xD8], ih[0xD9], ih[0xDA],
+                        ih[0xDB], ih[0xDC], ih[0xDD], ih[0xDE], stealth, anykey);
+        }
+    }
 }
 
 /* Throttled read-only observation of everything the FP work will drive. */
@@ -1353,6 +1420,8 @@ static void fp_camera_override(void *gw)
             if (pc_prev && g_spine_manual) release_spine(pc_prev);
             g_have_qref = 0; g_down_blend = 0.0f; g_is_down = 0;  /* ragdoll ref */
             g_have_fwd = 0;                                       /* spine fwd axis */
+            g_have_last_feet = 0; g_move_speed = 0.0f;            /* speed-push tracker */
+            g_have_prevraw = 0;                                   /* rebase-detect tracker */
             /* NOTE: g_have_t/g_tx/g_tz are NOT reset -- T is the floating-origin
              * translation (ogre vs game coords), scene-global and identical for
              * every character. Resetting it on swap opened an uncalibrated
@@ -1607,6 +1676,11 @@ static void fp_camera_override(void *gw)
         else panel_frames = 0;
         int ui_open = (control == 0) || (panels_now && panel_frames >= 8);
         g_ui_open = ui_open;                    /* read by the setPointer hook */
+        /* Movement gate is NARROWER than the cursor gate: a mere side panel
+         * (inventory/squad/jobs) frees the cursor + freezes look, but WASD should
+         * still walk the character (vanilla lets you pan the camera then too).
+         * Only a genuine control-disabled state (dialogue/cutscene) halts WASD. */
+        g_ui_moveblock = (control == 0);
         if (!g_ovr_prev) {                                            /* FP enter */
             mygui_cursor(0); g_pointer_default = 1;
             /* Save the vanilla zoom: the camera node's LOCAL position is
@@ -1639,6 +1713,7 @@ static void fp_camera_override(void *gw)
                  * follow resumes. g_qref self-recalibrates every upright frame,
                  * so no explicit clear is needed. */
                 if (!g_is_down) { g_yaw = 0.0f; g_pitch = 0.0f; }
+                g_have_prevraw = 0;   /* don't bridge a rebase across the FP gap */
                 LONG jx, jy; di_take_acc(&jx, &jy);     /* drain pre-FP motion */
             } else if (!g_ui_prev) {            /* skip the delta on the frame a dialogue closes */
                 /* DirectInput relative deltas (see ensure_dinput comment);
@@ -1705,11 +1780,41 @@ static void fp_camera_override(void *gw)
                 void *pc = first_player_char(gw);
                 Vec3 feet, head;
                 if (pc && char_position(pc, &feet)) {
+                    /* Horizontal ground speed from feet delta / dt (framerate-
+                     * independent). Drives the speed-scaled forward push below so
+                     * the eye leads faster movement instead of getting left behind. */
+                    {
+                        float dt = (g_frame_dt > 0.0f && g_frame_dt < 0.25f) ? g_frame_dt : 0.016f;
+                        if (g_have_last_feet) {
+                            float dfx = feet.x - g_last_feet_x, dfz = feet.z - g_last_feet_z;
+                            float inst = sqrtf(dfx*dfx + dfz*dfz) / dt;
+                            if (inst > 400.0f) inst = 400.0f;   /* reject teleport/paging jumps */
+                            g_move_speed += (inst - g_move_speed) * 0.20f;   /* ~0.15s low-pass */
+                        }
+                        g_last_feet_x = feet.x; g_last_feet_z = feet.z; g_have_last_feet = 1;
+                    }
                     g_get_bone_world(pc, &head, g_head_bone);
                     Vec3 h = { head.x - feet.x, head.y - feet.y, head.z - feet.z };
                     g_head_above = h.y;   /* head height over feet; small => actually prone */
                     if (h.x*h.x + h.y*h.y + h.z*h.z > 0.25f) {
                         eyeW.y = head.y - EYE_DROP;   /* head-bone Y directly (Y not rebased) */
+                        /* Floating-origin rebase guard: loading a new map chunk
+                         * makes Ogre recenter the scene -- centerW (Ogre coords)
+                         * jumps by the rebase delta in a single frame while feet
+                         * (game coords) stay continuous, so (centerW-feet) jumps.
+                         * During movement g_tx is frozen, so without this the eye
+                         * would stay in the OLD Ogre frame and the camera teleports
+                         * away. A one-frame jump this large is a rebase (camera lag
+                         * drifts only a few units/frame), so shift the frozen T by
+                         * it and the weld survives the chunk load seamlessly. */
+                        float rawtx = centerW.x - feet.x, rawtz = centerW.z - feet.z;
+                        if (g_have_prevraw && g_have_t) {
+                            float ddx = rawtx - g_prevraw_tx, ddz = rawtz - g_prevraw_tz;
+                            if (ddx*ddx + ddz*ddz > 2500.0f) {   /* >50u/frame = rebase */
+                                g_tx += ddx; g_tz += ddz;
+                            }
+                        }
+                        g_prevraw_tx = rawtx; g_prevraw_tz = rawtz; g_have_prevraw = 1;
                         /* head/feet are GAME coords, center is OGRE; they differ by
                          * a constant floating-origin translation T. Calibrate T ONLY
                          * while idle (the center node has caught up); freeze it during
@@ -1766,10 +1871,25 @@ static void fp_camera_override(void *gw)
 
             /* Push the eye forward (horizontal look dir) so it sits at the face,
              * not inside the head mesh. */
-            /* Extra forward push while moving, eased in/out (~0.25s) so the
-             * start/stop transition slides instead of popping. */
+            /* Speed-scaled forward lead so the camera doesn't get left behind
+             * the head. g_move_speed is the head's ON-SCREEN speed (feet delta /
+             * real dt), so it already grows with both faster movement AND higher
+             * game speed (2x/5x move the head 2x/5x further per real second).
+             *
+             * But at high game speed the weld lags by more world distance, and
+             * we want the lead to grow proportionally. So: divide out the game-
+             * speed multiplier to recover the pure gait (walk..run, 0..1), then
+             * multiply the lead back by game speed. Standing still -> 0 (no lag,
+             * no push); running at 5x -> ~5x the 1x-run lead. */
+            float gs = readable((void *)((uintptr_t)gw + GW_FRAMESPEED), 4)
+                     ? *(float *)((uintptr_t)gw + GW_FRAMESPEED) : 1.0f;
+            if (!(gs >= 1.0f)) gs = 1.0f;          /* paused/garbage -> treat as 1x */
+            if (gs > 6.0f) gs = 6.0f;              /* clamp (max button is 5x) */
+            /* gait = game-speed-independent movement intensity (0 idle .. 1 run) */
+            float gait = g_cfg_move_ref > 1.0f ? (g_move_speed / gs) / g_cfg_move_ref : 0.0f;
+            if (gait < 0.0f) gait = 0.0f; else if (gait > 1.25f) gait = 1.25f;
             static float mfwd;
-            mfwd += ((g_was_moving ? FP_MOVE_FORWARD : 0.0f) - mfwd) * 0.12f;
+            mfwd += (FP_MOVE_FORWARD * gait * gs - mfwd) * 0.15f;
             float fpush = FP_EYE_FORWARD + mfwd;
             eyeW.x += sinf(g_yaw) * fpush;
             eyeW.z += cosf(g_yaw) * fpush;
@@ -1830,14 +1950,21 @@ static void fp_camera_override(void *gw)
                 /* Require the head to actually be low (body prone), not just the
                  * ragdoll-parts mask + head tilt -- a critically injured but
                  * UPRIGHT character sets the mask and can slump the head past the
-                 * tilt threshold while still standing (head stays ~1.6m up). */
-                int truly_down = is_down && g_have_qref && tiltdeg > 55.0f
-                                 && g_head_above < 0.9f;
+                 * tilt threshold while still standing (head stays ~1.6m up).
+                 * PS_KO (authoritative prone state) triggers it directly too: the
+                 * tilt heuristic needs an UPRIGHT reference (g_qref) captured
+                 * before the knockdown, which we DON'T have after switching to a
+                 * character who is ALREADY unconscious -- so the vignette used to
+                 * vanish on swap. PS_KO doesn't need the reference. */
+                int ko = char_prone_state(pc2) == PS_KO;
+                int truly_down = ko ||
+                                 (is_down && g_have_qref && tiltdeg > 55.0f
+                                  && g_head_above < 0.9f);
                 g_is_down = truly_down;   /* next frame's look-input freeze reads this */
                 static int prev_down = -1;
                 if (KFP_DEBUG_LOG && ((int)truly_down != prev_down || (is_down && !truly_down))) {
-                    logline("[orient] is_down=%d truly=%d tilt=%.0f headY=%.2f",
-                            is_down, truly_down, tiltdeg, g_head_above);
+                    logline("[orient] is_down=%d truly=%d ko=%d tilt=%.0f headY=%.2f",
+                            is_down, truly_down, ko, tiltdeg, g_head_above);
                     prev_down = truly_down;
                 }
                 /* Freeze the upright reference on the raw ragdoll signal (not on
@@ -1893,7 +2020,7 @@ static void fp_camera_override(void *gw)
          * orientation to identity so update()'s incremental rotations no longer
          * drift off our FP angle (position is left for update() to reset). */
         while (ShowCursor(TRUE) < 0) { }
-        g_cursor_hidden = 0; g_ui_prev = 0; g_ui_open = 0;
+        g_cursor_hidden = 0; g_ui_prev = 0; g_ui_open = 0; g_ui_moveblock = 0;
         mygui_cursor(1);                        /* FP exit: restore the game cursor */
         /* widget hides handled post-frame by fp_gui_update (sees !g_fp_mode) */
         g_have_eye = 0;                         /* stop the mid-frame re-assert */
@@ -2011,26 +2138,50 @@ static int ui_panels_open(void)
     return mask != 0;
 }
 
-/* Character::moveToPosition (RVA 0x5d22b0 = vtable +0x318), crash-guarded: the
- * GENUINE right-click walk path. Issues/live-updates a Task_Move(0x1d) --
- * pathfinds, ground-follows, animates, and as a real player order makes a
- * DOWNED character struggle back up. Per-frame calls are exactly the game's
- * drag-move ("hold right-click") path: an active Task_Move just gets its
- * destination Vec3 updated in place.
- * Returns 1 if the call completed, 0 if unavailable or previously faulted. */
+/* Character::playerMoveOrderDefault(Building* dest, RootObject* subject,
+ * Vector3& loc) -- THE vanilla right-click walk order (KenshiLib: vtable +0x318,
+ * RVA 0x5D1B30 in the SDK build). Called via the VTABLE SLOT, not a hard-coded
+ * RVA: the previous hard-coded 0x5d22b0 was NOT this function (it isn't a
+ * Character method in the SDK header at all) -- point releases shift RVAs while
+ * the vtable layout stays put, so the slot is correct on every build/edition.
+ * Issues/live-updates a Task_Move(0x1d): pathfinds, ground-follows, animates,
+ * cancels the current job, and makes a downed/seated/bedded character get up.
+ * Crash-guarded. Returns 1 if the call completed, 0 if unavailable/faulted. */
 static int try_move_to_pos(void *pc, const Vec3 *tgt)
 {
-    if (g_movetopos_dead || !g_move_to_pos) return 0;
-    if (!in_module(*(void ***)pc)) return 0;
+    if (g_movetopos_dead) return 0;
+    void **vt = *(void ***)pc;
+    if (!in_module(vt)) return 0;
+    void (*fn)(void *, void *, void *, const Vec3 *) =
+        (void (*)(void *, void *, void *, const Vec3 *))vt[CHAR_VT_PLAYERMOVE];
+    if (!in_module((void *)fn)) return 0;
     if (setjmp(g_guard_jb)) {          /* longjmp target: the call blew up */
         g_movetopos_dead = 1;
-        logline("moveToPosition FAULTED -- disabled for this session");
+        g_guard_armed = 0;
+        logline("playerMoveOrderDefault FAULTED -- disabled for this session");
         return 0;
     }
     g_guard_armed = 1;
-    g_move_to_pos(pc, NULL, NULL, tgt);   /* NULL,NULL = plain ground point */
+    fn(pc, NULL, NULL, tgt);          /* NULL,NULL = plain ground point */
     g_guard_armed = 0;
     return 1;
+}
+
+/* Character::_currentProneState (member 0xE0): 0 normal, 2 crippled, 3 playing
+ * dead, 4 KO. Authoritative -- replaces the head-height heuristic for get-up. */
+static int char_prone_state(void *pc)
+{
+    return readable((void *)((uintptr_t)pc + CHAR_PRONE_STATE), 4)
+        ? *(int *)((uintptr_t)pc + CHAR_PRONE_STATE) : PS_NORMAL;
+}
+
+/* Set the game's OWN "the player wants me up" flag (member 0xEC). This is what
+ * a vanilla move order sets to break a character out of playing-dead / a bed /
+ * a seat and start the get-up. A plain, safe memory write -- no call. */
+static void char_request_getup(void *pc)
+{
+    if (readable((void *)((uintptr_t)pc + CHAR_WANTS_GETUP), 1))
+        *(unsigned char *)((uintptr_t)pc + CHAR_WANTS_GETUP) = 1;
 }
 
 /* Is the character's CURRENT task our walk order (Task_Move 0x1d)? Used to
@@ -2146,9 +2297,11 @@ static void fp_movement(void *gw, float dt)
     float mr = (float)(d - a);     /* left/right (turns the char, not strafe) */
 
     (void)dt;
-    /* Treat "UI panel open" as keys-released: halts if we were moving, and no
-     * WASD while typing/clicking in panels. */
-    if (g_ui_open || keys == 0 || (mf == 0.0f && mr == 0.0f)) {
+    /* Treat a HARD UI block (dialogue/cutscene, control disabled) as keys-
+     * released: halt if moving. A plain side panel does NOT block movement --
+     * WASD keeps walking the character while inventory/squad/jobs are open,
+     * matching vanilla (which still pans the camera then). */
+    if (g_ui_moveblock || keys == 0 || (mf == 0.0f && mr == 0.0f)) {
         if (g_was_moving) {         /* release: halt at current position */
             if (g_was_direct) {
                 /* direct drive: instant stop -- zero the motion, return the
@@ -2160,6 +2313,12 @@ static void fp_movement(void *gw, float dt)
                     *(int *)((uintptr_t)mv + MV_MOVEMODE) = 0;   /* MOVE_NORMAL */
                 }
                 g_was_direct = 0;
+                /* Belt-and-suspenders: if a Task_Move somehow re-appeared during
+                 * the hold, replace it with stop-here so releasing WASD leaves us
+                 * where we stopped instead of resuming an old destination. */
+                Vec3 hpos;
+                if (char_task_is_move(pc) && char_position(pc, &hpos))
+                    try_move_to_pos(pc, &hpos);
             } else {
                 Vec3 here;
                 /* Halt ONLY if our walk task still owns the character. If an
@@ -2173,6 +2332,7 @@ static void fp_movement(void *gw, float dt)
             g_was_moving = 0;
             g_have_dest = 0;
             g_lead_sm = 0.0f;           /* fresh lead estimate on next move */
+            g_stuck_frames = 0;         /* fresh pinned estimate on next move */
         }
         /* Orient-to-control: while standing still, rotate the body to face the
          * camera look direction via faceDirection (CharMovement vtable slot 6).
@@ -2199,16 +2359,70 @@ static void fp_movement(void *gw, float dt)
     if (len < 0.001f) return;
     dx = -dx / len; dz = -dz / len;
 
+    /* Pinned-state detection: MOVE_DIRECTION only drives a STANDING body. When
+     * the character is seated (chair/bench/bar), in a bed, or mid get-up, the
+     * head is still up (so head_above doesn't flag it) yet setDirectMovement
+     * can't translate them -- it just spins them in place. Detect "commanding
+     * direct drive but not actually moving" and route to the point-click ORDER
+     * path instead, which cancels the holding job and walks us out. Clears as
+     * soon as real movement resumes, so normal standing locomotion is untouched
+     * (walking is ~26 u/s, far above the 2 u/s pinned floor). */
+    if (g_was_direct && g_move_speed < 2.0f) { if (g_stuck_frames < 600) g_stuck_frames++; }
+    else if (g_move_speed >= 4.0f) g_stuck_frames = 0;
+    int pinned = g_stuck_frames > 15;   /* ~0.25s of no progress under direct drive */
+
+    /* Authoritative state (KenshiLib members): prone state and bed flag tell us
+     * directly when the character can't do standing MOVE_DIRECTION locomotion
+     * and must instead be issued a get-up move order. */
+    int prone = char_prone_state(pc);   /* 0 normal, 2 crippled, 3 play-dead, 4 KO */
+    int in_bed = readable((void *)((uintptr_t)pc + CHAR_IN_SOMETHING), 4)
+                 && *(int *)((uintptr_t)pc + CHAR_IN_SOMETHING) == 1;   /* IN_BED */
+    /* "downed" = anything that isn't normal standing: an authoritative prone
+     * state (playing dead / crippled / KO / staying-low), lying in a bed, a
+     * physically low head, or the pinned fallback (a SEAT is a job, not a prone
+     * state, so only stuck-detection catches it). Route these to the order path,
+     * which cancels the holding job and runs the get-up. */
+    int downed = (prone != PS_NORMAL) || in_bed || (g_head_above < 0.9f) || pinned;
+    if (KFP_DEBUG_LOG) {
+        static int lg;
+        if ((++lg % 20) == 1) {
+            int mode = readable((void *)((uintptr_t)mv + MV_MOVEMODE), 4)
+                       ? *(int *)((uintptr_t)mv + MV_MOVEMODE) : -1;
+            int engaged = readable((void *)((uintptr_t)pc + 0x250), 1)
+                          ? *(unsigned char *)((uintptr_t)pc + 0x250) : -1;   /* _isEngagedWithAPlayer */
+            logline("[getup] prone=%d in_bed=%d headY=%.2f pinned=%d spd=%.1f downed=%d dm_active=%ld was_direct=%d mode=%d engaged=%d",
+                    prone, in_bed, g_head_above, pinned, g_move_speed, downed,
+                    g_dm_active, g_was_direct, mode, engaged);
+        }
+    }
+
     /* STANDING: engine-native direct drive -- reliable on floors, platforms,
-     * ramps, and everywhere the terrain-ray/click-order scheme wasn't.
-     * Prone/downed (head low) falls through to the order path below, which
-     * still owns crawling and the get-up flow. */
-    if (g_head_above >= 0.9f) {
+     * ramps, and everywhere the terrain-ray/click-order scheme wasn't. */
+    if (!downed) {
         void **mvvt = *(void ***)mv;
         if (in_module(mvvt)) {
+            /* Point-click DISENGAGE on the WASD press edge (outside the setjmp
+             * guard below -- try_move_to_pos has its own). This is the vanilla
+             * right-click order, and it cancels WHATEVER state currently holds
+             * the character: a leftover move order, a chair/bench, a bed, combat
+             * lock, playing dead. It is deliberately NOT gated on task type --
+             * gating on Task_Move (our own order only) left seated/bedded/jobbed
+             * characters pinned, so WASD merely SPUN them in place instead of
+             * getting them up. Issue it toward the WASD direction (not the exact
+             * spot) so the engine commits to stand-up + step. moveToPosition is
+             * the same call a right-click makes and is SEH-guarded, so a fault on
+             * a genuinely non-orderable state is contained rather than fatal. */
+            if (!g_was_direct) {
+                char_request_getup(pc);   /* break a seat before pinned-detect kicks in */
+                Vec3 hpos;
+                if (char_position(pc, &hpos)) {
+                    Vec3 dis = { hpos.x + dx * 6.0f, hpos.y, hpos.z + dz * 6.0f };
+                    try_move_to_pos(pc, &dis);
+                }
+            }
             if (setjmp(g_guard_jb)) { g_guard_armed = 0; return; }
             g_guard_armed = 1;
-            if (!g_was_direct)   /* entering direct drive: cancel click orders */
+            if (!g_was_direct)   /* entering direct drive: also stop the mover */
                 ((void (*)(void *))mvvt[MV_HALT_SLOT])(mv);
             int spd = g_speed_scale < 0.4f ? 0 : g_speed_scale < 0.8f ? 1 : 2;
             /* Publish the intent; the CharMovement::update hook enforces it
@@ -2260,7 +2474,19 @@ static void fp_movement(void *gw, float dt)
      * Strafe/backpedal (look != move dir) or sky-aimed ray: fabricate the
      * point ahead and ground-clamp its height. */
     Vec3 tgt; int via_ray = 0;
-    if (mf > 0.0f && mr == 0.0f) {
+    if (downed) {
+        /* GET UP from the ground, a bed, being seated, or playing dead. Set the
+         * game's OWN get-up flag (what a real move order sets to break the state)
+         * and issue a FAR, un-clamped ground order in the WASD direction. That
+         * combination reliably commits the engine to get-up + walk -- the near,
+         * terrain-clamped targeting below is tuned for standing slope-climbing and
+         * doesn't trigger get-up dependably (and a bed sits above the ground, so
+         * clamping to the surface underneath can fabricate an unreachable target).
+         * If the character is genuinely KO the engine ignores it until recovery,
+         * so it does no harm. */
+        char_request_getup(pc);
+        tgt.x = here.x + dx * 500.0f; tgt.y = here.y; tgt.z = here.z + dz * 500.0f;
+    } else if (mf > 0.0f && mr == 0.0f) {
         float cp = cosf(g_pitch);
         Vec3 ro = { here.x, here.y + 16.0f, here.z };            /* ~eye, game frame */
         Vec3 rd = { dx * cp, -sinf(g_pitch), dz * cp };          /* unit look dir */
@@ -2290,7 +2516,7 @@ static void fp_movement(void *gw, float dt)
             }
         }
     }
-    if (!via_ray) {
+    if (!via_ray && !downed) {
         tgt.x = here.x + dx * dist; tgt.y = here.y; tgt.z = here.z + dz * dist;
         terrain_clamp(&tgt);
     }
@@ -2695,6 +2921,7 @@ static void load_ini(void)
         else if (ini_float(line, "sensitivity", &fv))     { if (fv >= 0.05f && fv <= 10) g_cfg_sens = fv; }
         else if (ini_float(line, "eye_forward", &fv))     { if (fv >= -5 && fv <= 10) g_cfg_eye_fwd = fv; }
         else if (ini_float(line, "move_forward", &fv))    { if (fv >= 0 && fv <= 10) g_cfg_move_fwd = fv; }
+        else if (ini_float(line, "move_speed_ref", &fv))  { if (fv >= 5 && fv <= 400) g_cfg_move_ref = fv; }
         else if (ini_float(line, "aim_lean_amount", &fv)) { if (fv >= 0 && fv <= 1.5f) g_cfg_lean = fv; }
     }
     fclose(f);
@@ -2725,16 +2952,22 @@ static void ini_hot_reload(void)
 static void fp_gui_update(void)
 {
     if (!g_gui_getinstance) return;
-    if (!g_fp_mode) {                      /* FP off: hide everything once */
-        static int hidden;
-        if (!hidden && g_widget_setvisible) {
+    static int prev_fp;
+    if (!g_fp_mode) {                      /* FP off: hide everything on the exit edge */
+        if (prev_fp && g_widget_setvisible) {
             if (g_crosshair) g_widget_setvisible(g_crosshair, 0);
             if (g_vignette)  g_widget_setvisible(g_vignette, 0);
             if (g_black_ov)  g_widget_setvisible(g_black_ov, 0);
-            hidden = 1;
+            /* Reset the KO fade so a re-enter doesn't flash a stale blackout. The
+             * static `hidden` guard used to latch on the FIRST exit and never
+             * re-arm, so exiting FP while unconscious a second time left the
+             * blackout stuck on screen. Edge-trigger on prev_fp fixes that. */
+            g_down_blend = 0.0f;
         }
+        prev_fp = 0;
         return;
     }
+    prev_fp = 1;
     ensure_crosshair();                    /* create (post-frame = safe) */
 
     /* crosshair tint (deferred from the setPointer hook) + visibility */
@@ -3011,15 +3244,46 @@ static void hooked_sheathe(void *pc)
  * in combat: the fight's locomotion suggestions lose the race every frame. */
 typedef void (*charmove_update_t)(void *mv, float t);
 static charmove_update_t g_charmove_update_orig;
-#define MV_CHARACTER 0x3A8              /* CharMovement::character (backref) */
-#define CHAR_VISNEAR 0x1A8              /* Character::isVisibleAndNear */
-#define CHAR_ONSCREEN 0x1A9             /* Character::isOnScreen */
+#define MV_CHARACTER   0x3A8            /* CharMovement::character (backref) */
+#define MV_ANIMOVERRIDE 0x37C           /* CharMovement::animationOverride (bool) */
+#define CHAR_VISNEAR   0x1A8            /* Character::isVisibleAndNear */
+#define CHAR_ONSCREEN  0x1A9            /* Character::isOnScreen */
+
+/* Force MOVE_DIRECTION + our WASD motion onto the player's CharMovement. Called
+ * both BEFORE and AFTER the original update: the original re-enables combat
+ * locomotion (animationOverride + movementMode) INSIDE itself when the char is
+ * combat-engaged, so a pre-override write alone loses the race every frame (log
+ * showed movementMode flickering 2->1->0). Re-asserting after the original is
+ * what makes WASD beat combat -- exactly what Kenshi-Direct-Control does. */
+static void mv_force_direct(void *mv)
+{
+    if (readable((void *)((uintptr_t)mv + MV_MOVEMODE), 4))
+        *(int *)((uintptr_t)mv + MV_MOVEMODE) = 2;              /* MOVE_DIRECTION */
+    if (readable((void *)((uintptr_t)mv + MV_ANIMOVERRIDE), 1))
+        *(unsigned char *)((uintptr_t)mv + MV_ANIMOVERRIDE) = 0;
+    if (readable((void *)((uintptr_t)mv + MV_SPEEDORDERS), 4))
+        *(int *)((uintptr_t)mv + MV_SPEEDORDERS) = g_dm_speed;
+    ((void (*)(void *, const Vec3 *, float))(g_base + RVA_SET_DIRECT_MOVE))(mv, &g_dm_dir, 99.0f);
+}
+
 static void hooked_charmove_update(void *mv, float t)
 {
-    if (g_dm_active && mv == g_dm_mv) {
-        if (readable((void *)((uintptr_t)mv + MV_SPEEDORDERS), 4))
-            *(int *)((uintptr_t)mv + MV_SPEEDORDERS) = g_dm_speed;
-        ((void (*)(void *, const Vec3 *, float))(g_base + RVA_SET_DIRECT_MOVE))(mv, &g_dm_dir, 99.0f);
+    int drive = (g_dm_active && mv == g_dm_mv);
+    if (KFP_DEBUG_LOG && g_fp_mode && mv == g_dm_mv) {
+        static int el;
+        if ((++el % 30) == 0) {
+            int mode = readable((void *)((uintptr_t)mv + MV_MOVEMODE), 4)
+                       ? *(int *)((uintptr_t)mv + MV_MOVEMODE) : -1;   /* mode combat left */
+            logline("[enf] dm_active=%ld mode(pre-override)=%d dir=(%.2f,%.2f)",
+                    g_dm_active, mode, g_dm_dir.x, g_dm_dir.z);
+        }
+    }
+    if (drive) {
+        /* Halt clears any combat chase motion the AI queued, then force our
+         * direction. (halt = CharMovement vtable +0x98.) */
+        void **vt = *(void ***)mv;
+        if (in_module(vt)) ((void (*)(void *))vt[MV_HALT_SLOT])(mv);
+        mv_force_direct(mv);
     }
     /* FP camera weld depends on a LIVE skeleton, but Kenshi culls animation
      * for characters it deems off-screen -- and in FP the camera sits inside
@@ -3034,6 +3298,9 @@ static void hooked_charmove_update(void *mv, float t)
         *(unsigned char *)((uintptr_t)g_player_pc + CHAR_ONSCREEN) = 1;
     }
     g_charmove_update_orig(mv, t);
+    /* Re-assert AFTER: the original just re-enabled combat locomotion mid-call.
+     * This post-write is the one that actually wins the race. */
+    if (drive) mv_force_direct(mv);
 }
 
 static int install_hook(void *target, void *detour, void **original)

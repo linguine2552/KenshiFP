@@ -46,8 +46,15 @@ which downgrades installs to 1.0.65 — KenshiFP runs on that build too.
 - **Building interiors preload** as you approach from outside — no more
   empty doorways.
 - **Foliage fix** — grass no longer vanishes underfoot in first person.
-- **FPS cap** — optional `KenshiFP.ini` (`fps_cap=N`): precise frame
-  limiting without vsync.
+- **Unconsciousness blackout** — knocked out, the screen fades to black
+  through a closing tunnel; on coming to, vision returns with a gradual
+  wake-up fade while the camera untumbles.
+- **Live-tunable settings** — `KenshiFP.ini` is **hot-reloaded in-game**:
+  edit and save, changes apply within a second, no restart. Toggles
+  (aim-lean, ranged free-aim, wheel speed, KO blackout), camera/feel
+  tuning (`fov`, `near_clip`, `sensitivity`, `eye_forward`,
+  `move_forward`, `aim_lean_amount`), key rebinds (FP toggle + WASD),
+  and an FPS cap (`fps_cap=N` — precise frame limiting without vsync).
 - **Framerate-independent mouse** — look input captured at ~1kHz on a
   dedicated thread; identical feel at any fps.
 

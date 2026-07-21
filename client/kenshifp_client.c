@@ -199,8 +199,8 @@
 #define MOVE_KEEPALIVE_MS  2000    /* safety re-issue if nothing else triggers */
 #define MOVE_TURN_EPS      0.12f   /* radians of heading change that forces a re-issue */
 #define EYE_DROP           (-1.5f) /* offset from the head bone Y (negative = raise); tune */
-#define FP_EYE_FORWARD     2.0f    /* move the eye forward (toward look) out of the head; tune */
-#define FP_MOVE_FORWARD    1.5f    /* EXTRA forward push while moving (blended in/out) */
+#define FP_EYE_FORWARD     (g_cfg_eye_fwd)  /* eye forward of the head (config) */
+#define FP_MOVE_FORWARD    (g_cfg_move_fwd) /* EXTRA forward push while moving (config) */
 
 /* ---- FOV ----
  * Ogre::Frustum::setFOVy(const Radian&) [Camera inherits it]; Radian == {float}.
@@ -209,7 +209,7 @@
  * person, and restore on exit. */
 #define OGRE_SETFOVY_SYM  "?setFOVy@Frustum@Ogre@@UEAAXAEBVRadian@2@@Z"
 #define OGRE_GETFOVY_SYM  "?getFOVy@Frustum@Ogre@@UEBAAEBVRadian@2@XZ"
-#define FP_FOV_DEG        70.0f    /* vertical FOV while first-person; tune */
+#define FP_FOV_DEG        (g_cfg_fov)  /* vertical FOV while first-person (config) */
 #define DEG2RAD           0.01745329f
 
 /* ---- near clip ----
@@ -219,7 +219,7 @@
  * (returns Real=float by value -> XMM0, safe scalar ABI). Kenshi is ~10 units/m. */
 #define OGRE_SETNEARCLIP_SYM "?setNearClipDistance@Frustum@Ogre@@UEAAXM@Z"
 #define OGRE_GETNEARCLIP_SYM "?getNearClipDistance@Frustum@Ogre@@UEBAMXZ"
-#define FP_NEARCLIP       1.0f     /* world units (~10 cm); clip very-near geometry
+#define FP_NEARCLIP       (g_cfg_nearclip) /* world units; clip very-near geometry
                                     * (own head/hair edges) a tiny bit; tune */
 
 /* ---- MyGUI cursor (hide the default arrow, keep contextual sword/speech) ----
@@ -287,6 +287,8 @@
 #define OGRE_OLDNODE_NEEDUPD_SYM "?needUpdate@OldNode@Ogre@@UEAAX_N@Z"
 #define OGRE_OLDBONE_SETMANUAL_SYM "?setManuallyControlled@OldBone@Ogre@@QEAAX_N@Z"
 #define OGRE_GETPARENTSCENENODE_SYM "?getParentSceneNode@MovableObject@Ogre@@QEBAPEAVSceneNode@2@XZ"
+#define MYGUI_GETSUBMAIN_SYM "?getSubWidgetMain@SkinItem@MyGUI@@QEAAPEAVISubWidgetRect@2@XZ"
+#define MYGUI_SUBSETCOLOUR_SYM "?_setColour@SubSkin@MyGUI@@UEAAXAEBUColour@2@@Z"
 #define OGRE_ENTITY_GETSKEL_SYM  "?getSkeleton@Entity@Ogre@@QEBAPEAVOldSkeletonInstance@2@XZ"
 #define OGRE_ENTITY_GETSKEL_SYM2 "?getSkeleton@Entity@Ogre@@QEBAPEAVSkeletonInstance@2@XZ"
 
@@ -462,7 +464,7 @@ static addr_table_t g_rva;   /* active table, selected at load by build signatur
 #define OGRE_SETDORI_SYM  "?_setDerivedOrientation@Node@Ogre@@QEAAXAEBVQuaternion@2@@Z"
 #define EYE_HEIGHT        1.7f    /* fallback eye height ONLY when the head bone
                                    * read fails; head-bone offset is used when valid */
-#define LOOK_SENS         0.0025f /* radians per mouse pixel */
+#define LOOK_SENS         (0.0025f * g_cfg_sens) /* radians per mouse count (config-scaled) */
 
 /* ---- player character / position (proven in KenshiMP) ---- */
 #define PI_PLAYERCHARS    0x2B0      /* PlayerInterface::playerCharacters (lektor<Character*>) */
@@ -473,11 +475,27 @@ static addr_table_t g_rva;   /* active table, selected at load by build signatur
 #define GETPOS_VTABLE_SLOT 8         /* Character::getPosition; ABI Vec3*(this RCX, out RDX) */
 
 /* ---- input (Win32, zero engine dependency for stage 0) ---- */
-#define VK_TOGGLE_FP      0xA5       /* Right Alt (VK_RMENU) — enter/leave FP */
-#define VK_W 0x57
-#define VK_A 0x41
-#define VK_S 0x53
-#define VK_D 0x44
+/* ---- user configuration (KenshiFP.ini, hot-reloaded in-game) ------------ */
+static int g_cfg_aim_lean = 1;     /* aim_lean: spine bend with weapon drawn */
+static int g_cfg_freeaim  = 1;     /* ranged_freeaim: crosshair aim in combat */
+static int g_cfg_wheel    = 1;     /* wheel_speed: scrollwheel gait control */
+static int g_cfg_vignette = 1;     /* ko_vignette: dark edges while knocked out */
+static int g_cfg_key_fp   = 0xA5;  /* key_toggle_fp (VK code; default Right Alt) */
+static int g_cfg_key_w    = 0x57;  /* key_forward */
+static int g_cfg_key_a    = 0x41;  /* key_left */
+static int g_cfg_key_s    = 0x53;  /* key_back */
+static int g_cfg_key_d    = 0x44;  /* key_right */
+static float g_cfg_fov      = 70.0f;   /* fov: vertical degrees in FP */
+static float g_cfg_nearclip = 1.0f;    /* near_clip: world units */
+static float g_cfg_sens     = 1.0f;    /* sensitivity: mouse multiplier */
+static float g_cfg_eye_fwd  = 2.0f;    /* eye_forward: eye ahead of head bone */
+static float g_cfg_move_fwd = 1.5f;    /* move_forward: extra push while moving */
+static float g_cfg_lean     = 0.5f;    /* aim_lean_amount: spine bend gain */
+#define VK_TOGGLE_FP      (g_cfg_key_fp)
+#define VK_W (g_cfg_key_w)
+#define VK_A (g_cfg_key_a)
+#define VK_S (g_cfg_key_s)
+#define VK_D (g_cfg_key_d)
 
 typedef struct { float x, y, z; } Vec3;
 typedef struct { float w, x, y, z; } Quat;   /* Ogre::Quaternion order */
@@ -655,6 +673,25 @@ static rgm_addlocation_t g_rgm_addlocation;
 static rgm_creategroup_t g_rgm_creategroup;
 static rgm_initgroup_t g_rgm_initgroup;
 static void *g_crosshair;          /* the ImageBox widget */
+static void *g_vignette;           /* fullscreen KO tunnel-vignette ImageBox */
+static void *g_black_ov;           /* fullscreen solid-black blackout ImageBox */
+typedef void *(*gui_getsubmain_t)(void *widget);
+typedef void (*gui_subsetcolour_t)(void *sub, const float *rgba);
+static gui_getsubmain_t   g_gui_getsubmain;
+static gui_subsetcolour_t g_gui_subsetcolour;
+
+/* Fade helper: MyGUI has no exported Widget::setAlpha, but the main sub-widget
+ * accepts an RGBA colour multiply -- alpha included. VEH-unsafe-free (pure
+ * pointer walks + one virtual-free exported call). */
+static int readable(const void *p, size_t n);
+static void widget_alpha(void *w, float a)
+{
+    if (!w || !g_gui_getsubmain || !g_gui_subsetcolour) return;
+    void *sub = g_gui_getsubmain(w);
+    if (!readable(sub, 8)) return;
+    float rgba[4] = { 1.0f, 1.0f, 1.0f, a };
+    g_gui_subsetcolour(sub, rgba);
+}
 static int g_crosshair_red;        /* crosshair currently on the red (enemy) texture */
 static int g_pointer_default = 1;  /* current MyGUI pointer is the default (arrow) */
 static charmove_setdest_t g_charmove_setdest;  /* CharMovement::setDestination (raw move) */
@@ -954,7 +991,7 @@ static int get_head_quat(void *pc, Quat *out)
  * No setManuallyControlled -> we layer on the live walk/run animation.
  * The local pitch axis + gain + sign are tuned in-game (Biped bones permuted).
  * VEH-guarded; pitch>0 = looking down. */
-#define SPINE_BEND_GAIN 0.5f      /* total lean as a fraction of look-pitch */
+#define SPINE_BEND_GAIN (g_cfg_lean)  /* total lean as a fraction of look-pitch (config) */
 #define SPINE_ROLL_UP   0.30f     /* roll gain, looking up   (pitch<0) */
 #define SPINE_ROLL_DOWN 0.30f     /* roll gain, looking down (pitch>0) */
 #define SPINE_ROLL_BIAS 0.0f      /* |pitch| roll, SAME direction both ways */
@@ -1328,7 +1365,7 @@ static void fp_camera_override(void *gw)
             logline("[spine] weaponInHands=%p drawn=%d", wih, weapon_drawn);
             prev_drawn = weapon_drawn;
         }
-        if (g_fp_mode && !g_is_down && weapon_drawn) bend_spine(pcx, g_pitch);
+        if (g_fp_mode && !g_is_down && weapon_drawn && g_cfg_aim_lean) bend_spine(pcx, g_pitch);
         else if (g_spine_manual)                     release_spine(pcx);
         /* Calibrate the forward axis only when the body reliably faces the
          * camera: sheathed (no bladed combat stance), idle, looking level. */
@@ -1519,7 +1556,7 @@ static void fp_camera_override(void *gw)
          * facing is driven by a path that bypasses faceDirection, so while in
          * FP ranged combat force the facing member (CharMovement+0xD0,
          * verified via getFacingDirection) to the look direction each frame. */
-        if (g_fp_mode && pcx) {
+        if (g_fp_mode && g_cfg_freeaim && pcx) {
             void *rc = readable((void *)((uintptr_t)pcx + CHAR_RANGEDCOMBAT), 8)
                 ? *(void **)((uintptr_t)pcx + CHAR_RANGEDCOMBAT) : NULL;
             if (readable((void *)((uintptr_t)rc + RC_COMBATMODE), 1)
@@ -1580,6 +1617,27 @@ static void fp_camera_override(void *gw)
         ensure_crosshair();
         if (g_crosshair && g_widget_setvisible)
             g_widget_setvisible(g_crosshair, (g_pointer_default && !ui_open) ? 1 : 0);
+        /* Destreza-style unconsciousness: the tunnel vignette rides the
+         * collapse blend, the screen goes FULL BLACK while out cold, and on
+         * regaining consciousness the black holds then smoothstep-fades over
+         * ~1.7s so vision "returns" gradually (wake-up fade). */
+        if (g_vignette && g_black_ov && g_widget_setvisible) {
+            static float wake; static int prev_out;
+            int out = g_is_down;
+            if (prev_out && !out) wake = 1.0f;      /* consciousness edge */
+            prev_out = out;
+            float dt = (g_frame_dt > 0.0f && g_frame_dt < 0.25f) ? g_frame_dt : 0.016f;
+            if (wake > 0.0f) { wake -= dt / 1.7f; if (wake < 0.0f) wake = 0.0f; }
+            float wk = wake * wake * (3.0f - 2.0f * wake);   /* smoothstep */
+            float black = out ? g_down_blend : 0.0f;
+            if (wk > black) black = wk;
+            float tun = g_down_blend * 1.3f; if (tun > 1.0f) tun = 1.0f;
+            if (!g_cfg_vignette || ui_open) { black = 0.0f; tun = 0.0f; }
+            widget_alpha(g_vignette, tun);
+            widget_alpha(g_black_ov, black);
+            g_widget_setvisible(g_vignette, tun > 0.02f);
+            g_widget_setvisible(g_black_ov, black > 0.02f);
+        }
 
         if (ui_open) {
             if (g_cursor_hidden) { while (ShowCursor(TRUE) < 0) { } g_cursor_hidden = 0; }
@@ -1851,6 +1909,8 @@ static void fp_camera_override(void *gw)
         g_cursor_hidden = 0; g_ui_prev = 0; g_ui_open = 0;
         mygui_cursor(1);                        /* FP exit: restore the game cursor */
         if (g_crosshair && g_widget_setvisible) g_widget_setvisible(g_crosshair, 0);
+        if (g_vignette && g_widget_setvisible) g_widget_setvisible(g_vignette, 0);
+        if (g_black_ov && g_widget_setvisible) g_widget_setvisible(g_black_ov, 0);
         g_have_eye = 0;                         /* stop the mid-frame re-assert */
         g_eye_sm_ok = 0; g_lead_sm = 0.0f;      /* reset smoothing state */
         /* Restore FOV/near-clip but KEEP the cached defaults (g_*_saved stays
@@ -2085,6 +2145,7 @@ static void fp_movement(void *gw, float dt)
     /* Scrollwheel throttle: consume the wheel captured by our LL hook. */
     LONG wheel = InterlockedExchange(&g_wheel_accum, 0);
     g_dbg_wheel = (int)wheel;
+    if (!g_cfg_wheel) wheel = 0;   /* wheel speed control disabled in config */
     if (wheel != 0) {
         g_speed_scale += (wheel / 120.0f) * 0.15f;      /* one notch = 0.15 */
         if (g_speed_scale < 0.15f) g_speed_scale = 0.15f;   /* slow walk */
@@ -2325,6 +2386,32 @@ static void ensure_crosshair(void)
     int cx = GetSystemMetrics(SM_CXSCREEN), cy = GetSystemMetrics(SM_CYSCREEN);
     if (cx <= 0) cx = 1920;
     if (cy <= 0) cy = 1080;
+    /* KO vignette: fullscreen, created FIRST so it renders under the
+     * crosshair within the same layer. Shown while knocked out. */
+    if (!g_vignette) {
+        unsigned char vt[32], vs[32], vl[32], vn[32], vtex[32];
+        make_mstr(vt, "ImageBox"); make_mstr(vs, "ImageBox"); make_mstr(vl, "Pointer");
+        make_mstr(vn, "FPVignette"); make_mstr(vtex, "vignette.png");
+        void *vw = g_gui_createwidget(gui, vt, vs, 0, 0, cx, cy,
+                                      0 /*Align::Default*/, vl, vn);
+        if (readable(vw, 8)) {
+            g_imgbox_setimage(vw, vtex);
+            g_widget_setvisible(vw, 0);
+            g_vignette = vw;
+        }
+    }
+    if (!g_black_ov) {
+        unsigned char bt[32], bs[32], bl[32], bn[32], btex[32];
+        make_mstr(bt, "ImageBox"); make_mstr(bs, "ImageBox"); make_mstr(bl, "Pointer");
+        make_mstr(bn, "FPBlackout"); make_mstr(btex, "black.png");
+        void *bw = g_gui_createwidget(gui, bt, bs, 0, 0, cx, cy,
+                                      0, bl, bn);
+        if (readable(bw, 8)) {
+            g_imgbox_setimage(bw, btex);
+            g_widget_setvisible(bw, 0);
+            g_black_ov = bw;
+        }
+    }
     /* Skin MUST be "ImageBox" (defined in Kenshi's common_skins.xml): a widget
      * renders through its skin's sub-items, so an empty skin draws nothing --
      * that was why the widget existed + texture loaded, yet nothing showed. */
@@ -2583,19 +2670,75 @@ static void fps_cap_wait(void)
     while (now.QuadPart < next.QuadPart) { YieldProcessor(); QueryPerformanceCounter(&now); }
 }
 
+static int ini_int(const char *line, const char *key, int *out)
+{
+    size_t kl = strlen(key);
+    while (*line == ' ' || *line == '\t') line++;
+    if (strncmp(line, key, kl) != 0) return 0;
+    line += kl;
+    while (*line == ' ' || *line == '\t') line++;
+    if (*line++ != '=') return 0;
+    while (*line == ' ' || *line == '\t') line++;
+    *out = (int)strtol(line, NULL, 0);   /* decimal or 0x hex */
+    return 1;
+}
+
+static int ini_float(const char *line, const char *key, float *out)
+{
+    size_t kl = strlen(key);
+    while (*line == ' ' || *line == '\t') line++;
+    if (strncmp(line, key, kl) != 0) return 0;
+    line += kl;
+    while (*line == ' ' || *line == '\t') line++;
+    if (*line++ != '=') return 0;
+    *out = (float)atof(line);
+    return 1;
+}
+
 static void load_ini(void)
 {
     FILE *f = fopen("KenshiFP.ini", "r");   /* CWD = game dir, same as KenshiFP.log */
     if (!f) return;
-    char line[128];
+    char line[160]; int v; float fv;
     while (fgets(line, sizeof line, f)) {
-        int v;
-        if (sscanf(line, " fps_cap = %d", &v) == 1 || sscanf(line, " fps_cap=%d", &v) == 1) {
-            if (v >= 15 && v <= 1000) g_fps_cap = v;
-        }
+        if (line[0] == ';' || line[0] == '#') continue;
+        if (ini_int(line, "fps_cap", &v))        g_fps_cap = (v >= 15 && v <= 1000) ? v : 0;
+        else if (ini_int(line, "aim_lean", &v))       g_cfg_aim_lean = !!v;
+        else if (ini_int(line, "ranged_freeaim", &v)) g_cfg_freeaim  = !!v;
+        else if (ini_int(line, "wheel_speed", &v))    g_cfg_wheel    = !!v;
+        else if (ini_int(line, "ko_vignette", &v))    g_cfg_vignette = !!v;
+        else if (ini_int(line, "key_toggle_fp", &v))  { if (v > 0 && v < 255) g_cfg_key_fp = v; }
+        else if (ini_int(line, "key_forward", &v))    { if (v > 0 && v < 255) g_cfg_key_w = v; }
+        else if (ini_int(line, "key_left", &v))       { if (v > 0 && v < 255) g_cfg_key_a = v; }
+        else if (ini_int(line, "key_back", &v))       { if (v > 0 && v < 255) g_cfg_key_s = v; }
+        else if (ini_int(line, "key_right", &v))      { if (v > 0 && v < 255) g_cfg_key_d = v; }
+        else if (ini_float(line, "fov", &fv))             { if (fv >= 40 && fv <= 120) g_cfg_fov = fv; }
+        else if (ini_float(line, "near_clip", &fv))       { if (fv >= 0.05f && fv <= 10) g_cfg_nearclip = fv; }
+        else if (ini_float(line, "sensitivity", &fv))     { if (fv >= 0.05f && fv <= 10) g_cfg_sens = fv; }
+        else if (ini_float(line, "eye_forward", &fv))     { if (fv >= -5 && fv <= 10) g_cfg_eye_fwd = fv; }
+        else if (ini_float(line, "move_forward", &fv))    { if (fv >= 0 && fv <= 10) g_cfg_move_fwd = fv; }
+        else if (ini_float(line, "aim_lean_amount", &fv)) { if (fv >= 0 && fv <= 1.5f) g_cfg_lean = fv; }
     }
     fclose(f);
-    if (g_fps_cap) { timeBeginPeriod(1); logline("fps cap enabled: %d (KenshiFP.ini)", g_fps_cap); }
+    if (g_fps_cap) timeBeginPeriod(1);
+    logline("config: fps_cap=%d aim_lean=%d freeaim=%d wheel=%d vignette=%d fpkey=0x%02X",
+            g_fps_cap, g_cfg_aim_lean, g_cfg_freeaim, g_cfg_wheel, g_cfg_vignette, g_cfg_key_fp);
+}
+
+/* Hot reload: re-parse when the file's write time changes (checked ~2 Hz),
+ * so settings apply in-game without a restart. */
+static void ini_hot_reload(void)
+{
+    static DWORD last_check; static FILETIME last_wt;
+    DWORD now = GetTickCount();
+    if (now - last_check < 500) return;
+    last_check = now;
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExA("KenshiFP.ini", GetFileExInfoStandard, &fad)) return;
+    if (CompareFileTime(&fad.ftLastWriteTime, &last_wt) != 0) {
+        last_wt = fad.ftLastWriteTime;
+        load_ini();
+    }
 }
 
 static void hooked_mainloop(void *gw, float time)
@@ -2621,6 +2764,7 @@ static void hooked_mainloop(void *gw, float time)
         fp_tick(gw);
     }
 
+    ini_hot_reload();             /* apply KenshiFP.ini edits without restart */
     fps_cap_wait();               /* optional user-configured frame limiter */
 }
 
@@ -2714,7 +2858,7 @@ static int fp_aim_point(Vec3 *out)
 static void hooked_ranged_animupd(void *rc, float ft, Vec3 *aimpos, void *target)
 {
     Vec3 aim;
-    if (g_fp_mode && rc
+    if (g_fp_mode && g_cfg_freeaim && rc
         && readable((void *)((uintptr_t)rc + RC_ME), 8)
         && *(void **)((uintptr_t)rc + RC_ME) == g_player_pc
         && readable(aimpos, sizeof(Vec3))
@@ -2741,7 +2885,7 @@ static gun_shoot_t g_gun_shoot_orig;
 static void hooked_gun_shoot(void *gun, void *me, void *target, int stat, const Vec3 *aimpos)
 {
     Vec3 aim;
-    if (g_fp_mode && me && me == g_player_pc && fp_aim_point(&aim)) {
+    if (g_fp_mode && g_cfg_freeaim && me && me == g_player_pc && fp_aim_point(&aim)) {
         aimpos = &aim;
         static int logged;
         if (!logged) { logged = 1; logline("[freeaim] projectile override LIVE"); }
@@ -2757,7 +2901,7 @@ typedef void (*face_dir_t)(void *mv, const Vec3 *dir);
 static face_dir_t g_face_dir_orig;
 static void hooked_face_direction(void *mv, const Vec3 *dir)
 {
-    if (g_fp_mode && g_player_pc
+    if (g_fp_mode && g_cfg_freeaim && g_player_pc
         && readable((void *)((uintptr_t)g_player_pc + CHAR_MOVEMENT), 8)
         && *(void **)((uintptr_t)g_player_pc + CHAR_MOVEMENT) == mv) {
         void *rc = readable((void *)((uintptr_t)g_player_pc + CHAR_RANGEDCOMBAT), 8)
@@ -3045,6 +3189,8 @@ __declspec(dllexport) void dllStartPlugin(void)
             g_gui_getinstance = (gui_getinstance_t)GetProcAddress(mygui, MYGUI_GUI_GETINSTANCE_SYM);
             g_gui_createwidget = (gui_createwidget_t)GetProcAddress(mygui, MYGUI_CREATEWIDGET_SYM);
             g_imgbox_setimage = (imgbox_setimage_t)GetProcAddress(mygui, MYGUI_SETIMAGETEX_SYM);
+            g_gui_getsubmain   = (gui_getsubmain_t)GetProcAddress(mygui, MYGUI_GETSUBMAIN_SYM);
+            g_gui_subsetcolour = (gui_subsetcolour_t)GetProcAddress(mygui, MYGUI_SUBSETCOLOUR_SYM);
             g_widget_setvisible = (widget_setvisible_t)GetProcAddress(mygui, MYGUI_WIDGET_SETVIS_SYM);
             g_widget_inhvis = (widget_inhvis_t)GetProcAddress(mygui, MYGUI_WIDGET_INHVIS_SYM);
             HMODULE ogremod = GetModuleHandleA("OgreMain_x64.dll");

@@ -3511,6 +3511,35 @@ static LRESULT CALLBACK mouse_ll(int code, WPARAM wp, LPARAM lp)
     return CallNextHookEx(NULL, code, wp, lp);
 }
 
+/* Dedicated message-pump thread that owns the low-level mouse/keyboard hooks.
+ * WH_MOUSE_LL / WH_KEYBOARD_LL callbacks are serviced ON THE INSTALLING THREAD,
+ * which must pump its message queue PROMPTLY -- the callback sits in the OS-wide
+ * input path, so if that thread stalls, mouse/keyboard input for the ENTIRE
+ * system is delayed. Installing on the game's main thread meant that between
+ * message pumps (while it's busy in the per-frame simulation) global cursor
+ * input stuttered -- fps-dependent wobble, even in menus and other apps (found
+ * + minimally reproduced by Biora with WH_MOUSE_LL + a busy frame-loop). This
+ * thread does NOTHING but install the hooks and pump, so they are always
+ * serviced instantly regardless of the game's frame time. */
+static DWORD WINAPI hook_thread_proc(void *unused)
+{
+    (void)unused;
+    g_mouse_hook = SetWindowsHookExA(WH_MOUSE_LL, mouse_ll, g_hinst, 0);
+    logline(g_mouse_hook ? "mouse wheel hook installed (dedicated pump thread)"
+                         : "mouse wheel hook FAILED (err %lu)", GetLastError());
+    g_kbd_hook = SetWindowsHookExA(WH_KEYBOARD_LL, kbd_ll, g_hinst, 0);
+    logline(g_kbd_hook ? "keyboard hook installed (FP toggle capture, dedicated pump thread)"
+                       : "keyboard hook FAILED (err %lu) -- polling fallback", GetLastError());
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0) > 0) {   /* pumps -> services the LL hooks */
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    if (g_mouse_hook) UnhookWindowsHookEx(g_mouse_hook);
+    if (g_kbd_hook)   UnhookWindowsHookEx(g_kbd_hook);
+    return 0;
+}
+
 /* Install one hook through the active backend. Returns 1 on success.
  * KenshiLib.AddHook does create+enable in one call (SUCCESS==0). */
 /* The FP aim point: 80m along the camera look direction from the head, in game
@@ -3775,12 +3804,15 @@ __declspec(dllexport) void dllStartPlugin(void)
     }
     g_get_bone_world   = (get_bone_world_t)(g_base + RVA_GET_BONE_WORLD);
 
-    g_mouse_hook = SetWindowsHookExA(WH_MOUSE_LL, mouse_ll, g_hinst, 0);
-    logline(g_mouse_hook ? "mouse wheel hook installed" : "mouse wheel hook FAILED (err %lu)",
-            GetLastError());
-    g_kbd_hook = SetWindowsHookExA(WH_KEYBOARD_LL, kbd_ll, g_hinst, 0);
-    logline(g_kbd_hook ? "keyboard hook installed (FP toggle capture)"
-                       : "keyboard hook FAILED (err %lu) -- polling fallback", GetLastError());
+    /* Install the low-level mouse/keyboard hooks on a DEDICATED message-pump
+     * thread (hook_thread_proc), NOT here on the game's main thread -- otherwise
+     * the game's per-frame work stalls hook servicing and stutters system-wide
+     * cursor input (Biora's fps-dependent wobble). */
+    {
+        HANDLE ht = CreateThread(NULL, 0, hook_thread_proc, NULL, 0, NULL);
+        if (ht) CloseHandle(ht);
+        else logline("hook pump thread FAILED to start (err %lu)", GetLastError());
+    }
 
     /* FP look deltas: DirectInput non-exclusive device, created lazily on the
      * first FP frame (the game window must exist). See ensure_dinput. */

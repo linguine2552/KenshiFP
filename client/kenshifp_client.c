@@ -296,6 +296,32 @@
 #define OGRE_GETPARENTSCENENODE_SYM "?getParentSceneNode@MovableObject@Ogre@@QEBAPEAVSceneNode@2@XZ"
 #define MYGUI_GETSUBMAIN_SYM "?getSubWidgetMain@SkinItem@MyGUI@@QEAAPEAVISubWidgetRect@2@XZ"
 #define MYGUI_SUBSETCOLOUR_SYM "?_setColour@SubSkin@MyGUI@@UEAAXAEBUColour@2@@Z"
+/* ---- in-game settings UI (MyGUI, resolved by mangled name from the DLL) ---- */
+#define MYGUI_GUI_FINDWIDGET_SYM "?findWidgetT@Gui@MyGUI@@QEAAPEAVWidget@2@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@_N@Z"
+#define MYGUI_WIDGET_CREATEWIDGET_SYM "?createWidgetT@Widget@MyGUI@@QEAAPEAV12@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@0HHHHUAlign@2@0@Z"
+#define MYGUI_TABCTRL_ITEMCOUNT_SYM "?getItemCount@TabControl@MyGUI@@QEBA_KXZ"
+#define MYGUI_TABCTRL_ITEMAT_SYM "?getItemAt@TabControl@MyGUI@@QEAAPEAVTabItem@2@_K@Z"
+/* Hit-testing via MyGUI itself: ask which widget is under the mouse and compare
+ * pointers -- avoids the fragile coordinate getters entirely. */
+#define MYGUI_INPUT_GETINST_SYM "?getInstancePtr@?$Singleton@VInputManager@MyGUI@@@MyGUI@@SAPEAVInputManager@2@XZ"
+#define MYGUI_MOUSEFOCUS_SYM "?getMouseFocusWidget@InputManager@MyGUI@@QEBAPEAVWidget@2@XZ"
+#define MYGUI_GETPARENT_SYM  "?getParent@Widget@MyGUI@@QEBAPEAV12@XZ"
+#define MYGUI_SCROLL_SETRANGE_SYM "?setScrollRange@ScrollBar@MyGUI@@QEAAX_K@Z"
+#define MYGUI_SCROLL_SETPOS_SYM "?setScrollPosition@ScrollBar@MyGUI@@QEAAX_K@Z"
+#define MYGUI_SCROLL_GETPOS_SYM "?getScrollPosition@ScrollBar@MyGUI@@QEBA_KXZ"
+#define MYGUI_BTN_GETSEL_SYM "?getStateSelected@Button@MyGUI@@QEBA_NXZ"
+#define MYGUI_BTN_SETSEL_SYM "?setStateSelected@Button@MyGUI@@QEAAX_N@Z"
+#define MYGUI_TEXTBOX_SETCAP_SYM "?setCaption@TextBox@MyGUI@@UEAAXAEBVUString@2@@Z"
+#define MYGUI_WINDOW_SETCAP_SYM  "?setCaption@Window@MyGUI@@UEAAXAEBVUString@2@@Z"   /* Window overrides it */
+#define MYGUI_USTRING_CTOR_SYM "??0UString@MyGUI@@QEAA@PEBD@Z"    /* UString(const char*) */
+#define MYGUI_USTRING_DTOR_SYM "??1UString@MyGUI@@QEAA@XZ"
+/* Recursive widget search (vanilla menu widgets carry a layout name-prefix that
+ * findWidgetT can't match, so we DFS the widget tree matching the suffix). The
+ * Enumerator is returned by value: { bool m_first; Widget** begin; Widget** end }
+ * -- read begin(+8)/end(+16) and iterate the pointer range directly. */
+#define MYGUI_GUI_GETENUM_SYM "?getEnumerator@Gui@MyGUI@@QEBA?AV?$Enumerator@V?$vector@PEAVWidget@MyGUI@@V?$allocator@PEAVWidget@MyGUI@@@std@@@std@@@2@XZ"
+#define MYGUI_WIDGET_GETENUM_SYM "?getEnumerator@Widget@MyGUI@@QEBA?AV?$Enumerator@V?$vector@PEAVWidget@MyGUI@@V?$allocator@PEAVWidget@MyGUI@@@std@@@std@@@2@XZ"
+#define MYGUI_WIDGET_GETNAME_SYM "?getName@Widget@MyGUI@@QEBAAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@XZ"
 #define OGRE_ENTITY_GETSKEL_SYM  "?getSkeleton@Entity@Ogre@@QEBAPEAVOldSkeletonInstance@2@XZ"
 #define OGRE_ENTITY_GETSKEL_SYM2 "?getSkeleton@Entity@Ogre@@QEBAPEAVSkeletonInstance@2@XZ"
 
@@ -496,6 +522,7 @@ static int g_cfg_key_w    = 0x57;  /* key_forward */
 static int g_cfg_key_a    = 0x41;  /* key_left */
 static int g_cfg_key_s    = 0x53;  /* key_back */
 static int g_cfg_key_d    = 0x44;  /* key_right */
+static int g_cfg_key_settings = 0x79;  /* key_settings (VK code; default F10) -- toggles the settings window */
 static float g_cfg_fov      = 70.0f;   /* fov: vertical degrees in FP */
 static float g_cfg_nearclip = 1.0f;    /* near_clip: world units */
 static float g_cfg_sens     = 1.0f;    /* sensitivity: mouse multiplier */
@@ -691,6 +718,44 @@ typedef void (*gui_subsetcolour_t)(void *sub, const float *rgba);
 static gui_getsubmain_t   g_gui_getsubmain;
 static gui_subsetcolour_t g_gui_subsetcolour;
 
+/* ---- in-game settings UI ---- */
+typedef void *(*gui_findwidget_t)(void *gui, const void *name_str, char throw_);
+typedef void *(*widget_createwidget_t)(void *self, const void *type, const void *skin,
+                                       int l, int t, int w, int h, int align, const void *name);
+typedef size_t (*tabctrl_itemcount_t)(void *tabctrl);
+typedef void *(*tabctrl_itemat_t)(void *tabctrl, size_t index);
+typedef void *(*input_getinst_t)(void);
+typedef void *(*mousefocus_t)(void *inputmgr);
+typedef void *(*getparent_t)(void *widget);
+typedef void (*scroll_setrange_t)(void *sb, size_t range);
+typedef void (*scroll_setpos_t)(void *sb, size_t pos);
+typedef size_t (*scroll_getpos_t)(void *sb);
+typedef char (*btn_getsel_t)(void *btn);
+typedef void (*btn_setsel_t)(void *btn, char sel);
+typedef void (*textbox_setcap_t)(void *tb, const void *ustr);
+typedef void *(*ustring_ctor_t)(void *self, const char *cstr);
+typedef void (*ustring_dtor_t)(void *self);
+typedef void (*getenum_t)(void *self, void *enum_retbuf24);   /* by-value: this=RCX, ret=RDX */
+typedef const void *(*widget_getname_t)(void *widget);        /* -> const std::string* */
+static gui_findwidget_t      g_gui_findwidget;
+static widget_createwidget_t g_widget_createwidget;
+static tabctrl_itemcount_t   g_tabctrl_itemcount;
+static tabctrl_itemat_t      g_tabctrl_itemat;
+static input_getinst_t       g_input_getinst;
+static mousefocus_t          g_mousefocus;
+static getparent_t           g_widget_getparent;
+static scroll_setrange_t     g_scroll_setrange;
+static scroll_setpos_t       g_scroll_setpos;
+static scroll_getpos_t       g_scroll_getpos;
+static btn_getsel_t          g_btn_getsel;
+static btn_setsel_t          g_btn_setsel;
+static textbox_setcap_t      g_textbox_setcap;
+static textbox_setcap_t      g_window_setcap;   /* Window::setCaption (title bar) */
+static ustring_ctor_t        g_ustring_ctor;
+static ustring_dtor_t        g_ustring_dtor;
+static getenum_t             g_gui_getenum, g_widget_getenum;
+static widget_getname_t      g_widget_getname;
+
 /* Fade helper: MyGUI has no exported Widget::setAlpha, but the main sub-widget
  * accepts an RGBA colour multiply -- alpha included. VEH-unsafe-free (pure
  * pointer walks + one virtual-free exported call). */
@@ -756,6 +821,7 @@ static int g_cursor_hidden;        /* our ShowCursor state */
 static int g_ui_prev;              /* dialogue/menu open last frame (edge) */
 static int g_ui_open;              /* dialogue/menu open THIS frame (read by the setPointer hook) */
 static int g_ui_moveblock;         /* HARD block (control disabled: dialogue/cutscene); halts WASD */
+static int g_settings_open;        /* our settings window is showing -> free the cursor like a panel */
 static int g_dbg_control;          /* controlEnabled read, for verification */
 static float g_tx, g_tz;           /* game->Ogre translation, calibrated when still */
 static int g_have_t;
@@ -1667,7 +1733,7 @@ static void fp_camera_override(void *gw)
         static int panel_frames;
         if (panels_now) { if (panel_frames < 1000) panel_frames++; }
         else panel_frames = 0;
-        int ui_open = (control == 0) || (panels_now && panel_frames >= 8);
+        int ui_open = (control == 0) || (panels_now && panel_frames >= 8) || g_settings_open;
         g_ui_open = ui_open;                    /* read by the setPointer hook */
         /* Movement gate is NARROWER than the cursor gate: a mere side panel
          * (inventory/squad/jobs) frees the cursor + freezes look, but WASD should
@@ -2564,6 +2630,29 @@ static void make_mstr(unsigned char *b32, const char *s)
     *(size_t *)(b32 + 0x18) = 15;   /* SSO capacity */
 }
 
+/* Build an MSVC std::string in b32 for ANY length. len<16 -> SSO (returns NULL);
+ * len>=16 -> data at a heap buffer we malloc and RETURN so the caller frees it
+ * AFTER the (copying) consumer call. Never let MSVC free it (allocator mismatch);
+ * the consumer copies the content, we free our own buffer. */
+static void *make_mstr_long(unsigned char *b32, const char *s)
+{
+    memset(b32, 0, 32);
+    size_t len = strlen(s);
+    if (len < 16) {
+        memcpy(b32, s, len);
+        *(size_t *)(b32 + 0x10) = len;
+        *(size_t *)(b32 + 0x18) = 15;
+        return NULL;
+    }
+    char *buf = (char *)malloc(len + 1);
+    if (!buf) { *(size_t *)(b32 + 0x18) = 15; return NULL; }
+    memcpy(buf, s, len + 1);
+    *(char **)b32 = buf;               /* heap data ptr at offset 0 */
+    *(size_t *)(b32 + 0x10) = len;     /* size */
+    *(size_t *)(b32 + 0x18) = len;     /* capacity >=16 => heap mode */
+    return buf;
+}
+
 /* Lazily create the crosshair ImageBox once MyGUI is up (retried each FP enter
  * until it succeeds). Registers the image folder as an Ogre resource location. */
 static void ensure_crosshair(void)
@@ -2909,6 +2998,7 @@ static void load_ini(void)
         else if (ini_int(line, "key_left", &v))       { if (v > 0 && v < 255) g_cfg_key_a = v; }
         else if (ini_int(line, "key_back", &v))       { if (v > 0 && v < 255) g_cfg_key_s = v; }
         else if (ini_int(line, "key_right", &v))      { if (v > 0 && v < 255) g_cfg_key_d = v; }
+        else if (ini_int(line, "key_settings", &v))   { if (v > 0 && v < 255) g_cfg_key_settings = v; }
         else if (ini_float(line, "fov", &fv))             { if (fv >= 40 && fv <= 120) g_cfg_fov = fv; }
         else if (ini_float(line, "near_clip", &fv))       { if (fv >= 0.05f && fv <= 10) g_cfg_nearclip = fv; }
         else if (ini_float(line, "sensitivity", &fv))     { if (fv >= 0.05f && fv <= 10) g_cfg_sens = fv; }
@@ -2942,9 +3032,330 @@ static void ini_hot_reload(void)
 /* All MyGUI widget work, run POST-FRAME (from hooked_mainloop, after the
  * game's frame + UI update completed) so we never touch MyGUI's widget lists
  * mid-update. Reads only globals published during the frame. */
+/* ------- in-game settings UI (MyGUI) : M1 = button + toggle window --------- */
+static void *g_settings_win;    /* our floating settings Window (Kenshi_WindowCX) */
+static void *g_settings_btn;    /* the injected "KenshiFP Settings" options-tab button */
+/* g_settings_open declared up top (read by the FP cursor-lock code) */
+
+/* Set a widget's caption from a C string via a temporary MyGUI::UString (a single
+ * basic_string<char16> = 0x20 bytes). Construct on the stack, set, destruct. */
+/* Set a caption via `setter` (Window::setCaption for the title bar,
+ * TextBox::setCaption for plain labels), building a temporary MyGUI::UString. */
+static void caption_set(void *w, const char *text, textbox_setcap_t setter)
+{
+    if (!w || !setter || !g_ustring_ctor) return;   /* dtor optional (tiny leak ok) */
+    unsigned char ustr[0x40] = {0};   /* UString (basic_string<u16>) */
+    g_ustring_ctor(ustr, text);
+    setter(w, ustr);
+    if (g_ustring_dtor) g_ustring_dtor(ustr);
+}
+
+static int g_settings_dead;     /* a MyGUI call faulted -> stand down permanently */
+
+/* DFS the MyGUI widget tree for a widget whose name (minus its layout prefix,
+ * the part after the last '_') equals `target`. The Enumerator returned by
+ * getEnumerator is { bool m_first; Widget** begin; Widget** end } -- iterate the
+ * begin..end pointer range. Depth-capped; assumes the caller armed g_guard_jb. */
+static int g_find_budget;   /* nodes left to visit this search (runaway guard) */
+__attribute__((unused))
+static void *find_widget_suffix(void **begin, void **end, const char *target, int depth)
+{
+    if (!begin || !end || depth > 10) return NULL;
+    /* sanity the enumerator range: a bad ABI/stale vector would give a wild
+     * begin..end and iterating it would read wild memory forever. */
+    if (end < begin || (size_t)(end - begin) > 2048) return NULL;
+    for (void **it = begin; it != end; ++it) {
+        if (--g_find_budget <= 0) return NULL;   /* total-node cap */
+        if (!readable(it, 8)) return NULL;
+        void *w = *it;
+        if (!readable(w, 8)) continue;
+        if (g_widget_getname) {
+            const void *ns = g_widget_getname(w);
+            char nm[128]; read_mstring(ns, nm, sizeof nm);
+            const char *suf = strrchr(nm, '_'); suf = suf ? suf + 1 : nm;
+            if (strcmp(suf, target) == 0) return w;
+        }
+        if (g_widget_getenum) {
+            unsigned char ce[32];
+            g_widget_getenum(w, ce);
+            void *found = find_widget_suffix(*(void ***)(ce + 8), *(void ***)(ce + 16), target, depth + 1);
+            if (found) return found;
+        }
+    }
+    return NULL;
+}
+
+/* Find a vanilla menu widget by name-suffix, walking from the Gui roots. */
+__attribute__((unused))
+static void *settings_find(void *gui, const char *target)
+{
+    if (!g_gui_getenum) return NULL;
+    g_find_budget = 4000;
+    unsigned char ge[32];
+    g_gui_getenum(gui, ge);
+    return find_widget_suffix(*(void ***)(ge + 8), *(void ***)(ge + 16), target, 0);
+}
+
+/* Ensure our floating settings window exists (created lazily the first time the
+ * button is clicked -- NOT at load, to avoid touching MyGUI during load/menu
+ * transitions). Returns the window or NULL. */
+/* Create a child widget on `parent`, handling skin/type/name strings of any
+ * length (Kenshi skin names exceed the 15-char SSO limit). */
+static void *make_child(void *parent, const char *type, const char *skin,
+                        int l, int t, int w, int h, const char *name)
+{
+    if (!g_widget_createwidget || !parent) return NULL;
+    unsigned char ty[32], sk[32], nm[32];
+    void *tf = make_mstr_long(ty, type);
+    void *sf = make_mstr_long(sk, skin);
+    void *nf = make_mstr_long(nm, name);
+    void *child = g_widget_createwidget(parent, ty, sk, l, t, w, h, 0, nm);
+    if (tf) free(tf);
+    if (sf) free(sf);
+    if (nf) free(nf);
+    return child;
+}
+
+/* --- settings model: numeric sliders + toggle checkboxes -------------------- */
+typedef struct { const char *label; float *cfg; float lo, hi, def; void *slider, *valtb; int lastpos; } fset_t;
+static fset_t g_fsets[] = {
+    { "FOV",             &g_cfg_fov,      40.0f, 120.0f, 70.0f, 0, 0, -1 },
+    { "Sensitivity",     &g_cfg_sens,      0.1f,   5.0f,  1.0f, 0, 0, -1 },
+    { "Near clip",       &g_cfg_nearclip,  0.05f,  3.0f,  1.0f, 0, 0, -1 },
+    { "Eye forward",     &g_cfg_eye_fwd,  -2.0f,   8.0f,  2.0f, 0, 0, -1 },
+    { "Move forward",    &g_cfg_move_fwd,  0.0f,   6.0f,  1.5f, 0, 0, -1 },
+    { "Move speed ref",  &g_cfg_move_ref, 20.0f, 200.0f, 60.0f, 0, 0, -1 },
+    { "Aim-lean amount", &g_cfg_lean,      0.0f,   1.5f,  0.5f, 0, 0, -1 },
+};
+typedef struct { const char *label; int *cfg, def; void *btn; } tset_t;
+static tset_t g_tsets[] = {
+    { "Aim lean",        &g_cfg_aim_lean, 1, 0 },
+    { "Ranged free-aim", &g_cfg_freeaim,  1, 0 },
+    { "Wheel speed",     &g_cfg_wheel,    1, 0 },
+    { "KO vignette",     &g_cfg_vignette, 1, 0 },
+};
+static void *g_reset_btn, *g_close_btn;
+#define KFP_SCROLL_RANGE 1000
+#define FN(a) ((int)(sizeof(a)/sizeof((a)[0])))
+
+/* Is the widget currently under the mouse `target` (or a descendant of it)?
+ * Uses MyGUI's own mouse-focus tracking -- no coordinate math. */
+static int widget_clicked(void *target)
+{
+    if (!target || !g_input_getinst || !g_mousefocus) return 0;
+    void *im = g_input_getinst();
+    if (!im) return 0;
+    void *f = g_mousefocus(im);
+    for (int i = 0; i < 10 && readable(f, 8); i++) {
+        if (f == target) return 1;
+        if (!g_widget_getparent) break;
+        f = g_widget_getparent(f);
+    }
+    return 0;
+}
+
+/* Push a float setting's current value onto its slider + value label. */
+static void settings_apply_slider(fset_t *fs)
+{
+    if (fs->slider && g_scroll_setpos) {
+        float frac = (*fs->cfg - fs->lo) / (fs->hi - fs->lo);
+        if (frac < 0) frac = 0; else if (frac > 1) frac = 1;
+        int pos = (int)(frac * (KFP_SCROLL_RANGE - 1) + 0.5f);
+        g_scroll_setpos(fs->slider, (size_t)pos);
+        fs->lastpos = pos;
+    }
+    if (fs->valtb) { char vb[32]; snprintf(vb, sizeof vb, "%.2f", *fs->cfg); caption_set(fs->valtb, vb, g_textbox_setcap); }
+}
+
+static void settings_reset_defaults(void)
+{
+    for (int i = 0; i < FN(g_fsets); i++) { *g_fsets[i].cfg = g_fsets[i].def; settings_apply_slider(&g_fsets[i]); }
+    for (int i = 0; i < FN(g_tsets); i++) {
+        *g_tsets[i].cfg = g_tsets[i].def;
+        if (g_tsets[i].btn && g_btn_setsel) g_btn_setsel(g_tsets[i].btn, *g_tsets[i].cfg ? 1 : 0);
+    }
+    if (KFP_DEBUG_LOG) logline("[settings] reset to defaults");
+}
+
+/* Build the rows once, on window creation. Sliders drag natively (we poll their
+ * value); checkboxes we click-poll (a plain Button doesn't self-toggle). */
+static void settings_build_content(void *win)
+{
+    if (!win || !g_scroll_setrange || !g_scroll_setpos) return;
+    const int pad = 16, rowh = 30, labw = 150, sx = 175, sw = 210, vx = 395, vw = 95;
+    int y = 14;
+    for (int i = 0; i < FN(g_fsets); i++) {
+        fset_t *fs = &g_fsets[i];
+        char nm[32];
+        snprintf(nm, sizeof nm, "KFPlbl%d", i);
+        void *lbl = make_child(win, "TextBox", "Kenshi_GenericTextBoxFlat", pad, y, labw, 24, nm);
+        if (lbl) caption_set(lbl, fs->label, g_textbox_setcap);
+        snprintf(nm, sizeof nm, "KFPsld%d", i);
+        void *sld = make_child(win, "ScrollBar", "Kenshi_ScrollBar", sx, y + 2, sw, 18, nm);
+        if (sld) {
+            g_scroll_setrange(sld, KFP_SCROLL_RANGE);
+            float frac = (*fs->cfg - fs->lo) / (fs->hi - fs->lo);
+            if (frac < 0) frac = 0; else if (frac > 1) frac = 1;
+            int pos = (int)(frac * (KFP_SCROLL_RANGE - 1) + 0.5f);
+            g_scroll_setpos(sld, (size_t)pos);
+            fs->lastpos = pos;
+        }
+        fs->slider = sld;
+        snprintf(nm, sizeof nm, "KFPval%d", i);
+        void *val = make_child(win, "TextBox", "Kenshi_GenericTextBoxFlat", vx, y, vw, 24, nm);
+        fs->valtb = val;
+        if (val) { char vb[32]; snprintf(vb, sizeof vb, "%.2f", *fs->cfg); caption_set(val, vb, g_textbox_setcap); }
+        y += rowh;
+    }
+    y += 10;
+    for (int i = 0; i < FN(g_tsets); i++) {
+        tset_t *ts = &g_tsets[i];
+        char nm[32];
+        snprintf(nm, sizeof nm, "KFPtl%d", i);
+        void *lbl = make_child(win, "TextBox", "Kenshi_GenericTextBoxFlat", pad, y, labw, 24, nm);
+        if (lbl) caption_set(lbl, ts->label, g_textbox_setcap);
+        snprintf(nm, sizeof nm, "KFPck%d", i);
+        void *chk = make_child(win, "Button", "Kenshi_TickBoxSkin", sx, y, 24, 24, nm);
+        if (chk && g_btn_setsel) g_btn_setsel(chk, *ts->cfg ? 1 : 0);
+        ts->btn = chk;
+        y += rowh;
+    }
+    g_reset_btn = make_child(win, "Button", "Kenshi_Button1", pad, y + 8, 190, 32, "KFPreset");
+    if (g_reset_btn) caption_set(g_reset_btn, "Reset to Defaults", g_textbox_setcap);
+    g_close_btn = make_child(win, "Button", "Kenshi_Button1", pad + 200, y + 8, 110, 32, "KFPclose");
+    if (g_close_btn) caption_set(g_close_btn, "Close", g_textbox_setcap);
+    if (KFP_DEBUG_LOG) logline("[settings] built %d sliders + %d toggles; reset=%p close=%p", FN(g_fsets), FN(g_tsets), g_reset_btn, g_close_btn);
+}
+
+/* Poll widget state -> config, every frame while the window is open. */
+static void settings_poll_content(void)
+{
+    for (int i = 0; i < FN(g_fsets); i++) {
+        fset_t *fs = &g_fsets[i];
+        if (!fs->slider || !g_scroll_getpos) continue;
+        int pos = (int)g_scroll_getpos(fs->slider);
+        if (pos == fs->lastpos) continue;           /* only on drag */
+        fs->lastpos = pos;
+        float frac = pos / (float)(KFP_SCROLL_RANGE - 1);
+        if (frac < 0) frac = 0; else if (frac > 1) frac = 1;
+        *fs->cfg = fs->lo + frac * (fs->hi - fs->lo);
+        if (fs->valtb) { char vb[32]; snprintf(vb, sizeof vb, "%.2f", *fs->cfg); caption_set(fs->valtb, vb, g_textbox_setcap); }
+    }
+    /* checkbox click-poll: LMB release inside a box toggles its config */
+    static int lmb_prev;
+    int lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    int released = (lmb_prev && !lmb);
+    lmb_prev = lmb;
+    for (int i = 0; i < FN(g_tsets); i++) {
+        tset_t *ts = &g_tsets[i];
+        if (!ts->btn) continue;
+        if (released && widget_clicked(ts->btn)) *ts->cfg = !*ts->cfg;
+        if (g_btn_setsel) g_btn_setsel(ts->btn, *ts->cfg ? 1 : 0);
+    }
+    if (released && widget_clicked(g_reset_btn)) settings_reset_defaults();
+}
+
+static void settings_ensure_window(void *gui)
+{
+    if (g_settings_win || !g_gui_createwidget) return;
+    unsigned char ty[32], sk[32], nm[32], lay[32];
+    make_mstr(ty, "Window"); make_mstr(sk, "Kenshi_WindowCX");
+    make_mstr(nm, "KFPSettingsWin"); make_mstr(lay, "Window");
+    int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    /* dynamic height: fit all rows + the reset button + window chrome */
+    int content_bottom = 14 + FN(g_fsets) * 30 + 10 + FN(g_tsets) * 30 + 8 + 32;
+    int ww = 520, wh = content_bottom + 60;
+    int wx = (sw > 0 ? sw / 2 - ww / 2 : 200), wy = (sh > 0 ? sh / 2 - wh / 2 : 150);
+    g_settings_win = g_gui_createwidget(gui, ty, sk, wx, wy, ww, wh, 0, lay, nm);
+    if (g_settings_win) {
+        caption_set(g_settings_win, "KenshiFP Settings", g_window_setcap);
+        settings_build_content(g_settings_win);
+        g_widget_setvisible(g_settings_win, 0);
+    }
+    if (KFP_DEBUG_LOG) logline("[settings] window create -> %p", g_settings_win);
+}
+
+/* Post-frame (MyGUI-safe), independent of FP mode. FULLY crash-guarded: a fault
+ * in any MyGUI call disables the settings UI for the session instead of taking
+ * the game down, and the step logs pinpoint which call faulted. */
+static void fp_settings_ui(void)
+{
+    if (g_settings_dead) return;
+    if (!g_gui_getinstance || !g_gui_createwidget || !g_widget_createwidget
+        || !g_gui_findwidget || !g_widget_setvisible
+        || !g_tabctrl_itemcount || !g_tabctrl_itemat) return;
+    /* let the game settle past the load screen before we touch the menu GUI */
+    static int warmup; if (warmup < 120) { warmup++; return; }
+
+    if (setjmp(g_guard_jb)) {          /* a MyGUI call blew up */
+        g_guard_armed = 0;
+        g_settings_dead = 1;
+        logline("[settings] MyGUI FAULT -- settings UI disabled for this session");
+        return;
+    }
+    g_guard_armed = 1;
+
+    void *gui = g_gui_getinstance();
+    if (!gui) { g_guard_armed = 0; return; }
+
+    /* Toggle the settings window with a HOTKEY (default F10). The menu-BUTTON
+     * injection was abandoned: creating a widget into the game's options menu at
+     * the exact frame it builds hard-crashes the game (a deferred render-time
+     * crash the VEH guard can't catch -- confirmed via log: createWidgetT on the
+     * mods tab the instant its item-count went 0->6). Our own top-level window is
+     * safe (same as the crosshair/vignette widgets). [settings_find + the tree
+     * walk are retained for a future, more careful button attempt.] */
+    static int key_prev;
+    int key = (GetAsyncKeyState(g_cfg_key_settings) & 0x8000) != 0;
+    if (key && !key_prev) {
+        settings_ensure_window(gui);
+        g_settings_open = !g_settings_open;
+        if (g_settings_win) g_widget_setvisible(g_settings_win, g_settings_open ? 1 : 0);
+        if (KFP_DEBUG_LOG) logline("[settings] hotkey toggle -> %d win=%p", g_settings_open, g_settings_win);
+    }
+    key_prev = key;
+
+    if (g_settings_open && g_settings_win) {
+        settings_poll_content();
+        /* Close on Escape, F10, the in-panel Close button, or the title-bar X.
+         * The X is MyGUI's own close button -- a widget named "Button" that sits
+         * (via the title-bar frame) directly under our window, distinct from our
+         * content which lives under the window's "Client" sub-widget. Detect a
+         * click on any "Button"-named descendant of the window. */
+        static int esc_prev, lmb_prev;
+        int esc = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+        int lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+        int close = (esc && !esc_prev);
+        if (lmb_prev && !lmb) {
+            if (widget_clicked(g_close_btn)) close = 1;
+            void *im = g_input_getinst ? g_input_getinst() : NULL;
+            void *f = (im && g_mousefocus) ? g_mousefocus(im) : NULL;
+            if (f && g_widget_getname) {
+                char nm[24]; read_mstring(g_widget_getname(f), nm, sizeof nm);
+                if (strcmp(nm, "Button") == 0) {          /* MyGUI title-bar X */
+                    void *a = f;
+                    for (int i = 0; i < 12 && readable(a, 8); i++) {
+                        if (a == g_settings_win) { close = 1; break; }
+                        if (!g_widget_getparent) break;
+                        a = g_widget_getparent(a);
+                    }
+                }
+            }
+        }
+        esc_prev = esc; lmb_prev = lmb;
+        if (close) {
+            g_settings_open = 0;
+            g_widget_setvisible(g_settings_win, 0);
+            if (KFP_DEBUG_LOG) logline("[settings] closed");
+        }
+    }
+    g_guard_armed = 0;
+}
+
 static void fp_gui_update(void)
 {
     if (!g_gui_getinstance) return;
+    fp_settings_ui();                     /* runs regardless of FP mode */
     static int prev_fp;
     if (!g_fp_mode) {                      /* FP off: hide everything on the exit edge */
         if (prev_fp && g_widget_setvisible) {
@@ -3505,6 +3916,30 @@ __declspec(dllexport) void dllStartPlugin(void)
             g_imgbox_setimage = (imgbox_setimage_t)GetProcAddress(mygui, MYGUI_SETIMAGETEX_SYM);
             g_gui_getsubmain   = (gui_getsubmain_t)GetProcAddress(mygui, MYGUI_GETSUBMAIN_SYM);
             g_gui_subsetcolour = (gui_subsetcolour_t)GetProcAddress(mygui, MYGUI_SUBSETCOLOUR_SYM);
+            g_gui_findwidget     = (gui_findwidget_t)GetProcAddress(mygui, MYGUI_GUI_FINDWIDGET_SYM);
+            g_widget_createwidget= (widget_createwidget_t)GetProcAddress(mygui, MYGUI_WIDGET_CREATEWIDGET_SYM);
+            g_tabctrl_itemcount  = (tabctrl_itemcount_t)GetProcAddress(mygui, MYGUI_TABCTRL_ITEMCOUNT_SYM);
+            g_tabctrl_itemat     = (tabctrl_itemat_t)GetProcAddress(mygui, MYGUI_TABCTRL_ITEMAT_SYM);
+            g_input_getinst      = (input_getinst_t)GetProcAddress(mygui, MYGUI_INPUT_GETINST_SYM);
+            g_mousefocus         = (mousefocus_t)GetProcAddress(mygui, MYGUI_MOUSEFOCUS_SYM);
+            g_widget_getparent   = (getparent_t)GetProcAddress(mygui, MYGUI_GETPARENT_SYM);
+            g_scroll_setrange    = (scroll_setrange_t)GetProcAddress(mygui, MYGUI_SCROLL_SETRANGE_SYM);
+            g_scroll_setpos      = (scroll_setpos_t)GetProcAddress(mygui, MYGUI_SCROLL_SETPOS_SYM);
+            g_scroll_getpos      = (scroll_getpos_t)GetProcAddress(mygui, MYGUI_SCROLL_GETPOS_SYM);
+            g_btn_getsel         = (btn_getsel_t)GetProcAddress(mygui, MYGUI_BTN_GETSEL_SYM);
+            g_btn_setsel         = (btn_setsel_t)GetProcAddress(mygui, MYGUI_BTN_SETSEL_SYM);
+            g_textbox_setcap     = (textbox_setcap_t)GetProcAddress(mygui, MYGUI_TEXTBOX_SETCAP_SYM);
+            g_window_setcap      = (textbox_setcap_t)GetProcAddress(mygui, MYGUI_WINDOW_SETCAP_SYM);
+            g_ustring_ctor       = (ustring_ctor_t)GetProcAddress(mygui, MYGUI_USTRING_CTOR_SYM);
+            g_ustring_dtor       = (ustring_dtor_t)GetProcAddress(mygui, MYGUI_USTRING_DTOR_SYM);
+            g_gui_getenum        = (getenum_t)GetProcAddress(mygui, MYGUI_GUI_GETENUM_SYM);
+            g_widget_getenum     = (getenum_t)GetProcAddress(mygui, MYGUI_WIDGET_GETENUM_SYM);
+            g_widget_getname     = (widget_getname_t)GetProcAddress(mygui, MYGUI_WIDGET_GETNAME_SYM);
+            if (KFP_DEBUG_LOG)
+                logline("[settings] syms: wcreate=%p focus(inst=%p,get=%p,parent=%p) scroll(set=%p,get=%p) btn(get=%p,set=%p) cap=%p wcap=%p",
+                    (void*)g_widget_createwidget,(void*)g_input_getinst,(void*)g_mousefocus,(void*)g_widget_getparent,
+                    (void*)g_scroll_setpos,(void*)g_scroll_getpos,(void*)g_btn_getsel,(void*)g_btn_setsel,
+                    (void*)g_textbox_setcap,(void*)g_window_setcap);
             g_widget_setvisible = (widget_setvisible_t)GetProcAddress(mygui, MYGUI_WIDGET_SETVIS_SYM);
             g_widget_inhvis = (widget_inhvis_t)GetProcAddress(mygui, MYGUI_WIDGET_INHVIS_SYM);
             HMODULE ogremod = GetModuleHandleA("OgreMain_x64.dll");

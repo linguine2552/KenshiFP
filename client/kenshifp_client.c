@@ -3826,7 +3826,7 @@ __declspec(dllexport) void dllStartPlugin(void)
     make_mstr(g_bone_spine2, "Bip01 Spine2");
     make_mstr(g_bone_neck,   "Bip01 Neck");
     make_mstr(g_bone_rootspine, "Bip01 Spine");   /* readiness computed after Ogre resolves */
-    logline("KenshiFP v0.3.0 loaded (FP + head-bone + FOV + WASD); module base %p", (void *)g_base);
+    logline("KenshiFP v0.4.2 loaded (FP + head-bone + FOV + WASD); module base %p", (void *)g_base);
 
     /* Report the detected build (selection already happened above). */
     {

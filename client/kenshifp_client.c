@@ -26,7 +26,10 @@
 #include <setjmp.h>
 #define DIRECTINPUT_VERSION 0x0800
 #include <dinput.h>
-#include "MinHook.h"
+#ifndef KFP_RE_PLUGIN
+#include "MinHook.h"    /* standalone edition only; the RE edition hooks via
+                         * KenshiLib::AddHook so it ships no inline-hook code */
+#endif
 
 /* ---- per-frame hook (proven in KenshiMP, same binary) ---- */
 #define RVA_MAINLOOP      0x788a00u  /* GameWorld::mainLoop_GPUSensitiveStuff(GameWorld*, float) */
@@ -682,9 +685,7 @@ static unsigned char g_head_bone[32];   /* MSVC std::string "Bip01 Head" (SSO) *
 static int g_ogre_ready;
 static DWORD g_last_tick_ms;
 static int g_fp_mode;              /* toggled by VK_TOGGLE_FP edge */
-static volatile LONG g_toggle_edge;    /* latched keydown from the LL kbd hook */
-static volatile LONG g_toggle_ll_down; /* LL-hook autorepeat filter */
-static HHOOK g_kbd_hook;
+static volatile LONG g_toggle_edge;    /* FP-toggle press latched by the DI poll thread */
 static int g_toggle_was_down;
 static int g_prev_fp;             /* g_fp_mode from last frame (camera_lock edge) */
 static int g_ovr_prev;            /* was the FP node override active last frame */
@@ -810,8 +811,7 @@ static Vec3 g_last_dest;           /* last issued move-order target (for the re-
 static int  g_have_dest;
 static int g_dbg_wheel;
 static HINSTANCE g_hinst;
-static HHOOK g_mouse_hook;
-static volatile LONG g_wheel_accum;  /* wheel notches*120, accumulated by the LL hook */
+static volatile LONG g_wheel_accum;  /* wheel (±120/notch) accumulated by the DI poll thread */
 static float g_last_move_dir;      /* heading of last issued destination (radians) */
 static int g_last_move_keys;       /* WASD bitmask of last issued destination */
 static float g_move_tx, g_move_tz, g_move_dist;  /* last issued target + its distance */
@@ -1368,20 +1368,15 @@ static void ensure_dinput(void)
     g_di_mouse->lpVtbl->SetCooperativeLevel(g_di_mouse, w,
                                             DISCL_BACKGROUND | DISCL_NONEXCLUSIVE);
     if (SUCCEEDED(g_di_mouse->lpVtbl->Acquire(g_di_mouse))) {
-        g_di_ready = 1;
+        g_di_ready = 1;   /* the poll thread (started at load) now reads the mouse */
         logline("DirectInput mouse acquired (non-exclusive background)");
-        if (!g_di_thread_on) {
-            g_di_thread_on = 1;
-            CloseHandle(CreateThread(NULL, 0, di_poll_thread, NULL, 0, NULL));
-            logline("mouse poll thread started (~1kHz, framerate-independent look)");
-        }
     }
 }
 
 /* Relative deltas since the previous call (mouse axes default to relative).
  * Called ONLY from the poll thread once it starts (single GetDeviceState
  * consumer -- concurrent calls would split deltas unpredictably). */
-static int di_get_deltas(LONG *dx, LONG *dy)
+static int di_get_deltas(LONG *dx, LONG *dy, LONG *dz)
 {
     if (!g_di_ready) return 0;
     DIMOUSESTATE2 st;
@@ -1389,7 +1384,7 @@ static int di_get_deltas(LONG *dx, LONG *dy)
         g_di_mouse->lpVtbl->Acquire(g_di_mouse);   /* lost: re-acquire, skip frame */
         return 0;
     }
-    *dx = st.lX; *dy = st.lY;
+    *dx = st.lX; *dy = st.lY; *dz = st.lZ;   /* lZ = wheel (±120/notch, like WM_MOUSEWHEEL) */
     return 1;
 }
 
@@ -1404,11 +1399,26 @@ static DWORD WINAPI di_poll_thread(void *unused)
 {
     (void)unused;
     timeBeginPeriod(1);              /* 1ms Sleep granularity for this loop */
+    int fp_key_down = 0;
     for (;;) {
-        LONG dx, dy;
-        if (di_get_deltas(&dx, &dy)) {
-            if (dx) InterlockedAdd(&g_acc_dx, dx);
-            if (dy) InterlockedAdd(&g_acc_dy, dy);
+        /* FP-toggle detection lives HERE, not in a global WH_KEYBOARD_LL hook:
+         * a dedicated thread whose job is a global keyboard hook is the textbook
+         * keylogger pattern and trips antivirus behavioral heuristics. A passive
+         * GetAsyncKeyState poll (the same call the game uses for WASD) does not,
+         * and because this thread is off the frame loop it still catches the
+         * toggle even if an Alt press briefly stalls the game's message loop. */
+        int kd = (GetAsyncKeyState(g_cfg_key_fp) & 0x8000) != 0;
+        if (kd && !fp_key_down) InterlockedExchange(&g_toggle_edge, 1);   /* press edge */
+        fp_key_down = kd;
+
+        /* Mouse look + wheel from DirectInput (once acquired) -- no WH_MOUSE_LL. */
+        if (g_di_ready) {
+            LONG dx, dy, dz;
+            if (di_get_deltas(&dx, &dy, &dz)) {
+                if (dx) InterlockedAdd(&g_acc_dx, dx);
+                if (dy) InterlockedAdd(&g_acc_dy, dy);
+                if (dz) InterlockedExchangeAdd(&g_wheel_accum, dz);   /* wheel notches */
+            }
         }
         Sleep(1);
     }
@@ -3476,69 +3486,10 @@ static DWORD WINAPI hook_watchdog(void *unused)
     }
 }
 
-/* Low-level keyboard hook: latch the FP-toggle keydown at event time. On
- * native Windows a bare Alt press can freeze the game loop in the system-menu
- * modal until release, so frame-polling GetAsyncKeyState misses the entire
- * press (first Windows user report); an LL hook still receives the event. */
-static LRESULT CALLBACK kbd_ll(int code, WPARAM wp, LPARAM lp)
-{
-    if (code == HC_ACTION) {
-        KBDLLHOOKSTRUCT *k = (KBDLLHOOKSTRUCT *)lp;
-        if (k->vkCode == VK_TOGGLE_FP) {
-            if (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) {
-                if (!g_toggle_ll_down) {           /* filter autorepeat */
-                    g_toggle_ll_down = 1;
-                    InterlockedExchange(&g_toggle_edge, 1);
-                }
-            } else if (wp == WM_KEYUP || wp == WM_SYSKEYUP) {
-                g_toggle_ll_down = 0;
-            }
-        }
-    }
-    return CallNextHookEx(NULL, code, wp, lp);
-}
-
-/* Low-level mouse hook: capture the wheel ourselves (the game clears its own
- * mWheel before our per-frame hook can read it). Look deltas come from the
- * DirectInput device instead (see ensure_dinput). */
-static LRESULT CALLBACK mouse_ll(int code, WPARAM wp, LPARAM lp)
-{
-    if (code == HC_ACTION && wp == WM_MOUSEWHEEL) {
-        MSLLHOOKSTRUCT *m = (MSLLHOOKSTRUCT *)lp;
-        int delta = (short)HIWORD(m->mouseData);   /* +120 / -120 per notch */
-        InterlockedExchangeAdd(&g_wheel_accum, delta);
-    }
-    return CallNextHookEx(NULL, code, wp, lp);
-}
-
-/* Dedicated message-pump thread that owns the low-level mouse/keyboard hooks.
- * WH_MOUSE_LL / WH_KEYBOARD_LL callbacks are serviced ON THE INSTALLING THREAD,
- * which must pump its message queue PROMPTLY -- the callback sits in the OS-wide
- * input path, so if that thread stalls, mouse/keyboard input for the ENTIRE
- * system is delayed. Installing on the game's main thread meant that between
- * message pumps (while it's busy in the per-frame simulation) global cursor
- * input stuttered -- fps-dependent wobble, even in menus and other apps (found
- * + minimally reproduced by Biora with WH_MOUSE_LL + a busy frame-loop). This
- * thread does NOTHING but install the hooks and pump, so they are always
- * serviced instantly regardless of the game's frame time. */
-static DWORD WINAPI hook_thread_proc(void *unused)
-{
-    (void)unused;
-    g_mouse_hook = SetWindowsHookExA(WH_MOUSE_LL, mouse_ll, g_hinst, 0);
-    logline(g_mouse_hook ? "mouse wheel hook installed (dedicated pump thread)"
-                         : "mouse wheel hook FAILED (err %lu)", GetLastError());
-    g_kbd_hook = SetWindowsHookExA(WH_KEYBOARD_LL, kbd_ll, g_hinst, 0);
-    logline(g_kbd_hook ? "keyboard hook installed (FP toggle capture, dedicated pump thread)"
-                       : "keyboard hook FAILED (err %lu) -- polling fallback", GetLastError());
-    MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0) > 0) {   /* pumps -> services the LL hooks */
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-    if (g_mouse_hook) UnhookWindowsHookEx(g_mouse_hook);
-    if (g_kbd_hook)   UnhookWindowsHookEx(g_kbd_hook);
-    return 0;
-}
+/* NOTE: no WH_MOUSE_LL / WH_KEYBOARD_LL global hooks anymore. The FP toggle and
+ * mouse wheel are polled on the DirectInput thread instead (di_poll_thread) --
+ * a background thread running a global keyboard hook trips antivirus keylogger
+ * heuristics, and passive GetAsyncKeyState / DirectInput reads do not. */
 
 /* Install one hook through the active backend. Returns 1 on success.
  * KenshiLib.AddHook does create+enable in one call (SUCCESS==0). */
@@ -3736,16 +3687,30 @@ static void hooked_charmove_update(void *mv, float t)
     if (drive) mv_force_direct(mv);
 }
 
+#ifdef KFP_RE_PLUGIN
+/* KenshiLib::AddHook(void* target, void* detour, void** original) -> HookStatus
+ * (SUCCESS=0). Resolved by name from KenshiLib.dll at load (RE_Kenshi's dep). */
+typedef int (*klib_addhook_t)(void *target, void *detour, void **original);
+static klib_addhook_t g_klib_addhook;
+#define KLIB_ADDHOOK_SYM "?AddHook@KenshiLib@@YA?AW4HookStatus@1@PEAX0PEAPEAX@Z"
+#endif
+
 static int install_hook(void *target, void *detour, void **original)
 {
-    /* Always MinHook. The KenshiLib AddHook "cooperative" path installed but
-     * the detours never fired for some RE_Kenshi users, and the watchdog's
-     * MinHook re-arm on a KenshiLib-installed hook mixed backends and crashed.
-     * Our source analysis shows MinHook does NOT conflict with RE_Kenshi
-     * (disjoint targets, module-private state), and correct 1.0.65 addresses
-     * over MinHook are the proven-working path. */
+#ifdef KFP_RE_PLUGIN
+    /* RE edition: hook through KenshiLib::AddHook -- RE_Kenshi's own hooking
+     * service does the code patching inside KenshiLib.dll, so OUR binary carries
+     * no inline-hook/trampoline machinery (which AV heuristics flag as an
+     * injector). This is the way the RE_Kenshi author recommended. NO MinHook is
+     * mixed in here (mixing backends is what crashed our earlier attempt), and
+     * the addresses are the same signature-resolved targets we already validate.
+     * HookStatus::SUCCESS == 0. */
+    return g_klib_addhook && g_klib_addhook(target, detour, original) == 0;
+#else
+    /* Standalone edition: no KenshiLib available, so MinHook does the hooking. */
     if (MH_CreateHook(target, detour, original) != MH_OK) return 0;
     return MH_EnableHook(target) == MH_OK;
+#endif
 }
 
 __declspec(dllexport) void dllStartPlugin(void)
@@ -3769,6 +3734,14 @@ __declspec(dllexport) void dllStartPlugin(void)
             g_wrong_build = 1;             /* core resolution failed -> disable */
             logline("*** core address resolution FAILED (mainloop=%p cam=%p camupd=%p)",
                     (void *)g_rva.MAINLOOP, (void *)g_rva.CAM_INSTANCE, (void *)g_rva.CAM_UPDATE);
+        }
+        /* Hook via RE_Kenshi's KenshiLib::AddHook (no in-binary inline hooking). */
+        HMODULE klib = GetModuleHandleA("KenshiLib.dll");
+        g_klib_addhook = klib ? (klib_addhook_t)GetProcAddress(klib, KLIB_ADDHOOK_SYM) : NULL;
+        logline("KenshiLib.dll=%p AddHook=%p", (void *)klib, (void *)g_klib_addhook);
+        if (!g_klib_addhook) {
+            g_wrong_build = 1;             /* can't hook without it -> stand down cleanly */
+            logline("*** KenshiLib::AddHook not found -- RE edition needs RE_Kenshi/KenshiLib loaded");
         }
     }
 #else
@@ -3804,14 +3777,18 @@ __declspec(dllexport) void dllStartPlugin(void)
     }
     g_get_bone_world   = (get_bone_world_t)(g_base + RVA_GET_BONE_WORLD);
 
-    /* Install the low-level mouse/keyboard hooks on a DEDICATED message-pump
-     * thread (hook_thread_proc), NOT here on the game's main thread -- otherwise
-     * the game's per-frame work stalls hook servicing and stutters system-wide
-     * cursor input (Biora's fps-dependent wobble). */
-    {
-        HANDLE ht = CreateThread(NULL, 0, hook_thread_proc, NULL, 0, NULL);
+    /* Input capture is 100% POLLING -- NO global WH_MOUSE_LL / WH_KEYBOARD_LL
+     * hooks (a background thread running a global keyboard hook reads as a
+     * keylogger to antivirus). A ~1kHz thread polls the FP-toggle key via
+     * GetAsyncKeyState and, once the DirectInput mouse is acquired, reads look
+     * deltas + wheel from it. Started at load so the toggle works immediately;
+     * off the frame loop, so no fps-dependent input stutter either. */
+    if (!g_di_thread_on) {
+        g_di_thread_on = 1;
+        HANDLE ht = CreateThread(NULL, 0, di_poll_thread, NULL, 0, NULL);
         if (ht) CloseHandle(ht);
-        else logline("hook pump thread FAILED to start (err %lu)", GetLastError());
+        logline(ht ? "input poll thread started (~1kHz; toggle + look + wheel, no OS hooks)"
+                   : "input poll thread FAILED to start (err %lu)", GetLastError());
     }
 
     /* FP look deltas: DirectInput non-exclusive device, created lazily on the
@@ -3826,7 +3803,7 @@ __declspec(dllexport) void dllStartPlugin(void)
     make_mstr(g_bone_spine2, "Bip01 Spine2");
     make_mstr(g_bone_neck,   "Bip01 Neck");
     make_mstr(g_bone_rootspine, "Bip01 Spine");   /* readiness computed after Ogre resolves */
-    logline("KenshiFP v0.4.2 loaded (FP + head-bone + FOV + WASD); module base %p", (void *)g_base);
+    logline("KenshiFP v0.4.3 loaded (FP + head-bone + FOV + WASD); module base %p", (void *)g_base);
 
     /* Report the detected build (selection already happened above). */
     {
@@ -3887,9 +3864,16 @@ __declspec(dllexport) void dllStartPlugin(void)
     logline(g_ogre_ready ? "Ogre node setters resolved (FP override armed)"
                          : "WARN: Ogre node setters NOT resolved (FP override disabled)");
 
+    /* Hooking backend: KenshiLib::AddHook for the RE edition (already resolved),
+     * MinHook for the standalone. */
+#ifdef KFP_RE_PLUGIN
+    int hook_ready = !g_wrong_build;   /* g_klib_addhook checked above */
+#else
     MH_STATUS mh = g_wrong_build ? MH_ERROR_NOT_INITIALIZED : MH_Initialize();
+    int hook_ready = !g_wrong_build && (mh == MH_OK || mh == MH_ERROR_ALREADY_INITIALIZED);
+#endif
     int ok = 0;
-    if (!g_wrong_build && (mh == MH_OK || mh == MH_ERROR_ALREADY_INITIALIZED)) {
+    if (hook_ready) {
         void *target = (void *)(g_base + RVA_MAINLOOP);
         g_mainloop_target = target;
         ok = install_hook(target, (void *)hooked_mainloop, (void **)&g_mainloop_orig);
@@ -3982,17 +3966,15 @@ __declspec(dllexport) void dllStartPlugin(void)
                 g_rgm_initgroup    = (rgm_initgroup_t)GetProcAddress(ogremod, OGRE_RGM_INITGROUP_SYM);
             }
             void *sp = GetProcAddress(mygui, MYGUI_SETPOINTER_SYM);
-            MH_STATUS mh3 = sp ? MH_CreateHook(sp, (void *)hooked_setpointer,
-                                               (void **)&g_pm_setpointer_orig)
-                               : MH_ERROR_NOT_EXECUTABLE;
-            if (mh3 == MH_OK) mh3 = MH_EnableHook(sp);
-            logline(mh3 == MH_OK ? "MyGUI setPointer hook installed (hide default cursor)"
-                                 : "MyGUI setPointer hook FAILED (MH_STATUS %d)", (int)mh3);
+            int spok = sp && install_hook(sp, (void *)hooked_setpointer,
+                                          (void **)&g_pm_setpointer_orig);
+            logline(spok ? "MyGUI setPointer hook installed (hide default cursor)"
+                         : "MyGUI setPointer hook FAILED");
         } else {
             logline("MyGUIEngine_x64.dll not found — cursor hide disabled");
         }
     } else if (!g_wrong_build) {
-        logline("MH_Initialize failed (MH_STATUS %d)", (int)mh);
+        logline("hook backend init failed (no MinHook / KenshiLib::AddHook)");
     }
 
     load_ini();                    /* optional KenshiFP.ini (fps_cap=N, ...) */

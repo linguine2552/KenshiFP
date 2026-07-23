@@ -12,9 +12,15 @@ REQUIREMENTS
 INSTALL
   1. Copy the whole "KenshiFP" folder into your Kenshi "mods" folder:
         <Kenshi install>/mods/KenshiFP/
-     (so you have mods/KenshiFP/KenshiFP.dll, KenshiFP.mod, RE_Kenshi.json)
+     After copying you should have ALL FOUR of these files:
+        mods/KenshiFP/KenshiFP.dll
+        mods/KenshiFP/KenshiFP.mod      <-- makes "KenshiFP" appear in the mod list
+        mods/KenshiFP/_KenshiFP.info
+        mods/KenshiFP/RE_Kenshi.json    <-- tells RE_Kenshi to load the plugin
   2. Launch Kenshi. In the mod list, ENABLE "KenshiFP" (tick it), then start.
      RE_Kenshi loads the plugin automatically for enabled mods.
+     If "KenshiFP" does NOT appear in the mod list, the KenshiFP.mod file is
+     missing from the folder -- re-extract the zip so all four files are present.
   3. Select a character and press RIGHT ALT to toggle first person.
 
   Do NOT also add a "Plugin=KenshiFP_x64" line to Plugins_x64.cfg -- that is

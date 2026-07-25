@@ -12,11 +12,14 @@ REQUIREMENTS
 INSTALL
   1. Copy the whole "KenshiFP" folder into your Kenshi "mods" folder:
         <Kenshi install>/mods/KenshiFP/
-     After copying you should have ALL FOUR of these files:
+     After copying you should have these files:
         mods/KenshiFP/KenshiFP.dll
         mods/KenshiFP/KenshiFP.mod      <-- makes "KenshiFP" appear in the mod list
         mods/KenshiFP/_KenshiFP.info
         mods/KenshiFP/RE_Kenshi.json    <-- tells RE_Kenshi to load the plugin
+        mods/KenshiFP/kenshifp/         <-- crosshair / vignette / blackout images
+     Keep the "kenshifp" image folder next to the DLL -- without it you get no
+     crosshair or KO effects.
   2. Launch Kenshi. In the mod list, ENABLE "KenshiFP" (tick it), then start.
      RE_Kenshi loads the plugin automatically for enabled mods.
      If "KenshiFP" does NOT appear in the mod list, the KenshiFP.mod file is
@@ -30,10 +33,10 @@ CONTROLS
   Right Alt = first person | Mouse = look | WASD = move | Wheel = walk/run speed
 
 CONFIG (optional, hot-reloaded in-game)
-  Put a "KenshiFP.ini" in your Kenshi install ROOT (next to kenshi_x64.exe),
-  NOT in this mod folder. Settings: fps_cap, fov, near_clip, sensitivity,
+  Edit "KenshiFP.ini" IN THIS MOD FOLDER (next to KenshiFP.dll) -- changes apply
+  within a second, no restart. Settings: fps_cap, fov, near_clip, sensitivity,
   aim_lean, ranged_freeaim, wheel_speed, ko_vignette, key rebinds, and more.
-  (See the standalone edition's KenshiFP.ini for the full documented sample.)
+  You can also change everything live from the in-game panel (F10).
 
 A log "KenshiFP.log" is written in your Kenshi install root -- attach it to any
 bug report.

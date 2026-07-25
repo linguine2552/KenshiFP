@@ -686,7 +686,6 @@ static int g_ogre_ready;
 static DWORD g_last_tick_ms;
 static int g_fp_mode;              /* toggled by VK_TOGGLE_FP edge */
 static volatile LONG g_toggle_edge;    /* FP-toggle press latched by the DI poll thread */
-static int g_toggle_was_down;
 static int g_prev_fp;             /* g_fp_mode from last frame (camera_lock edge) */
 static int g_ovr_prev;            /* was the FP node override active last frame */
 static float g_yaw, g_pitch;      /* accumulated mouse-look angles (radians) */
@@ -941,15 +940,20 @@ static int g_clearmod_frames;      /* countdown: keep clearing stuck mods after 
 
 static void poll_input(void)
 {
-    /* Two detection paths, one toggle:
-     *  - g_toggle_edge: latched by the LL keyboard hook at the instant of the
-     *    physical keydown. On native Windows a bare Alt press can stall the
-     *    game's message loop (system-menu modal), so a per-frame poll misses
-     *    the whole press -- the hook doesn't.
-     *  - GetAsyncKeyState edge: belt-and-braces for setups without the hook. */
-    int down = (GetAsyncKeyState(VK_TOGGLE_FP) & 0x8000) != 0;
+    /* One toggle per physical press, consumed from the ~1kHz DI poll thread's
+     * key-DOWN edge (g_toggle_edge). The thread is separate, so it never misses
+     * a press even if a bare Alt stalls the game's message loop.
+     *
+     * A second, per-frame GetAsyncKeyState edge detector used to live here as
+     * "belt-and-braces". It RACED the poll thread: the poll edge fired the
+     * toggle ON while this frame's own key read still saw the key as up, so
+     * g_toggle_was_down stayed 0 and the NEXT frame's async edge re-fired and
+     * flipped it straight back OFF -- a single Right Alt press landing as
+     * ON->OFF (worse at high fps, where frames are ~10ms apart). Removed; the
+     * poll-thread edge alone is reliable and there is no LL hook to fall back
+     * from anymore. */
     LONG edge = InterlockedExchange(&g_toggle_edge, 0);
-    if (edge || (down && !g_toggle_was_down)) {
+    if (edge) {
         /* AltGr guard: on many EU layouts Right Alt is AltGr (typing € @ etc);
          * don't yank the player into FP while they type in an open panel. */
         if (g_fp_mode || !ui_panels_open()) {
@@ -965,7 +969,6 @@ static void poll_input(void)
         g_clearmod_frames--;
         clear_input_mods();
     }
-    g_toggle_was_down = down;
 
     /* [sneak diag] Dump the game input state so we can SEE what "sneak" is:
      * InputHandler modifier/pan bytes (base 0x2133370: +0xD0 controlEnabled,
@@ -2680,9 +2683,34 @@ static void ensure_crosshair(void)
     if (g_rgm_getsingleton && g_rgm_addlocation) {
         void *rgm = g_rgm_getsingleton();
         if (readable(rgm, 8)) {
-            unsigned char loc[32], ft[32], grp[32];
-            make_mstr(loc, "kenshifp"); make_mstr(ft, "FileSystem"); make_mstr(grp, "GUI");
+            unsigned char ft[32], grp[32];
+            make_mstr(ft, "FileSystem"); make_mstr(grp, "GUI");
+            /* (1) CWD-relative: the standalone edition ships kenshifp/ next to
+             * the game exe (CWD = install root). */
+            unsigned char loc[32];
+            make_mstr(loc, "kenshifp");
             g_rgm_addlocation(rgm, loc, ft, grp, 0, 1);
+            /* (2) Next to THIS DLL, by absolute path: the RE_Kenshi edition lives
+             * in mods/KenshiFP/ (or the Steam Workshop content dir), so its images
+             * ship in a kenshifp/ subfolder THERE, not at the game root. Without
+             * this the mod-folder install finds no textures -> no crosshair /
+             * vignette / KO blackout. Works for the standalone too (its DLL is at
+             * the root, so this resolves to the same folder as (1)). */
+            wchar_t dllw[MAX_PATH];
+            DWORD n = GetModuleFileNameW(g_hinst, dllw, MAX_PATH);
+            if (n > 0 && n < MAX_PATH) {
+                for (DWORD k = n; k > 0; k--)
+                    if (dllw[k-1] == L'\\' || dllw[k-1] == L'/') { dllw[k-1] = 0; break; }
+                char dlla[MAX_PATH];
+                if (WideCharToMultiByte(CP_UTF8, 0, dllw, -1, dlla, MAX_PATH, NULL, NULL)) {
+                    char path[MAX_PATH + 16];
+                    snprintf(path, sizeof path, "%s\\kenshifp", dlla);
+                    unsigned char loc2[32];
+                    void *heap = make_mstr_long(loc2, path);
+                    g_rgm_addlocation(rgm, loc2, ft, grp, 0, 1);
+                    if (heap) free(heap);
+                }
+            }
         }
     }
 
@@ -2991,9 +3019,36 @@ static int ini_float(const char *line, const char *key, float *out)
     return 1;
 }
 
+/* Resolve where KenshiFP.ini lives, once. The standalone reads it from the game
+ * root (CWD, next to KenshiFP.log). The RE_Kenshi edition lives in a mod folder,
+ * so a root-level ini is unintuitive -- prefer <this dll's folder>\KenshiFP.ini
+ * if present, else fall back to the CWD path. (Existence is checked once; a new
+ * file in the other location is picked up on the next game launch.) */
+static const char *kfp_ini_path(void)
+{
+    static char path[MAX_PATH]; static int done;
+    if (done) return path;
+    done = 1;
+    wchar_t dllw[MAX_PATH];
+    DWORD n = GetModuleFileNameW(g_hinst, dllw, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        for (DWORD k = n; k > 0; k--)
+            if (dllw[k-1] == L'\\' || dllw[k-1] == L'/') { dllw[k-1] = 0; break; }
+        char dlla[MAX_PATH];
+        if (WideCharToMultiByte(CP_UTF8, 0, dllw, -1, dlla, MAX_PATH, NULL, NULL)) {
+            char cand[MAX_PATH];
+            snprintf(cand, sizeof cand, "%s\\KenshiFP.ini", dlla);
+            FILE *t = fopen(cand, "r");
+            if (t) { fclose(t); strncpy(path, cand, sizeof path - 1); return path; }
+        }
+    }
+    strcpy(path, "KenshiFP.ini");   /* CWD (game root) fallback */
+    return path;
+}
+
 static void load_ini(void)
 {
-    FILE *f = fopen("KenshiFP.ini", "r");   /* CWD = game dir, same as KenshiFP.log */
+    FILE *f = fopen(kfp_ini_path(), "r");   /* mod folder, else CWD = game dir */
     if (!f) return;
     char line[160]; int v; float fv;
     while (fgets(line, sizeof line, f)) {
@@ -3032,7 +3087,7 @@ static void ini_hot_reload(void)
     if (now - last_check < 500) return;
     last_check = now;
     WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (!GetFileAttributesExA("KenshiFP.ini", GetFileExInfoStandard, &fad)) return;
+    if (!GetFileAttributesExA(kfp_ini_path(), GetFileExInfoStandard, &fad)) return;
     if (CompareFileTime(&fad.ftLastWriteTime, &last_wt) != 0) {
         last_wt = fad.ftLastWriteTime;
         load_ini();
@@ -3723,17 +3778,70 @@ __declspec(dllexport) void dllStartPlugin(void)
      * so match both builds. Neither -> unsupported, disable. MUST run before any
      * RVA_* use (they now read the active table g_rva). */
 #ifdef KFP_RE_PLUGIN
-    /* Version-independent: resolve every address by scanning the live binary. */
+    /* Resolve g_rva. PREFER the built-in RVA tables, selected by a DIRECT
+     * prologue check at the known MAINLOOP RVA (exactly what the standalone
+     * does). base+RVA addressing is immune to the two failure modes that made
+     * the pure signature scan disable KenshiFP on most users' RE_Kenshi setups:
+     *   - false matches: kfp_sig returns the FIRST hit of a non-unique pattern,
+     *     so a mainloop scan could land on the wrong function (seen: 0x7877a0
+     *     instead of the real 0x787e70), and
+     *   - misses: a co-loaded plugin's hook (or a scan-region quirk) leaves a
+     *     pattern unmatched -> address 0 -> "core resolution FAILED".
+     * The RE_Kenshi bundled exe is Steam 1.0.65; a direct install is 1.0.68.
+     * Fall back to the signature scan ONLY for a build whose prologue we don't
+     * recognise (e.g. an unknown GOG variant) -- no worse than before there. */
     {
-        int r = kfp_resolve_all(g_base);
-        int total = (int)(sizeof(KFP_RTAB) / sizeof(KFP_RTAB[0]));
-        logline("RE plugin: resolved %d/%d addresses by signature (base %p)",
-                r, total, (void *)g_base);
-        g_build = 0;                       /* not a fixed build */
-        if (!g_rva.MAINLOOP || !g_rva.CAM_INSTANCE || !g_rva.CAM_UPDATE) {
-            g_wrong_build = 1;             /* core resolution failed -> disable */
-            logline("*** core address resolution FAILED (mainloop=%p cam=%p camupd=%p)",
-                    (void *)g_rva.MAINLOOP, (void *)g_rva.CAM_INSTANCE, (void *)g_rva.CAM_UPDATE);
+        /* (0) PE-header fingerprint -- SizeOfImage + TimeDateStamp live in the
+         * image header, which NO runtime code hook can touch. This identifies
+         * the exact build even when other RE_Kenshi plugins have hooked (and so
+         * clobbered) the very functions we would otherwise scan for -- including
+         * mainLoop itself. Logged every launch so any unknown build self-reports
+         * from a user's log and can be added here in one line. Known builds:
+         *   Steam 1.0.68 (direct):        SizeOfImage 0x232d000, stamp 0x6602d59d
+         *   Steam 1.0.65 (RE_Kenshi down): SizeOfImage 0x232c000, stamp 0x65d604d7 */
+        unsigned long img = 0, tstamp = 0, entry = 0;
+        {
+            IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)g_base;
+            if (readable(dos, sizeof *dos) && dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + dos->e_lfanew);
+                if (readable(nt, sizeof *nt) && nt->Signature == IMAGE_NT_SIGNATURE) {
+                    img    = (unsigned long)nt->OptionalHeader.SizeOfImage;
+                    tstamp = (unsigned long)nt->FileHeader.TimeDateStamp;
+                    entry  = (unsigned long)nt->OptionalHeader.AddressOfEntryPoint;
+                }
+            }
+        }
+        logline("exe fingerprint: SizeOfImage=0x%lx TimeDateStamp=0x%lx entry=0x%lx",
+                img, tstamp, entry);
+
+        static const unsigned char SIG_MAINLOOP[8] =
+            { 0x48,0x8b,0xc4,0x56,0x57,0x41,0x54,0x48 };
+        unsigned char *p68 = (unsigned char *)(g_base + T_1068.MAINLOOP);
+        unsigned char *p65 = (unsigned char *)(g_base + T_1065.MAINLOOP);
+        if (tstamp == 0x6602d59d || img == 0x232d000) {
+            g_rva = T_1068; g_build = 68;
+            logline("RE plugin: build 1.0.68 by PE fingerprint (hook-immune)");
+        } else if (tstamp == 0x65d604d7 || img == 0x232c000) {
+            g_rva = T_1065; g_build = 65;
+            logline("RE plugin: build 1.0.65 (RE_Kenshi downgrade) by PE fingerprint (hook-immune)");
+        } else if (readable(p68, 8) && memcmp(p68, SIG_MAINLOOP, 8) == 0) {
+            g_rva = T_1068; g_build = 68;
+            logline("RE plugin: build 1.0.68 by mainLoop prologue");
+        } else if (readable(p65, 8) && memcmp(p65, SIG_MAINLOOP, 8) == 0) {
+            g_rva = T_1065; g_build = 65;
+            logline("RE plugin: build 1.0.65 (RE_Kenshi downgrade) by mainLoop prologue");
+        } else {
+            /* Unrecognised build -> version-independent signature scan. */
+            int r = kfp_resolve_all(g_base);
+            int total = (int)(sizeof(KFP_RTAB) / sizeof(KFP_RTAB[0]));
+            g_build = 0;                   /* not a fixed build */
+            logline("RE plugin: unrecognised build, resolved %d/%d addresses by signature (base %p)",
+                    r, total, (void *)g_base);
+            if (!g_rva.MAINLOOP || !g_rva.CAM_INSTANCE || !g_rva.CAM_UPDATE) {
+                g_wrong_build = 1;         /* core resolution failed -> disable */
+                logline("*** core address resolution FAILED (mainloop=%p cam=%p camupd=%p)",
+                        (void *)g_rva.MAINLOOP, (void *)g_rva.CAM_INSTANCE, (void *)g_rva.CAM_UPDATE);
+            }
         }
         /* Hook via RE_Kenshi's KenshiLib::AddHook (no in-binary inline hooking). */
         HMODULE klib = GetModuleHandleA("KenshiLib.dll");
@@ -3803,7 +3911,7 @@ __declspec(dllexport) void dllStartPlugin(void)
     make_mstr(g_bone_spine2, "Bip01 Spine2");
     make_mstr(g_bone_neck,   "Bip01 Neck");
     make_mstr(g_bone_rootspine, "Bip01 Spine");   /* readiness computed after Ogre resolves */
-    logline("KenshiFP v0.4.3 loaded (FP + head-bone + FOV + WASD); module base %p", (void *)g_base);
+    logline("KenshiFP v0.4.6 loaded (FP + head-bone + FOV + WASD); module base %p", (void *)g_base);
 
     /* Report the detected build (selection already happened above). */
     {

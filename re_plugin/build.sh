@@ -20,3 +20,6 @@ x86_64-w64-mingw32-gcc -O2 -shared -static-libgcc -DKFP_RE_PLUGIN -o KenshiFP.dl
     -lkernel32 -ldinput8 -ldxguid -lwinmm -lm
 echo "built KenshiFP.dll (RE_Kenshi plugin, KenshiLib::AddHook, no MinHook)"
 x86_64-w64-mingw32-objdump -p KenshiFP.dll | grep -i "startPlugin" | head -1
+# Refresh the packaging/mod copy so zips + deploys never ship a stale DLL.
+cp -f KenshiFP.dll mod/KenshiFP.dll
+echo "copied -> mod/KenshiFP.dll"

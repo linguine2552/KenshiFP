@@ -55,6 +55,10 @@ static const rentry_t KFP_RTAB[] = {
   { AF(CAM_MANUAL_SETOZ),R_FUNC, "40 53 48 83 EC 40 0F 10 02 48 8B D9 48 8B 49 58 48 8D 54 24 20 0F 29 74 24 30 0F 28", 0,0,0 },
   { AF(SET_DIRECT_MOVE), R_FUNC, "48 89 5C 24 08 57 48 83 EC 30 48 8B DA BA 02 00 00 00 0F 29 74 24 20 0F 28 F2 48 8B", 0,0,0 },
   { AF(CHARMOVE_UPDATE), R_FUNC, "48 8B C4 55 56 57 41 54 41 55 41 56 41 57 48 8D A8 58 FE FF FF 48 81 EC 70 02 00 00", 0,0,0 },
+  /* CharStats::xpRunning(time,speed) -- athletics+strength XP tick; distinctive
+   * prologue: mov this; save xmm6/7; movaps xmm6,xmm1; movaps xmm7,xmm2; call
+   * [rax+0x58]; cmp [rax+0x250],0. */
+  { AF(XP_RUNNING), R_FUNC, "40 53 48 83 EC 40 48 8B D9 48 8B 49 10 0F 29 74 24 30 48 8B 01 0F 29 7C 24 20 0F 28 F1 0F 28 FA FF 50 58 48 83 B8 50 02 00 00 00 74 76 48 8B 4B 10", 0,0,0 },
 
   /* GUI panel getVisible thunks (mov rcx,[rcx+X]; jmp [rip->getVisible]).
    * Near-identical prologues; disambiguated by trailing next-function bytes.

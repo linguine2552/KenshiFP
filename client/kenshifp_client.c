@@ -87,6 +87,7 @@
 #define CHAR_ANIM          0x448   /* Character::animation (AnimationClass*) */
 #define CHAR_WEAPON_IN_HANDS 0x6D8 /* CharacterHuman::weaponInHands (Weapon*); non-null = drawn */
 #define CHAR_MOVEMENT     0x640    /* Character::movement (CharMovement*) */
+#define CHAR_STATS        0x450    /* Character::stats (CharStats*) */
 #define CHAR_RANGEDCOMBAT 0x2F0    /* Character::rangedCombat (RangedCombatClass*) */
 #define RC_COMBATMODE     0x36     /* RangedCombatClass::combatMode (bool) */
 #define ANIM_SKELETON      0xB8    /* AnimationClass::skeleton (Ogre::OldSkeletonInstance*) */
@@ -355,7 +356,7 @@ typedef struct {
         MSGBOX_COUNT, PLAYER_IFACE, CTXMENU_VISIBLE, CAM_UPDATE, TERRAIN_PTR,
         TOWNMGR_PTR, NEAREST_TOWN, INTERIOR_LOAD, GET_BONE_WORLD,
         RANGED_ANIMUPD, GUN_SHOOT, FACE_DIR, GUN_RELOAD, SHEATHE, GUN_CREATEPHYS,
-        RC_GETGUN, CAM_MANUAL_SETOZ, SET_DIRECT_MOVE, CHARMOVE_UPDATE;
+        RC_GETGUN, CAM_MANUAL_SETOZ, SET_DIRECT_MOVE, CHARMOVE_UPDATE, XP_RUNNING;
 } addr_table_t;
 
 static const addr_table_t T_1068 = {
@@ -387,6 +388,13 @@ static const addr_table_t T_1068 = {
                  * Engine-native direction-driven locomotion (verified decomp) */
     0x65ffa0,   /* CharMovement::update (via base-vtable+0x58 thunk; contains the
                  * MOVE_DIRECTION consumer branch at +0x11c -- self-verifying) */
+    0x8C6660,   /* CharStats::xpRunning(time, speed): awards athletics(17) +
+                 * strength(1) XP each move-frame. LOCATED BY DISASM -- the
+                 * KenshiLib header RVA (0x8C4EB0) is stale/wrong for this region.
+                 * WASD (MOVE_DIRECTION) bypasses the game's call to it, so we
+                 * call it ourselves. Confirmed: calls calcAthleticsXPMult(speed)
+                 * then xpGeneral(.,.,STAT_ATHLETICS) + calcStrengthXPMultFromWalking
+                 * then xpGeneral(.,.,STAT_STRENGTH). */
 };
 /* Steam 1.0.65 (RE_Kenshi's downgrade build). Signature-transplant mapped;
  * 0 = TODO (Ghidra pass in progress) or unused-in-client. Same field order. */
@@ -408,6 +416,8 @@ static const addr_table_t T_1065 = {
     0x6af0c0,   /* manuallySetOrientationAndZoom: byte-identical prologue, +0x7E0 */
     0x3332c0,   /* setDirectMovement: unique 22-byte prologue match */
     0x65f510,   /* CharMovement::update: unique 28-byte prologue match */
+    0x8C5790,   /* CharStats::xpRunning: masked-sig transplant from 1.0.68 0x8C6660
+                 * (unique match; prologue 40 53 48 83 EC 40 48 8B D9 48 8B 49 10) */
 };
 static addr_table_t g_rva;   /* active table, selected at load by build signature */
 
@@ -2338,6 +2348,36 @@ static int terrain_ray(const Vec3 *origin, const Vec3 *dir, Vec3 *out)
 #define MV_HALT_SLOT      (0x98/8) /* vtable: halt() -- cancels current orders */
 #define MV_SETSPEED_SLOT  (0xA8/8) /* vtable: setDesiredSpeed(MoveSpeed) */
 
+/* --- athletics + strength XP for WASD movement (v0.4.6) ---------------------
+ * WASD drives the character with MOVE_DIRECTION (setDirectMovement), which
+ * bypasses the move-order/pathfinding path where Kenshi calls CharStats::xpRunning
+ * to grant athletics (from speed) and strength (from walking-while-encumbered) XP.
+ * The character physically moves but never runs the XP routine -- so we call it
+ * ourselves each frame we drive it, with the same (frameTime, currentSpeed) the
+ * game passes. Crash-guarded: a fault disables just this, not movement. */
+typedef void (*xprunning_t)(void *charstats, float time, float speed);
+static xprunning_t g_xp_running;
+static int g_xp_dead;            /* set on fault -> XP award disabled this session */
+static void award_move_xp(void *pc, void *mv, float dt)
+{
+    if (g_xp_dead || !g_xp_running || !pc || !mv) return;
+    if (!(dt > 0.0f) || dt > 1.0f) return;                 /* sane per-frame delta */
+    if (!readable((void *)((uintptr_t)pc + CHAR_STATS), 8)) return;
+    void *stats = *(void **)((uintptr_t)pc + CHAR_STATS);
+    if (!readable(stats, 8)) return;
+    float speed = readable((void *)((uintptr_t)mv + MV_CURRENT_SPEED), 4)
+                ? *(float *)((uintptr_t)mv + MV_CURRENT_SPEED) : 0.0f;
+    if (!(speed > 0.1f)) return;                            /* only while actually moving */
+    { static int logged; if (!logged) { logged = 1;
+        logline("[xp] WASD athletics/strength XP tick LIVE (stats=%p speed=%.1f)", stats, speed); } }
+    if (setjmp(g_guard_jb)) { g_guard_armed = 0; g_xp_dead = 1;
+        logline("xpRunning FAULTED -- WASD athletics/strength XP disabled for this session");
+        return; }
+    g_guard_armed = 1;
+    g_xp_running(stats, dt, speed);
+    g_guard_armed = 0;
+}
+
 static void fp_movement(void *gw, float dt)
 {
     if (!g_fp_mode || !g_charmove_setdest) {
@@ -2510,6 +2550,9 @@ static void fp_movement(void *gw, float dt)
             g_guard_armed = 0;
             g_was_direct = 1;
             g_was_moving = 1;
+            /* MOVE_DIRECTION skips the game's own athletics/strength XP tick --
+             * run it ourselves so WASD trains like click-move. */
+            award_move_xp(pc, mv, dt);
             return;
         }
     }
@@ -3884,6 +3927,10 @@ __declspec(dllexport) void dllStartPlugin(void)
                 g_terrain_intersect ? "ok" : "MISSING");
     }
     g_get_bone_world   = (get_bone_world_t)(g_base + RVA_GET_BONE_WORLD);
+    /* CharStats::xpRunning -- only if resolved (0 on an unrecognised build). */
+    g_xp_running = g_rva.XP_RUNNING ? (xprunning_t)(g_base + g_rva.XP_RUNNING) : NULL;
+    logline("CharStats::xpRunning=%p (WASD athletics/strength XP %s)",
+            (void *)g_xp_running, g_xp_running ? "armed" : "UNRESOLVED");
 
     /* Input capture is 100% POLLING -- NO global WH_MOUSE_LL / WH_KEYBOARD_LL
      * hooks (a background thread running a global keyboard hook reads as a

@@ -536,6 +536,14 @@ static int g_cfg_key_a    = 0x41;  /* key_left */
 static int g_cfg_key_s    = 0x53;  /* key_back */
 static int g_cfg_key_d    = 0x44;  /* key_right */
 static int g_cfg_key_settings = 0x79;  /* key_settings (VK code; default F10) -- toggles the settings window */
+static float g_cfg_exit_zoom = 0.0f; /* exit_camera_zoom: 0 = auto (use the zoom captured on FP
+                                      * enter). Nonzero overrides the third-person distance the
+                                      * camera returns to on FP exit; negative flips it to the
+                                      * other side of the character. Hot-reloads. */
+static int g_cfg_key_free = 0xA4;  /* key_free_cursor (default Left Alt) -- HOLD to free the
+                                    * mouse (like an open panel) without opening UI; 0 = off.
+                                    * Read passively via GetAsyncKeyState, so Kenshi's own
+                                    * Left-Alt behaviour is NOT overridden. */
 static float g_cfg_fov      = 70.0f;   /* fov: vertical degrees in FP */
 static float g_cfg_nearclip = 1.0f;    /* near_clip: world units */
 static float g_cfg_sens     = 1.0f;    /* sensitivity: mouse multiplier */
@@ -631,6 +639,7 @@ static node_set_dpos_t g_node_set_dpos; /* Ogre::Node::_setDerivedPosition (worl
 static node_get_dpos_t g_node_get_dpos; /* Ogre::Node::_getDerivedPosition (world) */
 static node_get_pos_t  g_node_get_pos;  /* Ogre::Node::getPosition (LOCAL) */
 static float g_vanilla_zoom = 40.0f;    /* camera-node local Z = vanilla zoom (saved on FP enter) */
+static float g_vanilla_alt  = 0.0f;     /* CameraClass altitude (0x60), saved on FP enter */
 typedef void (*disable_bone_t)(void *skel, const void *name /*std::string*/, char disable);
 static disable_bone_t g_disable_bone;   /* OldSkeletonInstance::disableBone */
 typedef void *(*skel_getbone_t)(void *skel, const void *name);  /* -> OldBone* */
@@ -831,6 +840,7 @@ static int g_ui_prev;              /* dialogue/menu open last frame (edge) */
 static int g_ui_open;              /* dialogue/menu open THIS frame (read by the setPointer hook) */
 static int g_ui_moveblock;         /* HARD block (control disabled: dialogue/cutscene); halts WASD */
 static int g_settings_open;        /* our settings window is showing -> free the cursor like a panel */
+static int g_free_toggle;          /* key_free_cursor TOGGLE: 1 = cursor freed (like a panel) */
 static int g_dbg_control;          /* controlEnabled read, for verification */
 static float g_tx, g_tz;           /* game->Ogre translation, calibrated when still */
 static int g_have_t;
@@ -1756,7 +1766,20 @@ static void fp_camera_override(void *gw)
         static int panel_frames;
         if (panels_now) { if (panel_frames < 1000) panel_frames++; }
         else panel_frames = 0;
-        int ui_open = (control == 0) || (panels_now && panel_frames >= 8) || g_settings_open;
+        /* TOGGLE-free-cursor (default Left Alt): PRESS to free the mouse + pause
+         * look (like an open panel), press again to re-lock. Read passively
+         * (GetAsyncKeyState), so it does NOT consume the key -- Kenshi's own
+         * Left-Alt behaviour still fires. On re-lock, the look deltas accumulated
+         * while free are drained by the existing g_ui_prev path so the view never
+         * jumps. g_free_toggle is reset when FP turns off (see the exit block). */
+        {
+            static int free_was_down;
+            int fd = g_cfg_key_free && (GetAsyncKeyState(g_cfg_key_free) & 0x8000);
+            if (fd && !free_was_down) g_free_toggle = !g_free_toggle;   /* press edge */
+            free_was_down = fd;
+        }
+        int ui_open = (control == 0) || (panels_now && panel_frames >= 8)
+                      || g_settings_open || g_free_toggle;
         g_ui_open = ui_open;                    /* read by the setPointer hook */
         /* Movement gate is NARROWER than the cursor gate: a mere side panel
          * (inventory/squad/jobs) frees the cursor + freezes look, but WASD should
@@ -1772,8 +1795,22 @@ static void fp_camera_override(void *gw)
              * value on exit is what prevents the unending zoom-out. */
             if (g_node_get_pos) {
                 const Vec3 *lp = g_node_get_pos(node);
-                if (readable((void *)lp, 12) && lp->z > 2.0f && lp->z < 2000.0f)
-                    g_vanilla_zoom = lp->z;
+                /* Capture the SIGN, not just the magnitude: vanilla can park the
+                 * camera node at a NEGATIVE local Z (camera on the -Z side of the
+                 * center). The old guard (z > 2) rejected that, so we restored the
+                 * +default on exit and the camera came back on the WRONG side --
+                 * in front of the player. Accept either sign now. */
+                if (readable((void *)lp, 12)) {
+                    float z = lp->z, az = z < 0 ? -z : z;
+                    if (az > 2.0f && az < 2000.0f) g_vanilla_zoom = az;  /* magnitude */
+                }
+            }
+            /* Also save the vanilla camera altitude (0x60). FP work seats the
+             * camera at eye height; if the RTS camera comes back at that low
+             * altitude it sits on/under the floor -- restore it on exit. */
+            if (readable((void *)((uintptr_t)cam + CC_ALTITUDE), 4)) {
+                float a = *(float *)((uintptr_t)cam + CC_ALTITUDE);
+                if (a > 0.5f && a < 5000.0f) g_vanilla_alt = a;
             }
         }
         /* NB: all MyGUI widget work (crosshair/vignette/blackout create,
@@ -2103,6 +2140,7 @@ static void fp_camera_override(void *gw)
          * drift off our FP angle (position is left for update() to reset). */
         while (ShowCursor(TRUE) < 0) { }
         g_cursor_hidden = 0; g_ui_prev = 0; g_ui_open = 0; g_ui_moveblock = 0;
+        g_free_toggle = 0;                      /* clear the free-cursor toggle on exit */
         mygui_cursor(1);                        /* FP exit: restore the game cursor */
         /* widget hides handled post-frame by fp_gui_update (sees !g_fp_mode) */
         g_have_eye = 0;                         /* stop the mid-frame re-assert */
@@ -2116,10 +2154,32 @@ static void fp_camera_override(void *gw)
             g_cam_set_fovy(ogre_cam, &g_fov_default);
         if (g_nearclip_saved && g_cam_set_nearclip && readable(ogre_cam, 8))
             g_cam_set_nearclip(ogre_cam, g_nearclip_default);
+        if (KFP_DEBUG_LOG) {   /* one-shot exit-state diagnostic (dev builds only) */
+            const Vec3 *lp = g_node_get_pos ? g_node_get_pos(node) : NULL;
+            float calt = readable((void *)((uintptr_t)cam + CC_ALTITUDE), 4)
+                       ? *(float *)((uintptr_t)cam + CC_ALTITUDE) : -999.0f;
+            logline("[fpexit] vzoom=%.1f valt=%.1f fp_pitch=%.2f nodeLocalZ=%.1f camAlt=%.1f",
+                    g_vanilla_zoom, g_vanilla_alt, g_pitch, lp ? lp->z : -999.0f, calt);
+        }
+        /* Restore the vanilla altitude BEFORE the handoff so the RTS camera comes
+         * back at its normal height, not at eye level (which reads as "zoomed
+         * into the floor"). */
+        if (g_vanilla_alt > 0.5f && readable((void *)((uintptr_t)cam + CC_ALTITUDE), 4))
+            *(float *)((uintptr_t)cam + CC_ALTITUDE) = g_vanilla_alt;
         /* Seat the vanilla camera at our look direction + the saved zoom via
          * the game's own API. Fixes the endless zoom-out (garbage local pos
-         * was left as the zoom) and keeps view continuity on exit. */
-        vanilla_cam_handoff(cam, node, g_vanilla_zoom);
+         * was left as the zoom) and keeps view continuity on exit. exit_camera_zoom
+         * (ini, hot-reload) overrides the distance/side if the auto value is off. */
+        /* Our FP look-orientation makes the camera-node +Z the FRONT side, so a
+         * positive offset lands the camera in front of the player -- NEGATE it so
+         * third-person returns BEHIND. `d` is the (positive) distance behind:
+         * auto = the zoom captured on enter, or the exit_camera_zoom override. */
+        float d = (g_cfg_exit_zoom != 0.0f) ? g_cfg_exit_zoom : g_vanilla_zoom;
+        float exit_zoom = -d;
+        if (KFP_DEBUG_LOG)
+            logline("[fpexit] exit_zoom=%.1f (dist=%.1f cfg=%.1f auto_vzoom=%.1f)",
+                    exit_zoom, d, g_cfg_exit_zoom, g_vanilla_zoom);
+        vanilla_cam_handoff(cam, node, exit_zoom);
     }
     g_ovr_prev = active;
 }
@@ -3107,6 +3167,7 @@ static void load_ini(void)
         else if (ini_int(line, "key_back", &v))       { if (v > 0 && v < 255) g_cfg_key_s = v; }
         else if (ini_int(line, "key_right", &v))      { if (v > 0 && v < 255) g_cfg_key_d = v; }
         else if (ini_int(line, "key_settings", &v))   { if (v > 0 && v < 255) g_cfg_key_settings = v; }
+        else if (ini_int(line, "key_free_cursor", &v)) { if (v >= 0 && v < 255) g_cfg_key_free = v; }
         else if (ini_float(line, "fov", &fv))             { if (fv >= 40 && fv <= 120) g_cfg_fov = fv; }
         else if (ini_float(line, "near_clip", &fv))       { if (fv >= 0.05f && fv <= 10) g_cfg_nearclip = fv; }
         else if (ini_float(line, "sensitivity", &fv))     { if (fv >= 0.05f && fv <= 10) g_cfg_sens = fv; }
@@ -3114,6 +3175,7 @@ static void load_ini(void)
         else if (ini_float(line, "move_forward", &fv))    { if (fv >= 0 && fv <= 10) g_cfg_move_fwd = fv; }
         else if (ini_float(line, "move_speed_ref", &fv))  { if (fv >= 5 && fv <= 400) g_cfg_move_ref = fv; }
         else if (ini_float(line, "aim_lean_amount", &fv)) { if (fv >= 0 && fv <= 1.5f) g_cfg_lean = fv; }
+        else if (ini_float(line, "exit_camera_zoom", &fv)) { if (fv >= -500 && fv <= 500) g_cfg_exit_zoom = fv; }
     }
     fclose(f);
     if (g_fps_cap) timeBeginPeriod(1);
